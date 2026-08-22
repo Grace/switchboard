@@ -1,0 +1,9 @@
+# Build output
+/golem
+/dist/
+
+# Local config and models
+golem.json
+*.gguf
+
+.DS_Store
