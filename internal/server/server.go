@@ -53,6 +53,19 @@ type Animator interface {
 	Rest(model string) bool
 }
 
+// ToolCaller is implemented by backends that can forward tool definitions to a
+// model. Like Animator, it is an optional capability asked at the door: a
+// backend that cannot do this does not implement it, and the server turns the
+// request away rather than dropping the tools on the floor.
+type ToolCaller interface {
+	ToolsSupported() bool
+}
+
+func toolsSupported(b golem.Backend) bool {
+	tc, ok := b.(ToolCaller)
+	return ok && tc.ToolsSupported()
+}
+
 // handleAnimate loads a model ahead of first use.
 func (s *Server) handleAnimate(w http.ResponseWriter, r *http.Request) {
 	backend, model, ok := s.adminTarget(w, r)
@@ -160,10 +173,31 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		Stop:        req.Stop,
 	}
 	for _, m := range req.Messages {
-		chatReq.Messages = append(chatReq.Messages, golem.Message{
-			Role:    golem.Role(m.Role),
-			Content: m.Content,
-		})
+		chatReq.Messages = append(chatReq.Messages, toNeutralMessage(m))
+	}
+
+	if len(req.Tools) > 0 {
+		// Refuse rather than drop: a client that asked for tools and got prose
+		// back has no way to tell that the tools never reached the model.
+		if !toolsSupported(backend) {
+			writeError(w, http.StatusBadRequest, "invalid_request_error",
+				fmt.Sprintf("%s cannot forward tool definitions to %q", backend.Name(), model))
+			return
+		}
+		tools, err := toNeutralTools(req.Tools)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
+			return
+		}
+		chatReq.Tools = tools
+	}
+	if len(req.ToolChoice) > 0 {
+		choice, err := parseToolChoice(req.ToolChoice)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
+			return
+		}
+		chatReq.ToolChoice = choice
 	}
 
 	id := fmt.Sprintf("chatcmpl-%d", s.now().UnixNano())
@@ -218,9 +252,13 @@ func (s *Server) streamChat(w http.ResponseWriter, r *http.Request, backend gole
 	}
 
 	result, err := backend.Chat(r.Context(), req, func(c golem.Chunk) error {
+		delta := &wire.Message{Content: c.Text}
+		if c.ToolCall != nil {
+			delta.ToolCalls = []wire.ToolCall{toWireToolCallDelta(*c.ToolCall)}
+		}
 		return send(wire.ChatResponse{
 			ID: id, Object: "chat.completion.chunk", Created: created, Model: req.Model,
-			Choices: []wire.Choice{{Index: 0, Delta: &wire.Message{Content: c.Text}}},
+			Choices: []wire.Choice{{Index: 0, Delta: delta}},
 		})
 	})
 	if err != nil {
@@ -238,7 +276,7 @@ func (s *Server) streamChat(w http.ResponseWriter, r *http.Request, backend gole
 		return
 	}
 
-	finish := finishReason(result.StopReason)
+	finish := finishReasonFor(result)
 	final := wire.ChatResponse{
 		ID: id, Object: "chat.completion.chunk", Created: created, Model: req.Model,
 		Choices: []wire.Choice{{Index: 0, Delta: &wire.Message{}, FinishReason: &finish}},
@@ -253,19 +291,126 @@ func (s *Server) streamChat(w http.ResponseWriter, r *http.Request, backend gole
 
 // response builds a non-streaming completion body.
 func (s *Server) response(id, model string, result *golem.Result) wire.ChatResponse {
-	finish := finishReason(result.StopReason)
+	finish := finishReasonFor(result)
 	return wire.ChatResponse{
 		ID:      id,
 		Object:  "chat.completion",
 		Created: s.now().Unix(),
 		Model:   model,
 		Choices: []wire.Choice{{
-			Index:        0,
-			Message:      &wire.Message{Role: string(golem.RoleAssistant), Content: result.Text},
+			Index: 0,
+			Message: &wire.Message{
+				Role:      string(golem.RoleAssistant),
+				Content:   result.Text,
+				ToolCalls: toWireToolCalls(result.ToolCalls),
+			},
 			FinishReason: &finish,
 		}},
 		Usage: usage(result),
 	}
+}
+
+// toNeutralMessage converts one turn off the wire, flattening OpenAI's nested
+// function object into golem's flat call.
+func toNeutralMessage(m wire.Message) golem.Message {
+	out := golem.Message{
+		Role:       golem.Role(m.Role),
+		Content:    m.Content,
+		ToolCallID: m.ToolCallID,
+	}
+	for _, tc := range m.ToolCalls {
+		out.ToolCalls = append(out.ToolCalls, golem.ToolCall{
+			ID:        tc.ID,
+			Name:      tc.Function.Name,
+			Arguments: tc.Function.Arguments,
+		})
+	}
+	return out
+}
+
+// toNeutralTools validates the tools array and flattens it. The schema itself
+// is not inspected — backends hand it to the model, which is the only thing
+// that can judge it.
+func toNeutralTools(tools []wire.Tool) ([]golem.Tool, error) {
+	out := make([]golem.Tool, 0, len(tools))
+	for i, t := range tools {
+		if t.Type != "" && t.Type != "function" {
+			return nil, fmt.Errorf("tools[%d]: unsupported tool type %q, want \"function\"", i, t.Type)
+		}
+		if t.Function.Name == "" {
+			return nil, fmt.Errorf("tools[%d]: function.name is required", i)
+		}
+		out = append(out, golem.Tool{
+			Name:        t.Function.Name,
+			Description: t.Function.Description,
+			Schema:      t.Function.Parameters,
+		})
+	}
+	return out, nil
+}
+
+// parseToolChoice decodes OpenAI's polymorphic tool_choice: either a bare
+// string ("auto", "none", "required") or a named function object.
+func parseToolChoice(raw json.RawMessage) (*golem.ToolChoice, error) {
+	var mode string
+	if err := json.Unmarshal(raw, &mode); err == nil {
+		switch mode {
+		case "auto":
+			return &golem.ToolChoice{Mode: golem.ToolChoiceAuto}, nil
+		case "none":
+			return &golem.ToolChoice{Mode: golem.ToolChoiceNone}, nil
+		case "required", "any":
+			return &golem.ToolChoice{Mode: golem.ToolChoiceAny}, nil
+		default:
+			return nil, fmt.Errorf("tool_choice %q: want auto, none, or required", mode)
+		}
+	}
+
+	var named struct {
+		Type     string `json:"type"`
+		Function struct {
+			Name string `json:"name"`
+		} `json:"function"`
+	}
+	if err := json.Unmarshal(raw, &named); err != nil {
+		return nil, errors.New("tool_choice must be a string or a function object")
+	}
+	if named.Function.Name == "" {
+		return nil, errors.New("tool_choice: function.name is required")
+	}
+	return &golem.ToolChoice{Mode: golem.ToolChoiceTool, Name: named.Function.Name}, nil
+}
+
+// toWireToolCalls renders finished calls onto a complete response.
+func toWireToolCalls(calls []golem.ToolCall) []wire.ToolCall {
+	if len(calls) == 0 {
+		return nil
+	}
+	out := make([]wire.ToolCall, 0, len(calls))
+	for _, c := range calls {
+		out = append(out, wire.ToolCall{
+			ID:       c.ID,
+			Type:     "function",
+			Function: wire.ToolCallFunction{Name: c.Name, Arguments: c.Arguments},
+		})
+	}
+	return out
+}
+
+// toWireToolCallDelta renders one streamed increment. Index goes on every
+// frame so a client can correlate fragments; id, type, and name appear only on
+// the frame that opened the call, which is the shape OpenAI clients expect.
+func toWireToolCallDelta(d golem.ToolCallDelta) wire.ToolCall {
+	index := d.Index
+	out := wire.ToolCall{
+		Index:    &index,
+		ID:       d.ID,
+		Function: wire.ToolCallFunction{Name: d.Name, Arguments: d.Arguments},
+	}
+	if d.ID != "" {
+		out.Type = "function"
+	}
+	return out
 }
 
 func usage(result *golem.Result) *wire.Usage {
@@ -277,6 +422,18 @@ func usage(result *golem.Result) *wire.Usage {
 		CompletionTokens: result.Usage.OutputTokens,
 		TotalTokens:      result.Usage.InputTokens + result.Usage.OutputTokens,
 	}
+}
+
+// finishReasonFor picks the reason a client should see. A backend that
+// produced tool calls but reported a plain stop is corrected here: clients
+// branch on finish_reason to decide whether to run the tools, and a wrong
+// answer strands the call with no way to notice.
+func finishReasonFor(result *golem.Result) string {
+	reason := finishReason(result.StopReason)
+	if len(result.ToolCalls) > 0 && reason == "stop" {
+		return "tool_calls"
+	}
+	return reason
 }
 
 // finishReason normalises backend stop reasons onto OpenAI's vocabulary, since

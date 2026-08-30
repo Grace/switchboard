@@ -18,12 +18,22 @@ const (
 	RoleSystem    Role = "system"
 	RoleUser      Role = "user"
 	RoleAssistant Role = "assistant"
+	// RoleTool carries the result of a call the model asked for. The turn
+	// names the call it answers in ToolCallID.
+	RoleTool Role = "tool"
 )
 
 // Message is one turn of a conversation.
+//
+// ToolCalls and ToolCallID are the two halves of a tool exchange: an assistant
+// turn asks, and a RoleTool turn answers in Content, naming the call it
+// answers. They sit beside Content rather than inside a content-block union
+// because that is the shape both ends of golem already speak.
 type Message struct {
-	Role    Role   `json:"role"`
-	Content string `json:"content"`
+	Role       Role       `json:"role"`
+	Content    string     `json:"content"`
+	ToolCalls  []ToolCall `json:"tool_calls,omitempty"`
+	ToolCallID string     `json:"tool_call_id,omitempty"`
 }
 
 // ChatRequest is a backend-neutral completion request. Zero values mean "let
@@ -35,6 +45,11 @@ type ChatRequest struct {
 	Temperature *float64
 	TopP        *float64
 	Stop        []string
+	// Tools are the functions the model may call. A backend that cannot
+	// forward them must not silently ignore them; see server.ToolCaller.
+	Tools []Tool
+	// ToolChoice constrains tool use. Nil means auto when Tools is non-empty.
+	ToolChoice *ToolChoice
 }
 
 // System splits any leading system messages out of the conversation, since
@@ -55,9 +70,11 @@ func (r *ChatRequest) System() (string, []Message) {
 	return system, rest
 }
 
-// Chunk is one increment of a streaming response.
+// Chunk is one increment of a streaming response: either a piece of assistant
+// text or a piece of a tool call, never both.
 type Chunk struct {
-	Text string
+	Text     string
+	ToolCall *ToolCallDelta
 }
 
 // Usage reports token accounting when a backend provides it.
@@ -67,10 +84,14 @@ type Usage struct {
 }
 
 // Result is the completed response, returned alongside the streamed chunks.
+// A backend that emitted tool-call deltas must also report them assembled
+// here, so the non-streaming path and the finish reason do not have to
+// reconstruct them.
 type Result struct {
 	Text       string
 	StopReason string
 	Usage      Usage
+	ToolCalls  []ToolCall
 }
 
 // Model is one routable model as this process sees it.
