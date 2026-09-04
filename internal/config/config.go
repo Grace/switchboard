@@ -72,6 +72,8 @@ type Config struct {
 	Audit Audit `json:"audit,omitempty"`
 	// Teams are the attribution units and their API keys.
 	Teams []Team `json:"teams,omitempty"`
+	// OIDC trusts an identity provider instead of shared keys.
+	OIDC OIDC `json:"oidc,omitempty"`
 }
 
 // Duration is a time.Duration that round-trips as a JSON string ("10m").
@@ -182,7 +184,10 @@ func (c *Config) Validate() error {
 	default:
 		return fmt.Errorf("local.device %q: want auto, metal, cuda, or cpu", c.Local.Device)
 	}
-	if err := c.Attribution.validate(c.Teams); err != nil {
+	if err := c.Attribution.validate(c.Teams, c.OIDC.Enabled); err != nil {
+		return err
+	}
+	if err := c.OIDC.validate(c.Teams); err != nil {
 		return err
 	}
 	return c.validateIO()

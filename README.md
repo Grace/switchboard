@@ -136,6 +136,8 @@ AWS credentials come from the standard chain — environment, shared config, SSO
 
 Working: routing, both backends, streaming and non-streaming completions, token usage accounting, model lifecycle, graceful drain on shutdown. The HTTP surface and the tool-translation layer are covered by tests.
 
+**SSO.** Callers can present an OIDC token instead of a shared key, so the audit log records a person rather than a credential. Verification is a deliberately narrow implementation over the standard library — RS256/ES256, verification only — with the algorithm chosen from the key rather than the token, and an adversarial test suite that constructs each classic attack and asserts it is refused. See [docs/sso.md](docs/sso.md).
+
 **Tamper-evident audit.** Each entry carries the digest of the one before it, so an alteration, deletion or reordering is detectable — `switchboard audit verify` reports the first entry that does not hold, and exits non-zero. `SWITCHBOARD_AUDIT_KEY` makes an edit require the key as well as file access. `switchboard audit show -id …` reconstructs an individual decision, which is what Article 12 of the EU AI Act asks logging to permit.
 
 **Redaction and audit.** A structured JSONL record of what was sent to which provider, with redaction applied inside the log itself so no call site can skip it — which is what makes it a control rather than a convention that every application team has to remember. Content logging is refused outright unless redaction rules are configured. See [docs/redaction.md](docs/redaction.md).
@@ -148,8 +150,6 @@ Not done yet:
 - **Redaction toward the provider.** Content is redacted before it is written to the audit log, but it still reaches the model as written. Stripping it on the way *out* is a separate feature and is not built.
 - **Spend caps and chargeback reporting.** Per-team attribution now reaches the provider (see below), but there is no token budget, no enforcement when one is exceeded, and no rollup finance can read.
 - **Retry and backpressure.** No throttling-aware retry, concurrency ceiling, or token budget yet.
-- **SSO.** Authentication is static per-team keys. No OIDC, no per-user attribution, no rotation workflow. This is the most-requested gap and the next thing being built.
-
 For a security review, [docs/controls.md](docs/controls.md) maps what switchboard does against SOC 2, ISO 27001, HIPAA, NIST and EU AI Act control objectives — including, deliberately, everything it does not do.
 
 ## Contributing and contact

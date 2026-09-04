@@ -11,6 +11,9 @@ import "context"
 type Caller struct {
 	// Team is the attribution unit — whatever the bill should be split by.
 	Team string
+	// Subject identifies the individual, when the caller proved who they are
+	// rather than only which team they belong to. Empty for a shared team key.
+	Subject string
 }
 
 type callerKey struct{}

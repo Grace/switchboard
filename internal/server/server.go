@@ -17,6 +17,7 @@ import (
 
 	"github.com/Grace/switchboard/internal/audit"
 	"github.com/Grace/switchboard/internal/config"
+	"github.com/Grace/switchboard/internal/oidc"
 	"github.com/Grace/switchboard/internal/switchboard"
 	"github.com/Grace/switchboard/internal/wire"
 )
@@ -35,6 +36,17 @@ type Server struct {
 
 	// audit records what was sent to which provider. Nil means no log.
 	audit *audit.Log
+
+	// oidc verifies bearer tokens when an identity provider is configured.
+	oidc *oidc.Verifier
+}
+
+// WithOIDC lets the server accept identity-provider tokens as well as static
+// team keys. The team a token names must still be on the roster: an identity
+// provider decides who someone is, not which teams exist here.
+func (s *Server) WithOIDC(v *oidc.Verifier) *Server {
+	s.oidc = v
+	return s
 }
 
 // WithAudit gives the server a log to record completions in. Redaction is the
@@ -51,7 +63,7 @@ func (s *Server) record(ctx context.Context, r audit.Record) {
 		return
 	}
 	if c, ok := switchboard.CallerFrom(ctx); ok {
-		r.Team = c.Team
+		r.Team, r.Subject = c.Team, c.Subject
 	}
 	if err := s.audit.Write(r); err != nil {
 		s.logger.Printf("audit: %v", err)
@@ -94,15 +106,47 @@ func (s *Server) WithAttribution(teams []config.Team, requireCaller bool) *Serve
 // that down here, nothing downstream can reconstruct it — which is why an
 // unattributed request is refused rather than quietly billed to everyone.
 func (s *Server) caller(r *http.Request) (switchboard.Caller, bool) {
-	key, ok := bearer(r.Header.Get("Authorization"))
+	presented, ok := bearer(r.Header.Get("Authorization"))
 	if !ok {
 		return switchboard.Caller{}, false
 	}
-	team, ok := config.TeamForKey(s.teams, key)
-	if !ok {
+
+	// A static key first: it is a local comparison, and a deployment using
+	// only keys should never depend on an identity provider being reachable.
+	if team, ok := config.TeamForKey(s.teams, presented); ok {
+		return switchboard.Caller{Team: team}, true
+	}
+	if s.oidc == nil {
 		return switchboard.Caller{}, false
 	}
-	return switchboard.Caller{Team: team}, true
+
+	claims, err := s.oidc.Verify(r.Context(), presented)
+	if err != nil {
+		s.logger.Printf("oidc: rejected token: %v", err)
+		return switchboard.Caller{}, false
+	}
+	team, ok := s.oidc.Team(claims)
+	if !ok {
+		s.logger.Printf("oidc: token for %q carries no team claim", claims.Subject)
+		return switchboard.Caller{}, false
+	}
+	// The roster is the allowlist. Without this, any group name an identity
+	// provider happens to emit would become a billable team and a session tag.
+	if !knownTeam(s.teams, team) {
+		s.logger.Printf("oidc: token for %q names team %q, which is not on the roster",
+			claims.Subject, team)
+		return switchboard.Caller{}, false
+	}
+	return switchboard.Caller{Team: team, Subject: claims.Subject}, true
+}
+
+func knownTeam(teams []config.Team, name string) bool {
+	for _, t := range teams {
+		if t.Name == name {
+			return true
+		}
+	}
+	return false
 }
 
 func bearer(h string) (string, bool) {

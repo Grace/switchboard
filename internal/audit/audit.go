@@ -28,6 +28,7 @@ type Record struct {
 	Time    time.Time `json:"time"`
 	ID      string    `json:"id"`
 	Team    string    `json:"team,omitempty"`
+	Subject string    `json:"subject,omitempty"`
 	Model   string    `json:"model"`
 	Backend string    `json:"backend,omitempty"`
 

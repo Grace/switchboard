@@ -46,6 +46,16 @@ func runServe(ctx context.Context, args []string) error {
 
 	srv := server.New(reg, logger).WithAttribution(cfg.Teams, cfg.Attribution.RequireCaller)
 
+	if cfg.OIDC.Enabled {
+		v, err := cfg.OIDC.Build()
+		if err != nil {
+			return fmt.Errorf("oidc: %w", err)
+		}
+		srv = srv.WithOIDC(v)
+		logger.Printf("oidc: trusting %s (audience %q, team claim %q)",
+			cfg.OIDC.Issuer, cfg.OIDC.Audience, teamClaimOr(cfg.OIDC.TeamClaim))
+	}
+
 	if cfg.Audit.Enabled {
 		red, err := cfg.Redaction.Build()
 		if err != nil {
@@ -77,4 +87,11 @@ func runServe(ctx context.Context, args []string) error {
 	}
 	logger.Printf("shut down")
 	return nil
+}
+
+func teamClaimOr(s string) string {
+	if s == "" {
+		return "groups"
+	}
+	return s
 }

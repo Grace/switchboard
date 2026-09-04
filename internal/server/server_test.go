@@ -3,6 +3,8 @@ package server
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
+	"crypto/rsa"
 	"encoding/json"
 	"errors"
 	"io"
@@ -16,6 +18,7 @@ import (
 
 	"github.com/Grace/switchboard/internal/audit"
 	"github.com/Grace/switchboard/internal/config"
+	"github.com/Grace/switchboard/internal/oidc"
 	"github.com/Grace/switchboard/internal/redact"
 	"github.com/Grace/switchboard/internal/switchboard"
 	"github.com/Grace/switchboard/internal/wire"
@@ -682,5 +685,102 @@ func TestNoAuditLogIsFine(t *testing.T) {
 	srv := newTestServer(t, &fakeBackend{chunks: []string{"ok"}})
 	if resp := post(t, srv.URL+"/v1/chat/completions", `{"messages":[{"role":"user","content":"hi"}]}`); resp.StatusCode != http.StatusOK {
 		t.Errorf("status = %d without an audit log", resp.StatusCode)
+	}
+}
+
+// --- oidc ----------------------------------------------------------------
+
+// End to end through the server: a token from a trusted issuer resolves a
+// caller with both a team and a subject, and the subject reaches the audit log.
+// That is the point of SSO here — per-user attribution, not just per-team.
+func TestOIDCTokenResolvesCallerAndSubject(t *testing.T) {
+	k, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatal(err)
+	}
+	iss := oidcIssuer(t, k, "k1")
+
+	v, err := oidc.New(oidc.Config{
+		Issuer: iss.URL, Audience: "switchboard", TeamClaim: "groups", Client: iss.Client(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var seen switchboard.Caller
+	backend := &fakeBackend{onChat: func(ctx context.Context) {
+		seen, _ = switchboard.CallerFrom(ctx)
+	}}
+	reg := switchboard.NewRegistry()
+	reg.Register(backend, []string{"test-model"})
+	reg.SetDefault("test-model")
+
+	s := New(reg, log.New(io.Discard, "", 0)).
+		WithAttribution([]config.Team{{Name: "platform"}}, true).
+		WithOIDC(v)
+	srv := httptest.NewServer(s.Handler())
+	t.Cleanup(srv.Close)
+
+	tok := mintToken(t, k, "k1", iss.URL, "platform")
+	if resp := postAs(t, srv.URL+"/v1/chat/completions", tok, chatBody); resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	if seen.Team != "platform" {
+		t.Errorf("team = %q", seen.Team)
+	}
+	if seen.Subject != "user-42" {
+		t.Errorf("subject = %q; SSO exists to identify the person", seen.Subject)
+	}
+}
+
+// The identity provider decides who someone is. It does not decide which teams
+// exist here — otherwise any group name it emits becomes a billable team and a
+// session tag on the AWS bill.
+func TestOIDCTeamMustBeOnTheRoster(t *testing.T) {
+	k, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatal(err)
+	}
+	iss := oidcIssuer(t, k, "k1")
+	v, _ := oidc.New(oidc.Config{
+		Issuer: iss.URL, Audience: "switchboard", TeamClaim: "groups", Client: iss.Client(),
+	})
+
+	reg := switchboard.NewRegistry()
+	reg.Register(&fakeBackend{}, []string{"test-model"})
+	reg.SetDefault("test-model")
+	s := New(reg, log.New(io.Discard, "", 0)).
+		WithAttribution([]config.Team{{Name: "platform"}}, true).
+		WithOIDC(v)
+	srv := httptest.NewServer(s.Handler())
+	t.Cleanup(srv.Close)
+
+	tok := mintToken(t, k, "k1", iss.URL, "not-a-real-team")
+	if resp := postAs(t, srv.URL+"/v1/chat/completions", tok, chatBody); resp.StatusCode != http.StatusUnauthorized {
+		t.Errorf("status = %d, want 401 for a team not on the roster", resp.StatusCode)
+	}
+}
+
+// A deployment using static keys must not start depending on an identity
+// provider being reachable.
+func TestStaticKeysStillWorkAlongsideOIDC(t *testing.T) {
+	k, _ := rsa.GenerateKey(rand.Reader, 2048)
+	iss := oidcIssuer(t, k, "k1")
+	v, _ := oidc.New(oidc.Config{
+		Issuer: iss.URL, Audience: "switchboard", TeamClaim: "groups", Client: iss.Client(),
+	})
+	iss.Close() // the provider is down
+
+	reg := switchboard.NewRegistry()
+	reg.Register(&fakeBackend{}, []string{"test-model"})
+	reg.SetDefault("test-model")
+	s := New(reg, log.New(io.Discard, "", 0)).
+		WithAttribution([]config.Team{{Name: "search", Keys: []string{"key-search-0123456789"}}}, true).
+		WithOIDC(v)
+	srv := httptest.NewServer(s.Handler())
+	t.Cleanup(srv.Close)
+
+	if resp := postAs(t, srv.URL+"/v1/chat/completions", "key-search-0123456789", chatBody); resp.StatusCode != http.StatusOK {
+		t.Errorf("status = %d; a static key must not need the identity provider", resp.StatusCode)
 	}
 }

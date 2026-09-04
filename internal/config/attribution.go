@@ -50,7 +50,7 @@ var (
 	tagValueOK    = regexp.MustCompile(`^[\w\s+=.:/@-]{1,256}$`)
 )
 
-func (a *Attribution) validate(teams []Team) error {
+func (a *Attribution) validate(teams []Team, oidcEnabled bool) error {
 	if !a.Enabled {
 		if a.RequireCaller {
 			return fmt.Errorf("attribution.require_caller is set but attribution.enabled is false")
@@ -84,7 +84,7 @@ func (a *Attribution) validate(teams []Team) error {
 		}
 		seenName[t.Name] = true
 
-		if len(t.Keys) == 0 {
+		if len(t.Keys) == 0 && !oidcEnabled {
 			return fmt.Errorf("team %q has no keys, so nothing can authenticate as it", t.Name)
 		}
 		for _, k := range t.Keys {
