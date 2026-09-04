@@ -17,8 +17,8 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/bedrockruntime"
 	"github.com/aws/aws-sdk-go-v2/service/bedrockruntime/types"
 
-	"github.com/grace/golem/internal/config"
-	"github.com/grace/golem/internal/golem"
+	"github.com/Grace/switchboard/internal/config"
+	"github.com/Grace/switchboard/internal/switchboard"
 )
 
 // Options configures the backend.
@@ -29,26 +29,26 @@ type Options struct {
 	Profile string
 }
 
-// Backend is a golem.Backend backed by Amazon Bedrock.
+// Backend is a switchboard.Backend backed by Amazon Bedrock.
 type Backend struct {
 	opts  Options
-	specs map[string]config.Shem
+	specs map[string]config.Line
 	order []string
 
-	// The client is built on first use so that golem starts, serves local
+	// The client is built on first use so that switchboard starts, serves local
 	// models, and lists its roster on a machine with no AWS credentials at all.
 	once    sync.Once
 	client  *bedrockruntime.Client
 	initErr error
 }
 
-var _ golem.Backend = (*Backend)(nil)
+var _ switchboard.Backend = (*Backend)(nil)
 
-// New builds a backend serving the given shems.
-func New(opts Options, models []config.Shem) *Backend {
+// New builds a backend serving the given lines.
+func New(opts Options, models []config.Line) *Backend {
 	b := &Backend{
 		opts:  opts,
-		specs: make(map[string]config.Shem, len(models)),
+		specs: make(map[string]config.Line, len(models)),
 	}
 	for _, m := range models {
 		b.specs[m.Name] = m
@@ -57,21 +57,21 @@ func New(opts Options, models []config.Shem) *Backend {
 	return b
 }
 
-// Name implements golem.Backend.
+// Name implements switchboard.Backend.
 func (b *Backend) Name() string { return config.BackendBedrock }
 
-// Models implements golem.Backend. It reports what config declares rather than
+// Models implements switchboard.Backend. It reports what config declares rather than
 // calling ListFoundationModels: the roster should be visible without
 // credentials, and access to a model id is not knowable until you invoke it.
-func (b *Backend) Models(context.Context) ([]golem.Model, error) {
-	out := make([]golem.Model, 0, len(b.order))
+func (b *Backend) Models(context.Context) ([]switchboard.Model, error) {
+	out := make([]switchboard.Model, 0, len(b.order))
 	for _, name := range b.order {
 		spec := b.specs[name]
 		detail := spec.ModelID
 		if b.opts.Region != "" {
 			detail = fmt.Sprintf("%s @ %s", detail, b.opts.Region)
 		}
-		out = append(out, golem.Model{
+		out = append(out, switchboard.Model{
 			Name:    name,
 			Backend: b.Name(),
 			Detail:  detail,
@@ -106,11 +106,11 @@ func (b *Backend) resolve(ctx context.Context) (*bedrockruntime.Client, error) {
 	return b.client, b.initErr
 }
 
-// Chat implements golem.Backend.
-func (b *Backend) Chat(ctx context.Context, req *golem.ChatRequest, emit func(golem.Chunk) error) (*golem.Result, error) {
+// Chat implements switchboard.Backend.
+func (b *Backend) Chat(ctx context.Context, req *switchboard.ChatRequest, emit func(switchboard.Chunk) error) (*switchboard.Result, error) {
 	spec, ok := b.specs[req.Model]
 	if !ok {
-		return nil, &golem.UnknownModelError{Model: req.Model}
+		return nil, &switchboard.UnknownModelError{Model: req.Model}
 	}
 	client, err := b.resolve(ctx)
 	if err != nil {
@@ -142,7 +142,7 @@ func (b *Backend) Chat(ctx context.Context, req *golem.ChatRequest, emit func(go
 	defer stream.Close()
 
 	var text strings.Builder
-	result := &golem.Result{}
+	result := &switchboard.Result{}
 
 	for event := range stream.Events() {
 		switch e := event.(type) {
@@ -154,14 +154,14 @@ func (b *Backend) Chat(ctx context.Context, req *golem.ChatRequest, emit func(go
 				continue
 			}
 			text.WriteString(delta.Value)
-			if err := emit(golem.Chunk{Text: delta.Value}); err != nil {
+			if err := emit(switchboard.Chunk{Text: delta.Value}); err != nil {
 				return nil, err
 			}
 		case *types.ConverseStreamOutputMemberMessageStop:
 			result.StopReason = string(e.Value.StopReason)
 		case *types.ConverseStreamOutputMemberMetadata:
 			if u := e.Value.Usage; u != nil {
-				result.Usage = golem.Usage{
+				result.Usage = switchboard.Usage{
 					InputTokens:  int(aws.ToInt32(u.InputTokens)),
 					OutputTokens: int(aws.ToInt32(u.OutputTokens)),
 				}
@@ -179,14 +179,14 @@ func (b *Backend) Chat(ctx context.Context, req *golem.ChatRequest, emit func(go
 // toBedrock converts neutral turns into Converse messages. Bedrock requires
 // strictly alternating user/assistant turns, so consecutive same-role messages
 // are merged rather than rejected.
-func toBedrock(turns []golem.Message) ([]types.Message, error) {
+func toBedrock(turns []switchboard.Message) ([]types.Message, error) {
 	var out []types.Message
 	for _, m := range turns {
 		var role types.ConversationRole
 		switch m.Role {
-		case golem.RoleUser:
+		case switchboard.RoleUser:
 			role = types.ConversationRoleUser
-		case golem.RoleAssistant:
+		case switchboard.RoleAssistant:
 			role = types.ConversationRoleAssistant
 		default:
 			return nil, fmt.Errorf("bedrock: unsupported role %q outside the leading system prompt", m.Role)
@@ -216,7 +216,7 @@ func toBedrock(turns []golem.Message) ([]types.Message, error) {
 
 // inferenceConfig maps only the parameters the caller actually set, leaving
 // everything else to the model's own defaults.
-func inferenceConfig(req *golem.ChatRequest) *types.InferenceConfiguration {
+func inferenceConfig(req *switchboard.ChatRequest) *types.InferenceConfiguration {
 	cfg := &types.InferenceConfiguration{}
 	set := false
 
@@ -242,6 +242,6 @@ func inferenceConfig(req *golem.ChatRequest) *types.InferenceConfiguration {
 	return cfg
 }
 
-// Close implements golem.Backend. Nothing to release: the SDK client holds no
+// Close implements switchboard.Backend. Nothing to release: the SDK client holds no
 // long-lived resources of its own.
 func (b *Backend) Close() error { return nil }

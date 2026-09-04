@@ -1,6 +1,6 @@
 // Package wire holds the OpenAI-compatible JSON shapes.
 //
-// They appear on both sides of golem: the server speaks this dialect so that
+// They appear on both sides of switchboard: the server speaks this dialect so that
 // existing clients (Zed, Continue, the openai SDKs, curl) work unmodified, and
 // the local backend speaks it upstream to llama-server.
 package wire
@@ -117,7 +117,7 @@ type Error struct {
 	Code    string `json:"code,omitempty"`
 }
 
-// ErrorResponse is what golem returns on any non-2xx.
+// ErrorResponse is what switchboard returns on any non-2xx.
 type ErrorResponse struct {
 	Error Error `json:"error"`
 }

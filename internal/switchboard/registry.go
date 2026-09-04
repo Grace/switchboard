@@ -1,4 +1,4 @@
-package golem
+package switchboard
 
 import (
 	"context"

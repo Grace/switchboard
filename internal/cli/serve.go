@@ -7,7 +7,7 @@ import (
 	"log"
 	"os"
 
-	"github.com/grace/golem/internal/server"
+	"github.com/Grace/switchboard/internal/server"
 )
 
 func runServe(ctx context.Context, args []string) error {
@@ -31,14 +31,14 @@ func runServe(ctx context.Context, args []string) error {
 	// than to any one caller hanging up.
 	defer reg.Close()
 
-	logger := log.New(os.Stderr, "golem: ", log.LstdFlags)
+	logger := log.New(os.Stderr, "switchboard: ", log.LstdFlags)
 	models := reg.Models(ctx)
 	logger.Printf("serving %d model(s) on http://%s", len(models), cfg.Listen)
 	for _, m := range models {
 		logger.Printf("  %-24s %s", m.Name, m.Backend)
 	}
 	if len(models) == 0 {
-		logger.Printf("  (no models configured — see 'golem init')")
+		logger.Printf("  (no models configured — see 'switchboard init')")
 	}
 
 	if err := server.New(reg, logger).ListenAndServe(ctx, cfg.Listen); err != nil {

@@ -1,9 +1,12 @@
 # Build output
-/golem
+/switchboard
 /dist/
 
 # Local config and models
-golem.json
+switchboard.json
 *.gguf
 
 .DS_Store
+
+# Private working notes — names companies, not for publication
+POSITIONING.md

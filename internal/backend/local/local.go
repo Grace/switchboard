@@ -1,8 +1,8 @@
 // Package local runs models on this machine.
 //
-// It drives llama.cpp's llama-server as a child process, one per animated
+// It drives llama.cpp's llama-server as a child process, one per connected
 // model, and proxies chat over its OpenAI-compatible endpoint. Going through
-// the binary rather than binding libllama with cgo keeps golem a pure-Go
+// the binary rather than binding libllama with cgo keeps switchboard a pure-Go
 // static build while inheriting llama.cpp's device support unchanged: Metal on
 // Apple silicon, CUDA on a desktop or an external GPU, plain CPU everywhere
 // else. A cgo backend can be dropped in later behind the same interface.
@@ -25,9 +25,9 @@ import (
 	"sync"
 	"time"
 
-	"github.com/grace/golem/internal/config"
-	"github.com/grace/golem/internal/golem"
-	"github.com/grace/golem/internal/wire"
+	"github.com/Grace/switchboard/internal/config"
+	"github.com/Grace/switchboard/internal/switchboard"
+	"github.com/Grace/switchboard/internal/wire"
 )
 
 // Options configures the backend.
@@ -44,13 +44,13 @@ type Options struct {
 	Logf func(format string, args ...any)
 }
 
-// Backend is a golem.Backend that runs models locally.
+// Backend is a switchboard.Backend that runs models locally.
 type Backend struct {
 	opts   Options
 	client *http.Client
 
 	mu    sync.Mutex
-	specs map[string]config.Shem
+	specs map[string]config.Line
 	order []string
 	live  map[string]*instance
 
@@ -61,7 +61,7 @@ type Backend struct {
 // instance is one running llama-server. Exactly one goroutine calls Wait on
 // cmd; everything else observes the exit by reading done.
 type instance struct {
-	spec     config.Shem
+	spec     config.Line
 	cmd      *exec.Cmd
 	base     string
 	started  time.Time
@@ -72,10 +72,10 @@ type instance struct {
 	waitErr error
 }
 
-var _ golem.Backend = (*Backend)(nil)
+var _ switchboard.Backend = (*Backend)(nil)
 
-// New builds a backend serving the given shems.
-func New(opts Options, models []config.Shem) *Backend {
+// New builds a backend serving the given lines.
+func New(opts Options, models []config.Line) *Backend {
 	if opts.Host == "" {
 		opts.Host = "127.0.0.1"
 	}
@@ -84,13 +84,13 @@ func New(opts Options, models []config.Shem) *Backend {
 	}
 	if opts.Logf == nil {
 		opts.Logf = func(format string, args ...any) {
-			fmt.Fprintf(os.Stderr, "golem: "+format+"\n", args...)
+			fmt.Fprintf(os.Stderr, "switchboard: "+format+"\n", args...)
 		}
 	}
 
 	b := &Backend{
 		opts:  opts,
-		specs: make(map[string]config.Shem, len(models)),
+		specs: make(map[string]config.Line, len(models)),
 		live:  make(map[string]*instance),
 		stop:  make(chan struct{}),
 		// No client timeout: generation is long-lived and streaming. Callers
@@ -108,23 +108,23 @@ func New(opts Options, models []config.Shem) *Backend {
 	return b
 }
 
-// Name implements golem.Backend.
+// Name implements switchboard.Backend.
 func (b *Backend) Name() string { return config.BackendLocal }
 
-// Models implements golem.Backend.
-func (b *Backend) Models(context.Context) ([]golem.Model, error) {
+// Models implements switchboard.Backend.
+func (b *Backend) Models(context.Context) ([]switchboard.Model, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
-	out := make([]golem.Model, 0, len(b.order))
+	out := make([]switchboard.Model, 0, len(b.order))
 	for _, name := range b.order {
 		spec := b.specs[name]
 		inst, live := b.live[name]
 		detail := config.ExpandPath(spec.Path)
 		if live {
-			detail = fmt.Sprintf("%s (animated %s)", detail, time.Since(inst.started).Round(time.Second))
+			detail = fmt.Sprintf("%s (connected %s)", detail, time.Since(inst.started).Round(time.Second))
 		}
-		out = append(out, golem.Model{
+		out = append(out, switchboard.Model{
 			Name:    name,
 			Backend: b.Name(),
 			Detail:  detail,
@@ -134,8 +134,8 @@ func (b *Backend) Models(context.Context) ([]golem.Model, error) {
 	return out, nil
 }
 
-// Chat implements golem.Backend.
-func (b *Backend) Chat(ctx context.Context, req *golem.ChatRequest, emit func(golem.Chunk) error) (*golem.Result, error) {
+// Chat implements switchboard.Backend.
+func (b *Backend) Chat(ctx context.Context, req *switchboard.ChatRequest, emit func(switchboard.Chunk) error) (*switchboard.Result, error) {
 	inst, err := b.ensure(ctx, req.Model)
 	if err != nil {
 		return nil, err
@@ -169,7 +169,7 @@ func (b *Backend) Chat(ctx context.Context, req *golem.ChatRequest, emit func(go
 }
 
 // toWire converts a neutral request into llama-server's dialect.
-func toWire(req *golem.ChatRequest) wire.ChatRequest {
+func toWire(req *switchboard.ChatRequest) wire.ChatRequest {
 	out := wire.ChatRequest{
 		Model:         req.Model,
 		Messages:      make([]wire.Message, 0, len(req.Messages)),
@@ -187,13 +187,13 @@ func toWire(req *golem.ChatRequest) wire.ChatRequest {
 }
 
 // readSSE consumes an OpenAI-style event stream, emitting each delta.
-func readSSE(r io.Reader, emit func(golem.Chunk) error) (*golem.Result, error) {
+func readSSE(r io.Reader, emit func(switchboard.Chunk) error) (*switchboard.Result, error) {
 	scanner := bufio.NewScanner(r)
 	// Individual frames can carry a large final chunk; give the scanner room.
 	scanner.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
 
 	var text strings.Builder
-	result := &golem.Result{}
+	result := &switchboard.Result{}
 
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
@@ -212,7 +212,7 @@ func readSSE(r io.Reader, emit func(golem.Chunk) error) (*golem.Result, error) {
 			continue
 		}
 		if frame.Usage != nil {
-			result.Usage = golem.Usage{
+			result.Usage = switchboard.Usage{
 				InputTokens:  frame.Usage.PromptTokens,
 				OutputTokens: frame.Usage.CompletionTokens,
 			}
@@ -225,7 +225,7 @@ func readSSE(r io.Reader, emit func(golem.Chunk) error) (*golem.Result, error) {
 				continue
 			}
 			text.WriteString(choice.Delta.Content)
-			if err := emit(golem.Chunk{Text: choice.Delta.Content}); err != nil {
+			if err := emit(switchboard.Chunk{Text: choice.Delta.Content}); err != nil {
 				return nil, err
 			}
 		}
@@ -238,9 +238,9 @@ func readSSE(r io.Reader, emit func(golem.Chunk) error) (*golem.Result, error) {
 	return result, nil
 }
 
-// Animate loads a model into memory ahead of the first request, so that the
+// Connect loads a model into memory ahead of the first request, so that the
 // wait for weights to load does not land on a user.
-func (b *Backend) Animate(ctx context.Context, name string) error {
+func (b *Backend) Connect(ctx context.Context, name string) error {
 	_, err := b.ensure(ctx, name)
 	return err
 }
@@ -257,7 +257,7 @@ func (b *Backend) ensure(ctx context.Context, name string) (*instance, error) {
 	spec, ok := b.specs[name]
 	if !ok {
 		b.mu.Unlock()
-		return nil, &golem.UnknownModelError{Model: name}
+		return nil, &switchboard.UnknownModelError{Model: name}
 	}
 	b.mu.Unlock()
 
@@ -280,7 +280,7 @@ func (b *Backend) ensure(ctx context.Context, name string) (*instance, error) {
 }
 
 // start launches llama-server and blocks until it is healthy.
-func (b *Backend) start(ctx context.Context, spec config.Shem) (*instance, error) {
+func (b *Backend) start(ctx context.Context, spec config.Line) (*instance, error) {
 	bin := b.opts.ServerPath
 	if bin == "" {
 		bin = "llama-server"
@@ -312,13 +312,13 @@ func (b *Backend) start(ctx context.Context, spec config.Shem) (*instance, error
 	args = append(args, spec.Args...)
 
 	// Deliberately not bound to the request context: the process outlives the
-	// request that started it and is torn down by Rest, the reaper, or Close.
+	// request that started it and is torn down by Disconnect, the reaper, or Close.
 	cmd := exec.Command(resolved, args...)
 	cmd.Stdout = prefixWriter{prefix: "[" + spec.Name + "] ", w: os.Stderr}
 	cmd.Stderr = cmd.Stdout
 	configureProcess(cmd)
 
-	b.opts.Logf("animating %s on port %d", spec.Name, port)
+	b.opts.Logf("connecting %s on port %d", spec.Name, port)
 	if err := cmd.Start(); err != nil {
 		return nil, fmt.Errorf("starting llama-server: %w", err)
 	}
@@ -381,7 +381,7 @@ func (b *Backend) waitHealthy(ctx context.Context, inst *instance) error {
 
 // Rest unloads a model, freeing its memory. It is a no-op if the model is not
 // running.
-func (b *Backend) Rest(name string) bool {
+func (b *Backend) Disconnect(name string) bool {
 	b.mu.Lock()
 	inst, ok := b.live[name]
 	if ok {
@@ -446,7 +446,7 @@ func (b *Backend) reap() {
 
 			for _, name := range idle {
 				b.opts.Logf("%s idle for %s", name, b.opts.IdleTimeout)
-				b.Rest(name)
+				b.Disconnect(name)
 			}
 		}
 	}

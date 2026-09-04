@@ -10,29 +10,29 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/grace/golem/internal/golem"
-	"github.com/grace/golem/internal/wire"
+	"github.com/Grace/switchboard/internal/switchboard"
+	"github.com/Grace/switchboard/internal/wire"
 )
 
 // fakeBackend returns a canned response, split into chunks, and records what
 // it was asked for.
 type fakeBackend struct {
 	chunks     []string
-	toolDeltas []golem.ToolCallDelta
+	toolDeltas []switchboard.ToolCallDelta
 	// noTools makes the backend report that it cannot forward tools, without
 	// removing the method — the server asks the capability, not the type.
 	noTools bool
 	err     error
-	got     *golem.ChatRequest
+	got     *switchboard.ChatRequest
 
-	animated map[string]bool
+	connected map[string]bool
 	closed   bool
 }
 
 func (f *fakeBackend) Name() string { return "fake" }
 
-func (f *fakeBackend) Models(ctx context.Context) ([]golem.Model, error) {
-	return []golem.Model{{Name: "test-model", Backend: "fake", Live: true}}, nil
+func (f *fakeBackend) Models(ctx context.Context) ([]switchboard.Model, error) {
+	return []switchboard.Model{{Name: "test-model", Backend: "fake", Live: true}}, nil
 }
 
 func (f *fakeBackend) ToolsSupported() bool { return !f.noTools }
@@ -42,7 +42,7 @@ func (f *fakeBackend) Close() error {
 	return nil
 }
 
-func (f *fakeBackend) Chat(ctx context.Context, req *golem.ChatRequest, emit func(golem.Chunk) error) (*golem.Result, error) {
+func (f *fakeBackend) Chat(ctx context.Context, req *switchboard.ChatRequest, emit func(switchboard.Chunk) error) (*switchboard.Result, error) {
 	f.got = req
 	if f.err != nil {
 		return nil, f.err
@@ -50,46 +50,46 @@ func (f *fakeBackend) Chat(ctx context.Context, req *golem.ChatRequest, emit fun
 	var text strings.Builder
 	for _, c := range f.chunks {
 		text.WriteString(c)
-		if err := emit(golem.Chunk{Text: c}); err != nil {
+		if err := emit(switchboard.Chunk{Text: c}); err != nil {
 			return nil, err
 		}
 	}
 
-	var acc golem.ToolCallAccumulator
+	var acc switchboard.ToolCallAccumulator
 	for _, d := range f.toolDeltas {
 		acc.Add(d)
-		if err := emit(golem.Chunk{ToolCall: &d}); err != nil {
+		if err := emit(switchboard.Chunk{ToolCall: &d}); err != nil {
 			return nil, err
 		}
 	}
 
-	return &golem.Result{
+	return &switchboard.Result{
 		Text: text.String(),
 		// Deliberately a plain stop even when there are tool calls, so that
 		// what the tests observe is the server's own correction.
 		StopReason: "end_turn",
-		Usage:      golem.Usage{InputTokens: 7, OutputTokens: 11},
+		Usage:      switchboard.Usage{InputTokens: 7, OutputTokens: 11},
 		ToolCalls:  acc.Calls(),
 	}, nil
 }
 
-func (f *fakeBackend) Animate(ctx context.Context, model string) error {
-	if f.animated == nil {
-		f.animated = map[string]bool{}
+func (f *fakeBackend) Connect(ctx context.Context, model string) error {
+	if f.connected == nil {
+		f.connected = map[string]bool{}
 	}
-	f.animated[model] = true
+	f.connected[model] = true
 	return nil
 }
 
-func (f *fakeBackend) Rest(model string) bool {
-	was := f.animated[model]
-	delete(f.animated, model)
+func (f *fakeBackend) Disconnect(model string) bool {
+	was := f.connected[model]
+	delete(f.connected, model)
 	return was
 }
 
-func newTestServer(t *testing.T, backend golem.Backend) *httptest.Server {
+func newTestServer(t *testing.T, backend switchboard.Backend) *httptest.Server {
 	t.Helper()
-	reg := golem.NewRegistry()
+	reg := switchboard.NewRegistry()
 	reg.Register(backend, []string{"test-model"})
 	reg.SetDefault("test-model")
 
@@ -110,7 +110,7 @@ func post(t *testing.T, url, body string) *http.Response {
 }
 
 func TestChatCompletion(t *testing.T) {
-	backend := &fakeBackend{chunks: []string{"clay ", "and ", "word"}}
+	backend := &fakeBackend{chunks: []string{"patch ", "me ", "through"}}
 	srv := newTestServer(t, backend)
 
 	resp := post(t, srv.URL+"/v1/chat/completions",
@@ -126,7 +126,7 @@ func TestChatCompletion(t *testing.T) {
 	if len(got.Choices) != 1 {
 		t.Fatalf("choices = %d, want 1", len(got.Choices))
 	}
-	if want := "clay and word"; got.Choices[0].Message.Content != want {
+	if want := "patch me through"; got.Choices[0].Message.Content != want {
 		t.Errorf("content = %q, want %q", got.Choices[0].Message.Content, want)
 	}
 	// end_turn is Bedrock's vocabulary; clients branch on OpenAI's.
@@ -241,25 +241,25 @@ func TestModelsList(t *testing.T) {
 	}
 }
 
-func TestAnimateAndRest(t *testing.T) {
+func TestConnectAndDisconnect(t *testing.T) {
 	backend := &fakeBackend{}
 	srv := newTestServer(t, backend)
 
-	if resp := post(t, srv.URL+"/v1/animate", `{"model":"test-model"}`); resp.StatusCode != http.StatusOK {
-		t.Fatalf("animate: status = %s", resp.Status)
+	if resp := post(t, srv.URL+"/v1/connect", `{"model":"test-model"}`); resp.StatusCode != http.StatusOK {
+		t.Fatalf("connect: status = %s", resp.Status)
 	}
-	if !backend.animated["test-model"] {
-		t.Error("animate did not reach the backend")
+	if !backend.connected["test-model"] {
+		t.Error("connect did not reach the backend")
 	}
 
-	resp := post(t, srv.URL+"/v1/rest", `{"model":"test-model"}`)
+	resp := post(t, srv.URL+"/v1/disconnect", `{"model":"test-model"}`)
 	var state struct{ State string }
 	json.NewDecoder(resp.Body).Decode(&state)
-	if state.State != "resting" {
-		t.Errorf("state = %q, want resting", state.State)
+	if state.State != "disconnected" {
+		t.Errorf("state = %q, want disconnected", state.State)
 	}
-	if backend.animated["test-model"] {
-		t.Error("rest did not unload the model")
+	if backend.connected["test-model"] {
+		t.Error("disconnect did not unload the model")
 	}
 }
 
@@ -269,7 +269,7 @@ const weatherTool = `"tools":[{"type":"function","function":{` +
 	`"parameters":{"type":"object","properties":{"city":{"type":"string"}}}}}]`
 
 func TestChatToolCalls(t *testing.T) {
-	backend := &fakeBackend{toolDeltas: []golem.ToolCallDelta{
+	backend := &fakeBackend{toolDeltas: []switchboard.ToolCallDelta{
 		{Index: 0, ID: "call_1", Name: "get_weather"},
 		{Index: 0, Arguments: `{"city":`},
 		{Index: 0, Arguments: `"Berlin"}`},
@@ -313,7 +313,7 @@ func TestChatToolCalls(t *testing.T) {
 }
 
 func TestChatToolCallsStreaming(t *testing.T) {
-	srv := newTestServer(t, &fakeBackend{toolDeltas: []golem.ToolCallDelta{
+	srv := newTestServer(t, &fakeBackend{toolDeltas: []switchboard.ToolCallDelta{
 		{Index: 0, ID: "call_a", Name: "get_weather"},
 		{Index: 0, Arguments: `{"city":"Oslo"}`},
 		{Index: 1, ID: "call_b", Name: "get_time"},
@@ -328,7 +328,7 @@ func TestChatToolCallsStreaming(t *testing.T) {
 	}
 
 	// Reassemble the way a client would: index correlates the fragments.
-	var acc golem.ToolCallAccumulator
+	var acc switchboard.ToolCallAccumulator
 	var finish string
 	for _, line := range strings.Split(string(body), "\n") {
 		payload, ok := strings.CutPrefix(line, "data: ")
@@ -347,7 +347,7 @@ func TestChatToolCallsStreaming(t *testing.T) {
 				if tc.Index == nil {
 					t.Fatalf("streamed tool call without an index: %q", payload)
 				}
-				acc.Add(golem.ToolCallDelta{
+				acc.Add(switchboard.ToolCallDelta{
 					Index:     *tc.Index,
 					ID:        tc.ID,
 					Name:      tc.Function.Name,
@@ -412,7 +412,7 @@ func TestToolResultReachesBackend(t *testing.T) {
 	if msgs[1].ToolCalls[0].Arguments != `{"city":"Berlin"}` {
 		t.Errorf("arguments = %q", msgs[1].ToolCalls[0].Arguments)
 	}
-	if msgs[2].Role != golem.RoleTool || msgs[2].ToolCallID != "call_1" {
+	if msgs[2].Role != switchboard.RoleTool || msgs[2].ToolCallID != "call_1" {
 		t.Errorf("tool turn = %+v, want role tool answering call_1", msgs[2])
 	}
 }
@@ -437,12 +437,12 @@ func TestToolValidation(t *testing.T) {
 }
 
 func TestParseToolChoice(t *testing.T) {
-	cases := map[string]golem.ToolChoice{
-		`"auto"`:     {Mode: golem.ToolChoiceAuto},
-		`"none"`:     {Mode: golem.ToolChoiceNone},
-		`"required"`: {Mode: golem.ToolChoiceAny},
+	cases := map[string]switchboard.ToolChoice{
+		`"auto"`:     {Mode: switchboard.ToolChoiceAuto},
+		`"none"`:     {Mode: switchboard.ToolChoiceNone},
+		`"required"`: {Mode: switchboard.ToolChoiceAny},
 		`{"type":"function","function":{"name":"get_weather"}}`: {
-			Mode: golem.ToolChoiceTool, Name: "get_weather",
+			Mode: switchboard.ToolChoiceTool, Name: "get_weather",
 		},
 	}
 	for in, want := range cases {

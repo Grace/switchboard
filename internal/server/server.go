@@ -1,8 +1,8 @@
 // Package server exposes the registry over HTTP.
 //
 // The dialect is OpenAI-compatible on purpose: it costs nothing to implement
-// and means every existing client — editors, SDKs, curl — can point at golem
-// without knowing golem exists.
+// and means every existing client — editors, SDKs, curl — can point at switchboard
+// without knowing switchboard exists.
 package server
 
 import (
@@ -15,20 +15,20 @@ import (
 	"strings"
 	"time"
 
-	"github.com/grace/golem/internal/golem"
-	"github.com/grace/golem/internal/wire"
+	"github.com/Grace/switchboard/internal/switchboard"
+	"github.com/Grace/switchboard/internal/wire"
 )
 
-// Server serves the golem HTTP API.
+// Server serves the switchboard HTTP API.
 type Server struct {
-	reg    *golem.Registry
+	reg    *switchboard.Registry
 	logger *log.Logger
 	// now is injected so tests get deterministic timestamps.
 	now func() time.Time
 }
 
 // New builds a server over a registry.
-func New(reg *golem.Registry, logger *log.Logger) *Server {
+func New(reg *switchboard.Registry, logger *log.Logger) *Server {
 	if logger == nil {
 		logger = log.Default()
 	}
@@ -41,74 +41,74 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /healthz", s.handleHealth)
 	mux.HandleFunc("GET /v1/models", s.handleModels)
 	mux.HandleFunc("POST /v1/chat/completions", s.handleChat)
-	mux.HandleFunc("POST /v1/animate", s.handleAnimate)
-	mux.HandleFunc("POST /v1/rest", s.handleRest)
+	mux.HandleFunc("POST /v1/connect", s.handleConnect)
+	mux.HandleFunc("POST /v1/disconnect", s.handleDisconnect)
 	return mux
 }
 
-// Animator is implemented by backends that can load and unload models on
+// Connector is implemented by backends that can load and unload models on
 // demand. Backends that hold no local state simply do not implement it.
-type Animator interface {
-	Animate(ctx context.Context, model string) error
-	Rest(model string) bool
+type Connector interface {
+	Connect(ctx context.Context, model string) error
+	Disconnect(model string) bool
 }
 
 // ToolCaller is implemented by backends that can forward tool definitions to a
-// model. Like Animator, it is an optional capability asked at the door: a
+// model. Like Connector, it is an optional capability asked at the door: a
 // backend that cannot do this does not implement it, and the server turns the
 // request away rather than dropping the tools on the floor.
 type ToolCaller interface {
 	ToolsSupported() bool
 }
 
-func toolsSupported(b golem.Backend) bool {
+func toolsSupported(b switchboard.Backend) bool {
 	tc, ok := b.(ToolCaller)
 	return ok && tc.ToolsSupported()
 }
 
-// handleAnimate loads a model ahead of first use.
-func (s *Server) handleAnimate(w http.ResponseWriter, r *http.Request) {
+// handleConnect loads a model ahead of first use.
+func (s *Server) handleConnect(w http.ResponseWriter, r *http.Request) {
 	backend, model, ok := s.adminTarget(w, r)
 	if !ok {
 		return
 	}
-	animator, canAnimate := backend.(Animator)
-	if !canAnimate {
+	connector, canConnect := backend.(Connector)
+	if !canConnect {
 		writeJSON(w, http.StatusOK, map[string]any{
 			"model": model, "state": "remote",
 			"detail": fmt.Sprintf("%s models are always available; nothing to load", backend.Name()),
 		})
 		return
 	}
-	if err := animator.Animate(r.Context(), model); err != nil {
-		s.logger.Printf("animate %s: %v", model, err)
+	if err := connector.Connect(r.Context(), model); err != nil {
+		s.logger.Printf("connect %s: %v", model, err)
 		writeError(w, http.StatusBadGateway, "backend_error", err.Error())
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"model": model, "state": "animated"})
+	writeJSON(w, http.StatusOK, map[string]any{"model": model, "state": "connected"})
 }
 
-// handleRest unloads a model, freeing its memory.
-func (s *Server) handleRest(w http.ResponseWriter, r *http.Request) {
+// handleDisconnect unloads a model, freeing its memory.
+func (s *Server) handleDisconnect(w http.ResponseWriter, r *http.Request) {
 	backend, model, ok := s.adminTarget(w, r)
 	if !ok {
 		return
 	}
-	animator, canAnimate := backend.(Animator)
-	if !canAnimate {
+	connector, canConnect := backend.(Connector)
+	if !canConnect {
 		writeJSON(w, http.StatusOK, map[string]any{"model": model, "state": "remote"})
 		return
 	}
-	state := "resting"
-	if !animator.Rest(model) {
-		state = "was not animated"
+	state := "disconnected"
+	if !connector.Disconnect(model) {
+		state = "was not connected"
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"model": model, "state": state})
 }
 
 // adminTarget decodes {"model": "..."} and resolves it, reporting any failure
 // to the client itself.
-func (s *Server) adminTarget(w http.ResponseWriter, r *http.Request) (golem.Backend, string, bool) {
+func (s *Server) adminTarget(w http.ResponseWriter, r *http.Request) (switchboard.Backend, string, bool) {
 	var body struct {
 		Model string `json:"model"`
 	}
@@ -164,9 +164,9 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	chatReq := &golem.ChatRequest{
+	chatReq := &switchboard.ChatRequest{
 		Model:       model,
-		Messages:    make([]golem.Message, 0, len(req.Messages)),
+		Messages:    make([]switchboard.Message, 0, len(req.Messages)),
 		MaxTokens:   req.MaxTokens,
 		Temperature: req.Temperature,
 		TopP:        req.TopP,
@@ -206,7 +206,7 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	result, err := backend.Chat(r.Context(), chatReq, func(golem.Chunk) error { return nil })
+	result, err := backend.Chat(r.Context(), chatReq, func(switchboard.Chunk) error { return nil })
 	if err != nil {
 		s.logger.Printf("chat %s: %v", model, err)
 		writeError(w, http.StatusBadGateway, "backend_error", err.Error())
@@ -216,7 +216,7 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 }
 
 // streamChat writes the completion as server-sent events.
-func (s *Server) streamChat(w http.ResponseWriter, r *http.Request, backend golem.Backend, req *golem.ChatRequest, id string) {
+func (s *Server) streamChat(w http.ResponseWriter, r *http.Request, backend switchboard.Backend, req *switchboard.ChatRequest, id string) {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		writeError(w, http.StatusInternalServerError, "server_error", "streaming unsupported by this server")
@@ -242,7 +242,7 @@ func (s *Server) streamChat(w http.ResponseWriter, r *http.Request, backend gole
 		return nil
 	}
 
-	role := string(golem.RoleAssistant)
+	role := string(switchboard.RoleAssistant)
 	err := send(wire.ChatResponse{
 		ID: id, Object: "chat.completion.chunk", Created: created, Model: req.Model,
 		Choices: []wire.Choice{{Index: 0, Delta: &wire.Message{Role: role}}},
@@ -251,7 +251,7 @@ func (s *Server) streamChat(w http.ResponseWriter, r *http.Request, backend gole
 		return
 	}
 
-	result, err := backend.Chat(r.Context(), req, func(c golem.Chunk) error {
+	result, err := backend.Chat(r.Context(), req, func(c switchboard.Chunk) error {
 		delta := &wire.Message{Content: c.Text}
 		if c.ToolCall != nil {
 			delta.ToolCalls = []wire.ToolCall{toWireToolCallDelta(*c.ToolCall)}
@@ -290,7 +290,7 @@ func (s *Server) streamChat(w http.ResponseWriter, r *http.Request, backend gole
 }
 
 // response builds a non-streaming completion body.
-func (s *Server) response(id, model string, result *golem.Result) wire.ChatResponse {
+func (s *Server) response(id, model string, result *switchboard.Result) wire.ChatResponse {
 	finish := finishReasonFor(result)
 	return wire.ChatResponse{
 		ID:      id,
@@ -300,7 +300,7 @@ func (s *Server) response(id, model string, result *golem.Result) wire.ChatRespo
 		Choices: []wire.Choice{{
 			Index: 0,
 			Message: &wire.Message{
-				Role:      string(golem.RoleAssistant),
+				Role:      string(switchboard.RoleAssistant),
 				Content:   result.Text,
 				ToolCalls: toWireToolCalls(result.ToolCalls),
 			},
@@ -311,15 +311,15 @@ func (s *Server) response(id, model string, result *golem.Result) wire.ChatRespo
 }
 
 // toNeutralMessage converts one turn off the wire, flattening OpenAI's nested
-// function object into golem's flat call.
-func toNeutralMessage(m wire.Message) golem.Message {
-	out := golem.Message{
-		Role:       golem.Role(m.Role),
+// function object into switchboard's flat call.
+func toNeutralMessage(m wire.Message) switchboard.Message {
+	out := switchboard.Message{
+		Role:       switchboard.Role(m.Role),
 		Content:    m.Content,
 		ToolCallID: m.ToolCallID,
 	}
 	for _, tc := range m.ToolCalls {
-		out.ToolCalls = append(out.ToolCalls, golem.ToolCall{
+		out.ToolCalls = append(out.ToolCalls, switchboard.ToolCall{
 			ID:        tc.ID,
 			Name:      tc.Function.Name,
 			Arguments: tc.Function.Arguments,
@@ -331,8 +331,8 @@ func toNeutralMessage(m wire.Message) golem.Message {
 // toNeutralTools validates the tools array and flattens it. The schema itself
 // is not inspected — backends hand it to the model, which is the only thing
 // that can judge it.
-func toNeutralTools(tools []wire.Tool) ([]golem.Tool, error) {
-	out := make([]golem.Tool, 0, len(tools))
+func toNeutralTools(tools []wire.Tool) ([]switchboard.Tool, error) {
+	out := make([]switchboard.Tool, 0, len(tools))
 	for i, t := range tools {
 		if t.Type != "" && t.Type != "function" {
 			return nil, fmt.Errorf("tools[%d]: unsupported tool type %q, want \"function\"", i, t.Type)
@@ -340,7 +340,7 @@ func toNeutralTools(tools []wire.Tool) ([]golem.Tool, error) {
 		if t.Function.Name == "" {
 			return nil, fmt.Errorf("tools[%d]: function.name is required", i)
 		}
-		out = append(out, golem.Tool{
+		out = append(out, switchboard.Tool{
 			Name:        t.Function.Name,
 			Description: t.Function.Description,
 			Schema:      t.Function.Parameters,
@@ -351,16 +351,16 @@ func toNeutralTools(tools []wire.Tool) ([]golem.Tool, error) {
 
 // parseToolChoice decodes OpenAI's polymorphic tool_choice: either a bare
 // string ("auto", "none", "required") or a named function object.
-func parseToolChoice(raw json.RawMessage) (*golem.ToolChoice, error) {
+func parseToolChoice(raw json.RawMessage) (*switchboard.ToolChoice, error) {
 	var mode string
 	if err := json.Unmarshal(raw, &mode); err == nil {
 		switch mode {
 		case "auto":
-			return &golem.ToolChoice{Mode: golem.ToolChoiceAuto}, nil
+			return &switchboard.ToolChoice{Mode: switchboard.ToolChoiceAuto}, nil
 		case "none":
-			return &golem.ToolChoice{Mode: golem.ToolChoiceNone}, nil
+			return &switchboard.ToolChoice{Mode: switchboard.ToolChoiceNone}, nil
 		case "required", "any":
-			return &golem.ToolChoice{Mode: golem.ToolChoiceAny}, nil
+			return &switchboard.ToolChoice{Mode: switchboard.ToolChoiceAny}, nil
 		default:
 			return nil, fmt.Errorf("tool_choice %q: want auto, none, or required", mode)
 		}
@@ -378,11 +378,11 @@ func parseToolChoice(raw json.RawMessage) (*golem.ToolChoice, error) {
 	if named.Function.Name == "" {
 		return nil, errors.New("tool_choice: function.name is required")
 	}
-	return &golem.ToolChoice{Mode: golem.ToolChoiceTool, Name: named.Function.Name}, nil
+	return &switchboard.ToolChoice{Mode: switchboard.ToolChoiceTool, Name: named.Function.Name}, nil
 }
 
 // toWireToolCalls renders finished calls onto a complete response.
-func toWireToolCalls(calls []golem.ToolCall) []wire.ToolCall {
+func toWireToolCalls(calls []switchboard.ToolCall) []wire.ToolCall {
 	if len(calls) == 0 {
 		return nil
 	}
@@ -400,7 +400,7 @@ func toWireToolCalls(calls []golem.ToolCall) []wire.ToolCall {
 // toWireToolCallDelta renders one streamed increment. Index goes on every
 // frame so a client can correlate fragments; id, type, and name appear only on
 // the frame that opened the call, which is the shape OpenAI clients expect.
-func toWireToolCallDelta(d golem.ToolCallDelta) wire.ToolCall {
+func toWireToolCallDelta(d switchboard.ToolCallDelta) wire.ToolCall {
 	index := d.Index
 	out := wire.ToolCall{
 		Index:    &index,
@@ -413,7 +413,7 @@ func toWireToolCallDelta(d golem.ToolCallDelta) wire.ToolCall {
 	return out
 }
 
-func usage(result *golem.Result) *wire.Usage {
+func usage(result *switchboard.Result) *wire.Usage {
 	if result.Usage.InputTokens == 0 && result.Usage.OutputTokens == 0 {
 		return nil
 	}
@@ -428,7 +428,7 @@ func usage(result *golem.Result) *wire.Usage {
 // produced tool calls but reported a plain stop is corrected here: clients
 // branch on finish_reason to decide whether to run the tools, and a wrong
 // answer strands the call with no way to notice.
-func finishReasonFor(result *golem.Result) string {
+func finishReasonFor(result *switchboard.Result) string {
 	reason := finishReason(result.StopReason)
 	if len(result.ToolCalls) > 0 && reason == "stop" {
 		return "tool_calls"

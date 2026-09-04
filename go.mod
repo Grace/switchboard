@@ -1,4 +1,4 @@
-module github.com/grace/golem
+module github.com/Grace/switchboard
 
 go 1.24.1
 

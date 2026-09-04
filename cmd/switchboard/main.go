@@ -1,4 +1,4 @@
-// Command golem runs language models on your own machine or in your own
+// Command switchboard runs language models on your own machine or in your own
 // cloud, behind one OpenAI-compatible API.
 package main
 
@@ -8,7 +8,7 @@ import (
 	"os/signal"
 	"syscall"
 
-	"github.com/grace/golem/internal/cli"
+	"github.com/Grace/switchboard/internal/cli"
 )
 
 func main() {

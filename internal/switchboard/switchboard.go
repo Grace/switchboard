@@ -1,9 +1,9 @@
-// Package golem defines the core types every backend speaks.
+// Package switchboard defines the core types every backend speaks.
 //
-// The vocabulary is deliberate: weights sitting on disk are clay, a shem is the
-// written word that animates one of them, and a backend is what does the
-// animating — whether that is llama.cpp on this laptop or Bedrock in us-east-1.
-package golem
+// The vocabulary is deliberate: a line is one routable model as configured, a
+// backend is what actually serves it — llama.cpp on this laptop or Bedrock in
+// us-east-1 — and the registry is what connects a caller to the right one.
+package switchboard
 
 import (
 	"context"
@@ -28,7 +28,7 @@ const (
 // ToolCalls and ToolCallID are the two halves of a tool exchange: an assistant
 // turn asks, and a RoleTool turn answers in Content, naming the call it
 // answers. They sit beside Content rather than inside a content-block union
-// because that is the shape both ends of golem already speak.
+// because that is the shape both ends of switchboard already speak.
 type Message struct {
 	Role       Role       `json:"role"`
 	Content    string     `json:"content"`

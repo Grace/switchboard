@@ -10,7 +10,7 @@ import (
 	"os"
 	"strings"
 
-	"github.com/grace/golem/internal/golem"
+	"github.com/Grace/switchboard/internal/switchboard"
 )
 
 func runRun(ctx context.Context, args []string) error {
@@ -20,7 +20,7 @@ func runRun(ctx context.Context, args []string) error {
 	maxTokens := fs.Int("max-tokens", 0, "cap the response length (0 = model default)")
 	temperature := fs.Float64("temperature", -1, "sampling temperature (<0 = model default)")
 	fs.Usage = func() {
-		fmt.Fprint(os.Stderr, "usage: golem run [flags] [model] [prompt...]\n\n"+
+		fmt.Fprint(os.Stderr, "usage: switchboard run [flags] [model] [prompt...]\n\n"+
 			"With a prompt, prints one response. Without one, opens a chat;\n"+
 			"piped stdin is read as the prompt.\n\nflags:\n")
 		fs.PrintDefaults()
@@ -54,12 +54,12 @@ func runRun(ctx context.Context, args []string) error {
 		return err
 	}
 
-	opts := &golem.ChatRequest{Model: model, MaxTokens: *maxTokens}
+	opts := &switchboard.ChatRequest{Model: model, MaxTokens: *maxTokens}
 	if *temperature >= 0 {
 		opts.Temperature = temperature
 	}
 	if *system != "" {
-		opts.Messages = append(opts.Messages, golem.Message{Role: golem.RoleSystem, Content: *system})
+		opts.Messages = append(opts.Messages, switchboard.Message{Role: switchboard.RoleSystem, Content: *system})
 	}
 
 	if prompt := strings.TrimSpace(strings.Join(rest, " ")); prompt != "" {
@@ -74,15 +74,15 @@ func runRun(ctx context.Context, args []string) error {
 }
 
 // once sends a single prompt and streams the answer to stdout.
-func once(ctx context.Context, backend golem.Backend, base *golem.ChatRequest, prompt string) error {
+func once(ctx context.Context, backend switchboard.Backend, base *switchboard.ChatRequest, prompt string) error {
 	req := *base
-	req.Messages = append(append([]golem.Message{}, base.Messages...),
-		golem.Message{Role: golem.RoleUser, Content: prompt})
+	req.Messages = append(append([]switchboard.Message{}, base.Messages...),
+		switchboard.Message{Role: switchboard.RoleUser, Content: prompt})
 
 	out := bufio.NewWriter(os.Stdout)
 	defer out.Flush()
 
-	_, err := backend.Chat(ctx, &req, func(c golem.Chunk) error {
+	_, err := backend.Chat(ctx, &req, func(c switchboard.Chunk) error {
 		_, err := out.WriteString(c.Text)
 		// Flushing per chunk is what makes the response visibly stream rather
 		// than land all at once when the buffer fills.
@@ -97,9 +97,9 @@ func once(ctx context.Context, backend golem.Backend, base *golem.ChatRequest, p
 }
 
 // chat runs an interactive session, keeping the conversation in memory.
-func chat(ctx context.Context, backend golem.Backend, base *golem.ChatRequest) error {
+func chat(ctx context.Context, backend switchboard.Backend, base *switchboard.ChatRequest) error {
 	req := *base
-	req.Messages = append([]golem.Message{}, base.Messages...)
+	req.Messages = append([]switchboard.Message{}, base.Messages...)
 
 	fmt.Fprintf(os.Stderr, "%s — ctrl-d to leave\n\n", req.Model)
 	in := bufio.NewScanner(os.Stdin)
@@ -117,8 +117,8 @@ func chat(ctx context.Context, backend golem.Backend, base *golem.ChatRequest) e
 			continue
 		}
 
-		req.Messages = append(req.Messages, golem.Message{Role: golem.RoleUser, Content: prompt})
-		result, err := backend.Chat(ctx, &req, func(c golem.Chunk) error {
+		req.Messages = append(req.Messages, switchboard.Message{Role: switchboard.RoleUser, Content: prompt})
+		result, err := backend.Chat(ctx, &req, func(c switchboard.Chunk) error {
 			out.WriteString(c.Text)
 			out.Flush()
 			return nil
@@ -132,11 +132,11 @@ func chat(ctx context.Context, backend golem.Backend, base *golem.ChatRequest) e
 			}
 			// One failed turn should not end the session; drop the turn that
 			// went nowhere so the history stays consistent.
-			fmt.Fprintln(os.Stderr, "golem:", err)
+			fmt.Fprintln(os.Stderr, "switchboard:", err)
 			req.Messages = req.Messages[:len(req.Messages)-1]
 			continue
 		}
-		req.Messages = append(req.Messages, golem.Message{Role: golem.RoleAssistant, Content: result.Text})
+		req.Messages = append(req.Messages, switchboard.Message{Role: switchboard.RoleAssistant, Content: result.Text})
 	}
 }
 

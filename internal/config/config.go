@@ -1,4 +1,4 @@
-// Package config loads golem's configuration file.
+// Package config loads switchboard's configuration file.
 package config
 
 import (
@@ -10,15 +10,15 @@ import (
 	"time"
 )
 
-// Backend identifiers usable in a Shem.
+// Backend identifiers usable in a Line.
 const (
 	BackendLocal   = "local"
 	BackendBedrock = "bedrock"
 )
 
-// Shem is the written word that animates one golem: everything needed to turn
-// weights — on disk or in a region — into a model you can talk to.
-type Shem struct {
+// Line is one routable model as configured: everything needed to reach it,
+// whether that is weights on disk or a model id in a region.
+type Line struct {
 	// Name is what callers ask for, e.g. "qwen3-8b".
 	Name string `json:"name"`
 	// Backend is "local" or "bedrock".
@@ -62,7 +62,7 @@ type Config struct {
 	DefaultModel string  `json:"default_model,omitempty"`
 	Local        Local   `json:"local"`
 	Bedrock      Bedrock `json:"bedrock"`
-	Models       []Shem  `json:"models"`
+	Models       []Line  `json:"models"`
 }
 
 // Duration is a time.Duration that round-trips as a JSON string ("10m").
@@ -88,16 +88,16 @@ func (d *Duration) UnmarshalJSON(b []byte) error {
 // Duration converts back to the standard type.
 func (d Duration) Duration() time.Duration { return time.Duration(d) }
 
-// DefaultPath is ~/.golem/golem.json, overridable with GOLEM_CONFIG.
+// DefaultPath is ~/.switchboard/switchboard.json, overridable with SWITCHBOARD_CONFIG.
 func DefaultPath() string {
-	if p := os.Getenv("GOLEM_CONFIG"); p != "" {
+	if p := os.Getenv("SWITCHBOARD_CONFIG"); p != "" {
 		return p
 	}
 	home, err := os.UserHomeDir()
 	if err != nil {
-		return "golem.json"
+		return "switchboard.json"
 	}
-	return filepath.Join(home, ".golem", "golem.json")
+	return filepath.Join(home, ".switchboard", "switchboard.json")
 }
 
 // Default is the config used when no file exists: an empty roster, sensible
@@ -190,9 +190,9 @@ func (c *Config) Save(path string) error {
 	return os.WriteFile(path, append(data, '\n'), 0o644)
 }
 
-// ModelsFor returns the shems bound to one backend.
-func (c *Config) ModelsFor(backend string) []Shem {
-	var out []Shem
+// ModelsFor returns the lines bound to one backend.
+func (c *Config) ModelsFor(backend string) []Line {
+	var out []Line
 	for _, m := range c.Models {
 		if m.Backend == backend {
 			out = append(out, m)

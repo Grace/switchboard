@@ -1,4 +1,4 @@
-package golem
+package switchboard
 
 import "encoding/json"
 
@@ -49,7 +49,7 @@ type ToolChoice struct {
 
 // ToolCallDelta is one increment of a streamed tool call.
 //
-// Both dialects golem speaks announce a call before they can describe it: the
+// Both dialects switchboard speaks announce a call before they can describe it: the
 // first delta at an index carries ID and Name, and every delta after it adds
 // another fragment of the arguments JSON. Index is what correlates the
 // fragments when a model opens several calls at once.

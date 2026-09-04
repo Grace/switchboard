@@ -1,4 +1,4 @@
-// Package cli implements the golem command line.
+// Package cli implements the switchboard command line.
 package cli
 
 import (
@@ -9,29 +9,29 @@ import (
 	"io"
 	"os"
 
-	"github.com/grace/golem/internal/backend/bedrock"
-	"github.com/grace/golem/internal/backend/local"
-	"github.com/grace/golem/internal/config"
-	"github.com/grace/golem/internal/golem"
+	"github.com/Grace/switchboard/internal/backend/bedrock"
+	"github.com/Grace/switchboard/internal/backend/local"
+	"github.com/Grace/switchboard/internal/config"
+	"github.com/Grace/switchboard/internal/switchboard"
 )
 
 // Version is stamped at build time with -ldflags.
 var Version = "dev"
 
-const usage = `golem — run your own models, on your machine or in your cloud
+const usage = `switchboard — run your own models, on your machine or in your cloud
 
-usage: golem <command> [flags]
+usage: switchboard <command> [flags]
 
 commands:
   serve      serve the HTTP API (OpenAI-compatible)
   run        talk to a model from the terminal
   models     list configured models
-  animate    load a model into memory on a running server
-  rest       unload a model from a running server
+  connect    load a model into memory on a running server
+  disconnect unload a model from a running server
   init       write a starter config file
   version    print the version
 
-run "golem <command> -h" for a command's flags.
+run "switchboard <command> -h" for a command's flags.
 `
 
 // Main runs the CLI and returns a process exit code.
@@ -49,18 +49,18 @@ func Main(ctx context.Context, args []string) int {
 		err = runRun(ctx, args[1:])
 	case "models":
 		err = runModels(ctx, args[1:])
-	case "animate":
-		err = runAnimate(ctx, args[1:])
-	case "rest":
-		err = runRest(ctx, args[1:])
+	case "connect":
+		err = runConnect(ctx, args[1:])
+	case "disconnect":
+		err = runDisconnect(ctx, args[1:])
 	case "init":
 		err = runInit(ctx, args[1:])
 	case "version":
-		fmt.Println("golem", Version)
+		fmt.Println("switchboard", Version)
 	case "-h", "--help", "help":
 		fmt.Print(usage)
 	default:
-		fmt.Fprintf(os.Stderr, "golem: unknown command %q\n\n%s", cmd, usage)
+		fmt.Fprintf(os.Stderr, "switchboard: unknown command %q\n\n%s", cmd, usage)
 		return 2
 	}
 
@@ -73,7 +73,7 @@ func Main(ctx context.Context, args []string) int {
 		// Ctrl-C is a normal way to end a generation, not a failure.
 		return 0
 	default:
-		fmt.Fprintln(os.Stderr, "golem:", err)
+		fmt.Fprintln(os.Stderr, "switchboard:", err)
 		return 1
 	}
 }
@@ -86,7 +86,7 @@ func loadConfig(path string, warn io.Writer) (*config.Config, error) {
 		return nil, err
 	}
 	if !found && warn != nil {
-		fmt.Fprintf(warn, "golem: no config at %s — run 'golem init' to create one\n", path)
+		fmt.Fprintf(warn, "switchboard: no config at %s — run 'switchboard init' to create one\n", path)
 	}
 	return cfg, nil
 }
@@ -94,8 +94,8 @@ func loadConfig(path string, warn io.Writer) (*config.Config, error) {
 // buildRegistry wires up one backend per kind of model the config mentions.
 // Backends with no models are not constructed at all, so a laptop-only config
 // never touches AWS and an AWS-only config never looks for llama-server.
-func buildRegistry(cfg *config.Config) *golem.Registry {
-	reg := golem.NewRegistry()
+func buildRegistry(cfg *config.Config) *switchboard.Registry {
+	reg := switchboard.NewRegistry()
 
 	if models := cfg.ModelsFor(config.BackendLocal); len(models) > 0 {
 		reg.Register(local.New(local.Options{
@@ -116,7 +116,7 @@ func buildRegistry(cfg *config.Config) *golem.Registry {
 	return reg
 }
 
-func names(models []config.Shem) []string {
+func names(models []config.Line) []string {
 	out := make([]string, 0, len(models))
 	for _, m := range models {
 		out = append(out, m.Name)
@@ -126,7 +126,7 @@ func names(models []config.Shem) []string {
 
 // configFlag registers the shared -config flag.
 func configFlag(fs *flag.FlagSet) *string {
-	return fs.String("config", config.DefaultPath(), "path to golem.json")
+	return fs.String("config", config.DefaultPath(), "path to switchboard.json")
 }
 
 // parse runs a flag set, converting the help case into flag.ErrHelp so Main

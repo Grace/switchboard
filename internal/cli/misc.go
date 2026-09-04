@@ -12,7 +12,7 @@ import (
 	"os"
 	"text/tabwriter"
 
-	"github.com/grace/golem/internal/config"
+	"github.com/Grace/switchboard/internal/config"
 )
 
 func runModels(ctx context.Context, args []string) error {
@@ -31,16 +31,16 @@ func runModels(ctx context.Context, args []string) error {
 
 	models := reg.Models(ctx)
 	if len(models) == 0 {
-		fmt.Println("no models configured — run 'golem init' to start a config")
+		fmt.Println("no models configured — run 'switchboard init' to start a config")
 		return nil
 	}
 
 	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
 	fmt.Fprintln(w, "MODEL\tBACKEND\tSTATE\tDETAIL")
 	for _, m := range models {
-		state := "clay"
+		state := "idle"
 		if m.Live {
-			state = "animated"
+			state = "connected"
 		}
 		mark := ""
 		if m.Name == reg.Default() {
@@ -51,12 +51,12 @@ func runModels(ctx context.Context, args []string) error {
 	return w.Flush()
 }
 
-func runAnimate(ctx context.Context, args []string) error {
-	return adminCommand(ctx, "animate", args)
+func runConnect(ctx context.Context, args []string) error {
+	return adminCommand(ctx, "connect", args)
 }
 
-func runRest(ctx context.Context, args []string) error {
-	return adminCommand(ctx, "rest", args)
+func runDisconnect(ctx context.Context, args []string) error {
+	return adminCommand(ctx, "disconnect", args)
 }
 
 // adminCommand drives the server's load/unload endpoints. These act on a
@@ -70,7 +70,7 @@ func adminCommand(ctx context.Context, verb string, args []string) error {
 		return err
 	}
 	if fs.NArg() != 1 {
-		return fmt.Errorf("usage: golem %s <model>", verb)
+		return fmt.Errorf("usage: switchboard %s <model>", verb)
 	}
 
 	addr := *server
@@ -95,7 +95,7 @@ func adminCommand(ctx context.Context, verb string, args []string) error {
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
-		return fmt.Errorf("no server at %s (start one with 'golem serve'): %w", addr, err)
+		return fmt.Errorf("no server at %s (start one with 'switchboard serve'): %w", addr, err)
 	}
 	defer resp.Body.Close()
 
@@ -152,7 +152,7 @@ func runInit(ctx context.Context, args []string) error {
 
 	cfg := config.Default()
 	cfg.DefaultModel = "claude-sonnet"
-	cfg.Models = []config.Shem{
+	cfg.Models = []config.Line{
 		{
 			Name:    "claude-sonnet",
 			Backend: config.BackendBedrock,
@@ -175,6 +175,6 @@ func runInit(ctx context.Context, args []string) error {
 	fmt.Printf("wrote %s\n\nnext:\n"+
 		"  - point the \"local\" model at a .gguf file you have, or delete it\n"+
 		"  - check the bedrock region and model id, or delete that entry\n"+
-		"  - golem models\n", *cfgPath)
+		"  - switchboard models\n", *cfgPath)
 	return nil
 }
