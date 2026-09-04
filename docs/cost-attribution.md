@@ -93,14 +93,15 @@ confirm the `iamPrincipal/` tag splits the way you expect. If it does not, the
 usual causes are a missing `sts:TagSession`, an unactivated cost allocation tag,
 or looking before the 24–48 hour lag.
 
+Redaction of request and response content — the blocker for sending traces off
+the box at all — is now implemented; see [redaction.md](redaction.md).
+
 ## Still not built
 
 - **Spend caps.** No per-team token budget and no enforcement when one is
   exceeded. Visibility tells you spend climbed; it does not stop it.
 - **Chargeback reporting.** No rollup or export — the data is in CUR, not in
   something finance can read without an engineer.
-- **Redaction.** Request and response content is not redacted anywhere yet,
-  which is the blocker for sending traces off the box at all.
 
 If you are running Bedrock for several teams and solving this some other way, I
 would like to hear how. **hello@gracefulco.de**
