@@ -236,3 +236,83 @@ func TestNameIsStable(t *testing.T) {
 		t.Errorf("Name() = %q", b.Name())
 	}
 }
+
+// --- idle reaping --------------------------------------------------------
+
+func liveBackend(t *testing.T, idle time.Duration) (*Backend, *instance) {
+	t.Helper()
+	spec := config.Line{Name: "test-model", Backend: config.BackendLocal, Path: "/nonexistent.gguf"}
+	b := New(Options{IdleTimeout: idle, Logf: func(string, ...any) {}}, []config.Line{spec})
+	inst := &instance{
+		spec: spec, base: "http://127.0.0.1:1",
+		started: time.Now(), lastUsed: time.Now().Add(-time.Hour),
+		done: make(chan struct{}),
+	}
+	// No process to wait on; closing done makes halt return immediately.
+	close(inst.done)
+	b.live["test-model"] = inst
+	return b, inst
+}
+
+func isLive(b *Backend, name string) bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	_, ok := b.live[name]
+	return ok
+}
+
+func TestSweepUnloadsIdleModels(t *testing.T) {
+	b, _ := liveBackend(t, time.Minute)
+	b.sweepIdle()
+	if isLive(b, "test-model") {
+		t.Error("a model idle for an hour should have been unloaded")
+	}
+}
+
+// The property that matters: a long generation can run well past the idle
+// timeout without touching the clock, and unloading its weights mid-stream
+// would kill the request.
+func TestSweepSparesModelsWithRequestsInFlight(t *testing.T) {
+	b, inst := liveBackend(t, time.Minute)
+	b.acquire(inst) // a request begins
+
+	inst.lastUsed = time.Now().Add(-time.Hour) // and runs long
+	b.sweepIdle()
+	if !isLive(b, "test-model") {
+		t.Fatal("a model with a request in flight must not be unloaded")
+	}
+
+	b.release(inst) // request finishes
+	inst.lastUsed = time.Now().Add(-time.Hour)
+	b.sweepIdle()
+	if isLive(b, "test-model") {
+		t.Error("once the request is done the model should be reapable")
+	}
+}
+
+func TestSweepLeavesRecentlyUsedModels(t *testing.T) {
+	b, inst := liveBackend(t, time.Minute)
+	inst.lastUsed = time.Now()
+	b.sweepIdle()
+	if !isLive(b, "test-model") {
+		t.Error("a model used a moment ago should stay loaded")
+	}
+}
+
+// acquire and release move the clock as well as the counter, so a burst of
+// short requests keeps a model alive.
+func TestAcquireAndReleaseTouchTheClock(t *testing.T) {
+	b, inst := liveBackend(t, time.Minute)
+	before := inst.lastUsed
+
+	b.acquire(inst)
+	if !inst.lastUsed.After(before) || inst.inflight != 1 {
+		t.Fatalf("acquire: inflight=%d lastUsed moved=%v", inst.inflight, inst.lastUsed.After(before))
+	}
+	mid := inst.lastUsed
+
+	b.release(inst)
+	if inst.inflight != 0 || inst.lastUsed.Before(mid) {
+		t.Errorf("release: inflight=%d lastUsed=%v", inst.inflight, inst.lastUsed)
+	}
+}

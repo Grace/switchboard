@@ -435,20 +435,31 @@ func (b *Backend) reap() {
 		case <-b.stop:
 			return
 		case <-tick.C:
-			b.mu.Lock()
-			var idle []string
-			for name, inst := range b.live {
-				if inst.inflight == 0 && time.Since(inst.lastUsed) > b.opts.IdleTimeout {
-					idle = append(idle, name)
-				}
-			}
-			b.mu.Unlock()
-
-			for _, name := range idle {
-				b.opts.Logf("%s idle for %s", name, b.opts.IdleTimeout)
-				b.Disconnect(name)
-			}
+			b.sweepIdle()
 		}
+	}
+}
+
+// sweepIdle unloads models that have gone quiet. Separated from the ticker so
+// the decision can be tested without waiting on one.
+//
+// The inflight check is the load-bearing part: weights must not be unloaded out
+// from under a generation in progress. lastUsed alone is not enough, because a
+// long completion can run well past the idle timeout without the request that
+// started it ever touching the clock again.
+func (b *Backend) sweepIdle() {
+	b.mu.Lock()
+	var idle []string
+	for name, inst := range b.live {
+		if inst.inflight == 0 && time.Since(inst.lastUsed) > b.opts.IdleTimeout {
+			idle = append(idle, name)
+		}
+	}
+	b.mu.Unlock()
+
+	for _, name := range idle {
+		b.opts.Logf("%s idle for %s", name, b.opts.IdleTimeout)
+		b.Disconnect(name)
 	}
 }
 
