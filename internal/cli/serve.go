@@ -7,6 +7,7 @@ import (
 	"log"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/Grace/switchboard/internal/audit"
 	"github.com/Grace/switchboard/internal/config"
@@ -46,6 +47,13 @@ func runServe(ctx context.Context, args []string) error {
 	}
 
 	srv := server.New(reg, logger).WithAttribution(cfg.Teams, cfg.Attribution.RequireCaller)
+
+	if lim := cfg.Limiter(); lim != nil {
+		srv = srv.WithLimits(lim)
+		d := cfg.Limits.Default
+		logger.Printf("limits: %d req/min, %d concurrent, %d tokens per %s (per team)",
+			d.RequestsPerMinute, d.Concurrent, d.TokensPerWindow, time.Duration(cfg.Limits.Window))
+	}
 
 	if cfg.OIDC.Enabled {
 		v, err := cfg.OIDC.Build()

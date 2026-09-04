@@ -144,6 +144,8 @@ Working: routing, both backends, streaming and non-streaming completions, tool c
 
 **Redaction and audit.** A structured JSONL record of what was sent to which provider, with redaction applied inside the log itself so no call site can skip it — which is what makes it a control rather than a convention that every application team has to remember. Content logging is refused outright unless redaction rules are configured. See [docs/redaction.md](docs/redaction.md).
 
+**Limits that stop spend, not just report it.** Per-team request rate, concurrency ceiling and token budget over a window — MITRE ATLAS AML.M0004 — enforced against the same identity the provider's bill splits by. Refusals are 429 naming which limit was reached and when it lifts.
+
 **Per-team cost attribution.** A gateway calls Bedrock under one role, so every team's spend lands on the bill as one identity. switchboard resolves a caller's key to a team, assumes a role with that team as the session name and a session tag, and makes the call with those credentials — so the provider bills an identity you can split on. Optionally fails closed on unattributed requests. See [docs/cost-attribution.md](docs/cost-attribution.md), including how to verify it against a real bill.
 
 Not done yet:
@@ -151,7 +153,7 @@ Not done yet:
 - **Tool forwarding on the Bedrock backend.** The local backend forwards tool definitions, `tool_choice`, and tool results to `llama-server`, and assembles streamed tool calls back out; Bedrock does not implement `ToolCaller` yet, so tool requests naming a Bedrock model are refused rather than silently served without them. Wiring Converse's tool blocks is the next piece.
 - **Redaction toward the provider.** Content is redacted before it is written to the audit log, but it still reaches the model as written. Stripping it on the way *out* is a separate feature and is not built.
 - **Spend caps and chargeback reporting.** Per-team attribution now reaches the provider (see below), but there is no token budget, no enforcement when one is exceeded, and no rollup finance can read.
-- **Retry and backpressure.** No throttling-aware retry, concurrency ceiling, or token budget yet.
+- **Retry and backpressure.** No throttling-aware retry yet. Rate, concurrency and token budgets are enforced (see below); retrying a throttled provider is not.
 For a security review, [docs/controls.md](docs/controls.md) maps what switchboard does against SOC 2, ISO 27001, HIPAA, NIST and EU AI Act control objectives — including, deliberately, everything it does not do.
 
 ## Contributing and contact

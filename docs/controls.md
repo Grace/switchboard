@@ -63,7 +63,7 @@ certification. switchboard is software you run; the controls are yours.
 |---|---|---|---|
 | Graceful shutdown without losing work | SOC 2 A1.1 | ✅ | Draining shutdown; local models are unloaded and their processes stopped. |
 | Health checking | SOC 2 A1.1 · NIST SI-4 | ✅ | `GET /healthz`. |
-| Resource limits | SOC 2 A1.1 | ❌ | No rate limiting, concurrency ceiling, or token budget. A runaway caller is not contained. |
+| Resource limits | SOC 2 A1.1 · NIST SC-5 · ATLAS AML.M0004 | ✅ | Per-team request rate, concurrency ceiling and token budget over a window, keyed on the caller identity attribution resolves. Refusals are 429 naming which limit was hit. Tokens are charged after a completion, so a team may overshoot by one request. |
 | Failure is reported honestly | SOC 2 CC7.3 | ✅ | A mid-stream backend error becomes an error frame before `[DONE]` rather than a truncated response that reads as a short success. Backends that cannot forward tools refuse the request rather than silently dropping them. |
 
 ---
@@ -76,7 +76,9 @@ certification. switchboard is software you run; the controls are yours.
 | Deployer retains logs ≥6 months | EU AI Act Art. 26 | ❌ | Retention is not implemented. |
 | Policy enforcement at the model boundary | MITRE ATLAS AML.M0033 | ◐ | Team-scoped access and fail-closed configuration. No content policy or output filtering. |
 | Telemetry logging | MITRE ATLAS AML.M0024 | ✅ | The audit log. |
-| Adversarial input detection | MITRE ATLAS AML.M0015 | ❌ | Not built, deliberately: [injection-study](https://github.com/Grace/injection-study) measures why content matching does not hold up, which is the reason this design enforces at the boundary rather than trying to recognise malice. |
+| Limit model queries | MITRE ATLAS AML.M0004 | ✅ | Request rate, concurrency and token budgets per team. See [cost-attribution.md](cost-attribution.md). |
+| Adversarial input detection | MITRE ATLAS AML.M0015 | ❌ | Not built, deliberately. [injection-study](https://github.com/Grace/injection-study) measures why signature matching does not hold: past a single-word rewrite similarity collapses below any deployable threshold, and the false positives fire at the default. A gateway is well placed to bound what a model may *do* and badly placed to guess what an input *means*, so the mitigations here are structural — access, limits, redaction, audit — rather than semantic. |
+| Generative AI guardrails | MITRE ATLAS AML.M0020 | ❌ | Same position as M0015. A filter that fires at 90% produces a support burden and a false sense of safety at once. |
 
 ---
 
@@ -93,7 +95,8 @@ verification is a narrow in-house implementation rather than a JOSE dependency;
 [sso.md](sso.md) explains that choice and the adversarial tests that pin it, and
 swapping it for a vetted library is one file if your review requires that.
 
-It does no content filtering, no rate limiting, and no retention management, and
-does not pretend to.
+It does no content filtering and no retention management, and does not pretend
+to. The absence of content filtering is a position rather than a gap: see the
+ATLAS row below.
 
 Questions: **hello@gracefulco.de**

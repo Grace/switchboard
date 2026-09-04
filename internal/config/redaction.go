@@ -65,6 +65,9 @@ func (c *Config) validateIO() error {
 	// The rule worth being loud about: content logging is the moment prompts
 	// stop being transient and acquire a retention policy. Doing that with no
 	// redaction configured is almost always an accident.
+	if err := c.Limits.validate(c.Teams); err != nil {
+		return err
+	}
 	if c.Vault.Enabled {
 		if err := c.Vault.validate(c.Redaction, c.Audit); err != nil {
 			return err

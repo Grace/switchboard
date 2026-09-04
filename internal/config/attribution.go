@@ -41,6 +41,8 @@ type Attribution struct {
 type Team struct {
 	Name string   `json:"name"`
 	Keys []string `json:"keys"`
+	// Limits overrides the default allowance for this team.
+	Limits TeamLimits `json:"limits,omitempty"`
 }
 
 // AWS constrains both, and a violation is a runtime error from STS rather than

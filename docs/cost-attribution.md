@@ -96,10 +96,47 @@ or looking before the 24–48 hour lag.
 Redaction of request and response content — the blocker for sending traces off
 the box at all — is now implemented; see [redaction.md](redaction.md).
 
-## Still not built
+## Stopping spend, not just watching it
 
-- **Spend caps.** No per-team token budget and no enforcement when one is
-  exceeded. Visibility tells you spend climbed; it does not stop it.
+Attribution tells you a team's spend climbed. Limits stop it — MITRE ATLAS
+**AML.M0004**, Limit Model Queries, which with metered inference is also the
+denial-of-wallet defence.
+
+```json
+{
+  "limits": {
+    "enabled": true,
+    "window": "24h",
+    "default": { "requests_per_minute": 120, "concurrent": 8, "tokens_per_window": 5000000 }
+  },
+  "teams": [
+    { "name": "search", "keys": ["…"], "limits": { "tokens_per_window": 20000000 } }
+  ]
+}
+```
+
+Three limits, because they fail differently. A **request rate** bounds how fast
+a caller can ask. A **concurrency ceiling** bounds work in flight, which is what
+protects a shared local model from one caller. A **token budget** over a window
+bounds spend, and is the only one a patient caller cannot simply wait out.
+
+A refusal is a 429 carrying `Retry-After` and `X-RateLimit-Limit` naming which
+limit was reached, because "slow down" and "your team has spent its budget for
+the day" need different responses from whoever is holding the error.
+
+Enforcement is keyed on the same identity attribution resolves, so a budget is
+spent by the team the provider's own invoice will independently confirm. Callers
+that presented no key share one allowance, so an anonymous flood is bounded even
+where `require_caller` is off.
+
+**One request of overshoot is deliberate.** Tokens are charged after a
+completion, not reserved before it, because reserving needs a prediction of how
+long a response will be — which is not knowable, and refusing anything that
+*might* overrun turns a budget into a much smaller one. A team can therefore
+exceed its budget by a single request, and is refused from then until the window
+rolls.
+
+## Still not built
 - **Chargeback reporting.** No rollup or export — the data is in CUR, not in
   something finance can read without an engineer.
 

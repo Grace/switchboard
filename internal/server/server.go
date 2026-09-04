@@ -12,11 +12,13 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/Grace/switchboard/internal/audit"
 	"github.com/Grace/switchboard/internal/config"
+	"github.com/Grace/switchboard/internal/limit"
 	"github.com/Grace/switchboard/internal/oidc"
 	"github.com/Grace/switchboard/internal/switchboard"
 	"github.com/Grace/switchboard/internal/wire"
@@ -39,6 +41,60 @@ type Server struct {
 
 	// oidc verifies bearer tokens when an identity provider is configured.
 	oidc *oidc.Verifier
+
+	// limits bounds what a caller may consume. Nil means unlimited.
+	limits *limit.Limiter
+}
+
+// WithLimits bounds requests, concurrency and token spend per caller —
+// MITRE ATLAS AML.M0004.
+func (s *Server) WithLimits(l *limit.Limiter) *Server {
+	s.limits = l
+	return s
+}
+
+// admit applies the caller's allowance, answering 429 with enough detail to act
+// on. "Slow down" and "your team has spent its budget for the day" need
+// different responses from whoever is holding the error.
+func (s *Server) admit(w http.ResponseWriter, r *http.Request) (func(), bool) {
+	if s.limits == nil {
+		return func() {}, true
+	}
+	var team string
+	if c, ok := switchboard.CallerFrom(r.Context()); ok {
+		team = c.Team
+	}
+
+	release, err := s.limits.Acquire(team)
+	if err == nil {
+		return release, true
+	}
+
+	var ex *limit.Exceeded
+	if !errors.As(err, &ex) {
+		writeError(w, http.StatusInternalServerError, "server_error", err.Error())
+		return nil, false
+	}
+	retry := int(ex.RetryAfter.Seconds())
+	if retry < 1 {
+		retry = 1
+	}
+	w.Header().Set("Retry-After", strconv.Itoa(retry))
+	w.Header().Set("X-RateLimit-Limit", ex.Limit)
+	writeError(w, http.StatusTooManyRequests, "rate_limit_exceeded", ex.Error())
+	return nil, false
+}
+
+// charge records what a completion actually used, against the caller's budget.
+func (s *Server) charge(ctx context.Context, usage switchboard.Usage) {
+	if s.limits == nil {
+		return
+	}
+	var team string
+	if c, ok := switchboard.CallerFrom(ctx); ok {
+		team = c.Team
+	}
+	s.limits.Charge(team, usage.InputTokens+usage.OutputTokens)
 }
 
 // WithOIDC lets the server accept identity-provider tokens as well as static
@@ -318,6 +374,12 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	release, ok := s.admit(w, r)
+	if !ok {
+		return
+	}
+	defer release()
+
 	backend, model, err := s.reg.Resolve(req.Model)
 	if err != nil {
 		status, kind := http.StatusNotFound, "model_not_found"
@@ -381,6 +443,7 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadGateway, "backend_error", err.Error())
 		return
 	}
+	s.charge(r.Context(), result.Usage)
 	s.record(r.Context(), audit.Record{
 		ID: id, Model: model, Backend: backend.Name(),
 		Prompt: promptText(chatReq), Completion: result.Text,
@@ -456,6 +519,7 @@ func (s *Server) streamChat(w http.ResponseWriter, r *http.Request, backend swit
 		return
 	}
 
+	s.charge(r.Context(), result.Usage)
 	s.record(r.Context(), audit.Record{
 		ID: id, Model: req.Model, Backend: backend.Name(), Streamed: true,
 		Prompt: promptText(req), Completion: result.Text,

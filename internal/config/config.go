@@ -72,6 +72,8 @@ type Config struct {
 	Audit Audit `json:"audit,omitempty"`
 	// Vault seals redacted values for recovery during an investigation.
 	Vault Vault `json:"vault,omitempty"`
+	// Limits bounds what callers may consume.
+	Limits Limits `json:"limits,omitempty"`
 	// Teams are the attribution units and their API keys.
 	Teams []Team `json:"teams,omitempty"`
 	// OIDC trusts an identity provider instead of shared keys.

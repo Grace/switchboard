@@ -15,9 +15,11 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/Grace/switchboard/internal/audit"
 	"github.com/Grace/switchboard/internal/config"
+	"github.com/Grace/switchboard/internal/limit"
 	"github.com/Grace/switchboard/internal/oidc"
 	"github.com/Grace/switchboard/internal/redact"
 	"github.com/Grace/switchboard/internal/switchboard"
@@ -783,4 +785,106 @@ func TestStaticKeysStillWorkAlongsideOIDC(t *testing.T) {
 	if resp := postAs(t, srv.URL+"/v1/chat/completions", "key-search-0123456789", chatBody); resp.StatusCode != http.StatusOK {
 		t.Errorf("status = %d; a static key must not need the identity provider", resp.StatusCode)
 	}
+}
+
+// --- limits (ATLAS AML.M0004) --------------------------------------------
+
+func limitedServer(t *testing.T, backend switchboard.Backend, l *limit.Limiter) *httptest.Server {
+	t.Helper()
+	reg := switchboard.NewRegistry()
+	reg.Register(backend, []string{"test-model"})
+	reg.SetDefault("test-model")
+	s := New(reg, log.New(io.Discard, "", 0)).
+		WithAttribution([]config.Team{
+			{Name: "search", Keys: []string{"key-search-0123456789"}},
+			{Name: "billing", Keys: []string{"key-billing-0123456789"}},
+		}, false).
+		WithLimits(l)
+	srv := httptest.NewServer(s.Handler())
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+// A refusal has to say which limit and when it lifts. "Slow down" and "your
+// team has spent its budget" need different responses from the caller.
+func TestRateLimitAnswers429WithDetail(t *testing.T) {
+	l := limit.New(limit.Limits{RequestsPerMinute: 1, Window: time.Hour}, nil)
+	srv := limitedServer(t, &fakeBackend{chunks: []string{"ok"}}, l)
+
+	if resp := postAs(t, srv.URL+"/v1/chat/completions", "key-search-0123456789", chatBody); resp.StatusCode != http.StatusOK {
+		t.Fatalf("first request = %d", resp.StatusCode)
+	}
+	resp := postAs(t, srv.URL+"/v1/chat/completions", "key-search-0123456789", chatBody)
+	if resp.StatusCode != http.StatusTooManyRequests {
+		t.Fatalf("second request = %d, want 429", resp.StatusCode)
+	}
+	if resp.Header.Get("Retry-After") == "" {
+		t.Error("a 429 must say when to retry")
+	}
+	if got := resp.Header.Get("X-RateLimit-Limit"); got != "request rate" {
+		t.Errorf("X-RateLimit-Limit = %q, should name which limit was hit", got)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	if !strings.Contains(string(body), "search") {
+		t.Errorf("the error should name the team: %s", body)
+	}
+}
+
+// The budget is enforced against the same identity the bill splits by, and it
+// is charged from the tokens actually used.
+func TestTokenBudgetStopsATeamNotTheGateway(t *testing.T) {
+	l := limit.New(limit.Limits{TokensPerWindow: 5, Window: time.Hour}, nil)
+	backend := &fakeBackend{chunks: []string{"hello"}}
+	srv := limitedServer(t, backend, l)
+
+	// First request succeeds and charges the team past its budget.
+	if resp := postAs(t, srv.URL+"/v1/chat/completions", "key-search-0123456789", chatBody); resp.StatusCode != http.StatusOK {
+		t.Fatalf("first = %d", resp.StatusCode)
+	}
+	resp := postAs(t, srv.URL+"/v1/chat/completions", "key-search-0123456789", chatBody)
+	if resp.StatusCode != http.StatusTooManyRequests {
+		t.Fatalf("second = %d, want 429 once the budget is spent", resp.StatusCode)
+	}
+	if got := resp.Header.Get("X-RateLimit-Limit"); got != "token budget" {
+		t.Errorf("X-RateLimit-Limit = %q", got)
+	}
+
+	// The other team is untouched: a budget is per caller, not per gateway.
+	if resp := postAs(t, srv.URL+"/v1/chat/completions", "key-billing-0123456789", chatBody); resp.StatusCode != http.StatusOK {
+		t.Errorf("billing = %d; one team's spend must not bind another", resp.StatusCode)
+	}
+}
+
+func TestNoLimiterMeansNoLimit(t *testing.T) {
+	srv := limitedServer(t, &fakeBackend{chunks: []string{"ok"}}, nil)
+	for i := 0; i < 20; i++ {
+		if resp := postAs(t, srv.URL+"/v1/chat/completions", "key-search-0123456789", chatBody); resp.StatusCode != http.StatusOK {
+			t.Fatalf("request %d = %d with no limiter configured", i, resp.StatusCode)
+		}
+	}
+}
+
+// A streaming completion holds its concurrency slot until the last token, not
+// until the handler returns.
+func TestSlotIsHeldForTheWholeStream(t *testing.T) {
+	l := limit.New(limit.Limits{Concurrent: 1, Window: time.Hour}, nil)
+
+	started := make(chan struct{})
+	finish := make(chan struct{})
+	backend := &fakeBackend{chunks: []string{"a"}, onChat: func(context.Context) {
+		close(started)
+		<-finish
+	}}
+	srv := limitedServer(t, backend, l)
+
+	go func() {
+		postAs(t, srv.URL+"/v1/chat/completions", "key-search-0123456789", chatBody)
+	}()
+	<-started
+
+	resp := postAs(t, srv.URL+"/v1/chat/completions", "key-search-0123456789", chatBody)
+	if resp.StatusCode != http.StatusTooManyRequests {
+		t.Errorf("status = %d; the slot should still be held mid-completion", resp.StatusCode)
+	}
+	close(finish)
 }
