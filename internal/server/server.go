@@ -65,6 +65,9 @@ func (s *Server) record(ctx context.Context, r audit.Record) {
 	if c, ok := switchboard.CallerFrom(ctx); ok {
 		r.Team, r.Subject = c.Team, c.Subject
 	}
+	if c, ok := conversationFrom(ctx); ok {
+		r.Conversation = c
+	}
 	if err := s.audit.Write(r); err != nil {
 		s.logger.Printf("audit: %v", err)
 	}
@@ -138,6 +141,35 @@ func (s *Server) caller(r *http.Request) (switchboard.Caller, bool) {
 		return switchboard.Caller{}, false
 	}
 	return switchboard.Caller{Team: team, Subject: claims.Subject}, true
+}
+
+type conversationKey struct{}
+
+// Conversations are the client's to name. switchboard is stateless — every
+// request carries its whole history — so nothing here can infer that two calls
+// belong to the same thread. A caller that wants its turns linked in the audit
+// log says so with a header.
+const conversationHeader = "X-Conversation-Id"
+
+func conversationFrom(ctx context.Context) (string, bool) {
+	v, ok := ctx.Value(conversationKey{}).(string)
+	return v, ok && v != ""
+}
+
+// sanitiseConversation bounds what a client can write into the log.
+func sanitiseConversation(s string) string {
+	if len(s) > 128 {
+		s = s[:128]
+	}
+	out := make([]rune, 0, len(s))
+	for _, r := range s {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9',
+			r == '-', r == '_', r == '.', r == ':':
+			out = append(out, r)
+		}
+	}
+	return string(out)
 }
 
 func knownTeam(teams []config.Team, name string) bool {
@@ -265,6 +297,9 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
+	if id := sanitiseConversation(r.Header.Get(conversationHeader)); id != "" {
+		r = r.WithContext(context.WithValue(r.Context(), conversationKey{}, id))
+	}
 	if c, ok := s.caller(r); ok {
 		r = r.WithContext(switchboard.WithCaller(r.Context(), c))
 	} else if s.requireCaller {

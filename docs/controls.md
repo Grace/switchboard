@@ -46,7 +46,7 @@ certification. switchboard is software you run; the controls are yours.
 | Data can be kept in-region or on-premises | ISO 27001 A.5.34 · FedRAMP SA-9 | ✅ | Bedrock region is configured; the local backend serves models on the host with no cloud dependency at all, for networks where no provider is reachable. |
 | Redaction toward the provider | ISO 27001 A.8.11 | ❌ | Content is redacted before it is logged. It still reaches the model as written. |
 | Encryption in transit | SOC 2 CC6.7 · HIPAA §164.312(e)(1) | ◐ | Provider calls use the SDK's TLS. **The gateway's own listener is plain HTTP** and expects to sit behind a TLS terminator; it binds loopback by default. |
-| Encryption at rest | HIPAA §164.312(a)(2)(iv) · NIST SC-28 | ❌ | The audit log is a file with 0600 permissions. Encryption at rest is the filesystem's job. |
+| Encryption at rest | HIPAA §164.312(a)(2)(iv) · NIST SC-28 | ◐ | Sealed values are encrypted with AES-256-GCM under RSA-OAEP-wrapped keys, to a public key the gateway holds no private half of. **The audit log itself is a 0600 file; encrypting it is the filesystem's job.** |
 
 ## Configuration and change management
 

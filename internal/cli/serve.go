@@ -11,6 +11,7 @@ import (
 	"github.com/Grace/switchboard/internal/audit"
 	"github.com/Grace/switchboard/internal/config"
 	"github.com/Grace/switchboard/internal/server"
+	"github.com/Grace/switchboard/internal/vault"
 )
 
 func runServe(ctx context.Context, args []string) error {
@@ -61,11 +62,32 @@ func runServe(ctx context.Context, args []string) error {
 		if err != nil {
 			return fmt.Errorf("redaction: %w", err)
 		}
+		if cfg.Vault.Enabled {
+			// Tokens are what a sealed value is recovered by, so they are the
+			// prerequisite rather than an option alongside.
+			red = red.WithTokens(audit.KeyFromEnv())
+		}
+
 		lg, err := audit.Open(config.ExpandPath(cfg.Audit.Path), red, cfg.Audit.LogContent)
 		if err != nil {
 			return fmt.Errorf("audit log: %w", err)
 		}
 		defer lg.Close()
+
+		if cfg.Vault.Enabled {
+			pub, err := vault.LoadPublicKey(config.ExpandPath(cfg.Vault.PublicKey))
+			if err != nil {
+				return fmt.Errorf("vault: %w", err)
+			}
+			vw, err := vault.Open(config.ExpandPath(cfg.Vault.Path), pub)
+			if err != nil {
+				return fmt.Errorf("vault: %w", err)
+			}
+			defer vw.Close()
+			lg = lg.WithVault(vw)
+			logger.Printf("vault: sealing redacted values to %s (this process cannot read them back)",
+				cfg.Vault.PublicKey)
+		}
 
 		what := "metadata only"
 		if cfg.Audit.LogContent {

@@ -13,6 +13,9 @@
 package redact
 
 import (
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"regexp"
 	"sort"
@@ -82,6 +85,53 @@ func BuiltinNames() []string {
 // Redactor applies a fixed set of rules.
 type Redactor struct {
 	rules []Rule
+	// tokenKey, when set, makes each placeholder carry a stable identifier
+	// derived from the value. See WithTokens.
+	tokenKey []byte
+}
+
+// Hit is one thing removed: which rule caught it, the token written in its
+// place, and the value itself.
+//
+// The value never reaches the log. It exists here so a caller can encrypt it to
+// a key this process cannot read back — see internal/vault.
+type Hit struct {
+	Rule  string
+	Token string
+	Value string
+}
+
+// WithTokens makes placeholders carry a stable identifier: `[redacted:email:a3f1c2]`
+// rather than `[redacted:email]`.
+//
+// The identifier is a truncated HMAC of the value under key, so the same value
+// produces the same token everywhere and a different value effectively never
+// collides with it. That buys two things a bare placeholder cannot: an
+// investigator can see the same address recurred across six prompts, and can
+// confirm a suspected value by deriving its token and comparing — without the
+// value ever being written down.
+//
+// The rule name is part of the input, so the same string caught by two
+// different rules does not produce the same token.
+func (r *Redactor) WithTokens(key []byte) *Redactor {
+	if r == nil {
+		return nil
+	}
+	r.tokenKey = key
+	return r
+}
+
+// Tokenised reports whether placeholders carry value identifiers.
+func (r *Redactor) Tokenised() bool { return r != nil && len(r.tokenKey) > 0 }
+
+func (r *Redactor) token(rule, value string) string {
+	m := hmac.New(sha256.New, r.tokenKey)
+	m.Write([]byte(rule))
+	m.Write([]byte{0})
+	m.Write([]byte(value))
+	// Six bytes is twelve hex characters: enough that a collision across a
+	// realistic corpus is not a practical concern, short enough to read.
+	return hex.EncodeToString(m.Sum(nil)[:6])
 }
 
 // New compiles a redactor from built-in rule names and custom patterns.
@@ -144,24 +194,40 @@ func New(builtinNames []string, custom []Rule) (*Redactor, error) {
 // can record that three email addresses passed through without recording any of
 // them.
 func (r *Redactor) Apply(s string) (string, map[string]int) {
+	out, counts, _ := r.ApplyDetailed(s)
+	return out, counts
+}
+
+// ApplyDetailed additionally returns what was removed.
+//
+// Hits carry the plaintext, which is the one place in the system it exists
+// after redaction. Callers either use it immediately and drop it, or encrypt it
+// to a key they cannot read back. Nothing writes it anywhere else.
+func (r *Redactor) ApplyDetailed(s string) (string, map[string]int, []Hit) {
 	if r == nil || len(r.rules) == 0 || s == "" {
-		return s, nil
+		return s, nil, nil
 	}
 	counts := map[string]int{}
+	var hits []Hit
+
 	for _, rule := range r.rules {
-		placeholder := "[redacted:" + rule.Name + "]"
 		s = rule.re.ReplaceAllStringFunc(s, func(m string) string {
 			if rule.confirm != nil && !rule.confirm(m) {
 				return m
 			}
 			counts[rule.Name]++
-			return placeholder
+			if !r.Tokenised() {
+				return "[redacted:" + rule.Name + "]"
+			}
+			tok := r.token(rule.Name, m)
+			hits = append(hits, Hit{Rule: rule.Name, Token: tok, Value: m})
+			return "[redacted:" + rule.Name + ":" + tok + "]"
 		})
 	}
 	if len(counts) == 0 {
-		return s, nil
+		return s, nil, nil
 	}
-	return s, counts
+	return s, counts, hits
 }
 
 // Rules reports the rule names in the order they are applied.

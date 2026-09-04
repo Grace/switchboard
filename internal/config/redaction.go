@@ -65,6 +65,11 @@ func (c *Config) validateIO() error {
 	// The rule worth being loud about: content logging is the moment prompts
 	// stop being transient and acquire a retention policy. Doing that with no
 	// redaction configured is almost always an accident.
+	if c.Vault.Enabled {
+		if err := c.Vault.validate(c.Redaction, c.Audit); err != nil {
+			return err
+		}
+	}
 	if c.Audit.LogContent && c.Redaction.Empty() {
 		return fmt.Errorf(
 			"audit.log_content is set but no redaction rules are configured: " +

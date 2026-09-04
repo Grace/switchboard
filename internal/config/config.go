@@ -70,6 +70,8 @@ type Config struct {
 	Redaction Redaction `json:"redaction,omitempty"`
 	// Audit records what was sent to which provider.
 	Audit Audit `json:"audit,omitempty"`
+	// Vault seals redacted values for recovery during an investigation.
+	Vault Vault `json:"vault,omitempty"`
 	// Teams are the attribution units and their API keys.
 	Teams []Team `json:"teams,omitempty"`
 	// OIDC trusts an identity provider instead of shared keys.

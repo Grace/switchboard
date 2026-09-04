@@ -9,12 +9,14 @@ import (
 
 	"github.com/Grace/switchboard/internal/audit"
 	"github.com/Grace/switchboard/internal/config"
+	"github.com/Grace/switchboard/internal/vault"
 )
 
 const auditUsage = `usage: switchboard audit <verify|show> [flags]
 
   verify   walk the chain and report the first entry that does not hold
   show     print every entry for one completion id
+  recover  decrypt sealed values, given the private key
 
 An audit log is evidence only if an edit to it is detectable. Each entry
 carries the digest of the one before it, and its own digest covers that link,
@@ -37,12 +39,18 @@ func runAudit(_ context.Context, args []string) error {
 	cfgPath := configFlag(fs)
 	path := fs.String("path", "", "audit log to read (default: audit.path from config)")
 	id := fs.String("id", "", "completion id, for show")
+	keyPath := fs.String("key", "", "PEM private key, for recover")
+	vaultPath := fs.String("vault", "", "sealed-value store (default: vault.path from config)")
+	token := fs.String("token", "", "value token to recover; omit for all")
 	if err := parse(fs, rest); err != nil {
 		return err
 	}
 
+	// Only verify and show read the log. recover works from the vault and the
+	// private key alone, which is the point: it runs where the key is, which is
+	// deliberately not where the gateway runs.
 	logPath := *path
-	if logPath == "" {
+	if logPath == "" && sub != "recover" {
 		cfg, err := loadConfig(*cfgPath, os.Stderr)
 		if err != nil {
 			return err
@@ -61,6 +69,23 @@ func runAudit(_ context.Context, args []string) error {
 			return fmt.Errorf("show needs -id")
 		}
 		return auditShow(logPath, *id)
+	case "recover":
+		if *keyPath == "" {
+			return fmt.Errorf("recover needs -key: the gateway is never given the " +
+				"private half, so recovery is an out-of-band act by whoever holds it")
+		}
+		vp := *vaultPath
+		if vp == "" {
+			cfg, err := loadConfig(*cfgPath, os.Stderr)
+			if err != nil {
+				return err
+			}
+			if cfg.Vault.Path == "" {
+				return fmt.Errorf("no vault configured: set vault.path, or pass -vault")
+			}
+			vp = config.ExpandPath(cfg.Vault.Path)
+		}
+		return auditRecover(vp, *keyPath, *token)
 	default:
 		fmt.Fprint(os.Stderr, auditUsage)
 		return fmt.Errorf("unknown audit command %q", sub)
@@ -121,3 +146,28 @@ type brokenError struct{}
 func (brokenError) Error() string { return "audit chain does not verify" }
 
 var errBroken = brokenError{}
+
+// auditRecover decrypts sealed values. This runs wherever the private key is,
+// which is deliberately not where the gateway runs.
+func auditRecover(vaultPath, keyPath, token string) error {
+	priv, err := vault.LoadPrivateKey(config.ExpandPath(keyPath))
+	if err != nil {
+		return err
+	}
+	var tokens []string
+	if token != "" {
+		tokens = []string{token}
+	}
+	found, err := vault.Recover(config.ExpandPath(vaultPath), priv, tokens...)
+	if err != nil {
+		return err
+	}
+	if len(found) == 0 {
+		return fmt.Errorf("nothing to recover in %s", vaultPath)
+	}
+	for _, r := range found {
+		fmt.Printf("%-14s %-18s %s\n", r.Token, r.Rule, r.Value)
+	}
+	fmt.Fprintf(os.Stderr, "\n%d value(s) recovered. This is the plaintext redaction removed; handle accordingly.\n", len(found))
+	return nil
+}

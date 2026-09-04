@@ -154,3 +154,90 @@ func TestRulesAreReported(t *testing.T) {
 		t.Errorf("Rules() = %q", got)
 	}
 }
+
+// --- stable tokens -------------------------------------------------------
+
+// The forensic property: the same value produces the same token wherever it
+// appears, so an investigator can see it recurred without it ever being stored.
+func TestTokensAreStableAcrossCalls(t *testing.T) {
+	r := mustNew(t, []string{"email"}).WithTokens([]byte("audit-key"))
+
+	a, _, hitsA := r.ApplyDetailed("write to grace@example.com")
+	b, _, hitsB := r.ApplyDetailed("cc grace@example.com again")
+
+	if len(hitsA) != 1 || len(hitsB) != 1 {
+		t.Fatalf("hits = %v, %v", hitsA, hitsB)
+	}
+	if hitsA[0].Token != hitsB[0].Token {
+		t.Errorf("the same address produced different tokens: %q vs %q", hitsA[0].Token, hitsB[0].Token)
+	}
+	if !strings.Contains(a, hitsA[0].Token) || !strings.Contains(b, hitsB[0].Token) {
+		t.Errorf("token should appear in the placeholder: %q / %q", a, b)
+	}
+	if strings.Contains(a, "grace@example.com") {
+		t.Error("the value must not survive in the text")
+	}
+}
+
+func TestDifferentValuesGetDifferentTokens(t *testing.T) {
+	r := mustNew(t, []string{"email"}).WithTokens([]byte("audit-key"))
+	_, _, hits := r.ApplyDetailed("a@x.com and b@y.com")
+	if len(hits) != 2 || hits[0].Token == hits[1].Token {
+		t.Errorf("hits = %+v", hits)
+	}
+}
+
+// An investigator with a suspect derives the token and compares. That is the
+// confirm path, and it must work without the value being stored anywhere.
+func TestASuspectedValueCanBeConfirmed(t *testing.T) {
+	key := []byte("audit-key")
+	r := mustNew(t, []string{"email"}).WithTokens(key)
+	_, _, hits := r.ApplyDetailed("exfiltrate to attacker@evil.com now")
+
+	suspect := mustNew(t, []string{"email"}).WithTokens(key).token("email", "attacker@evil.com")
+	if suspect != hits[0].Token {
+		t.Errorf("deriving a suspect's token should match the logged one: %q vs %q", suspect, hits[0].Token)
+	}
+
+	wrong := mustNew(t, []string{"email"}).WithTokens(key).token("email", "innocent@example.com")
+	if wrong == hits[0].Token {
+		t.Error("an unrelated address must not match")
+	}
+}
+
+// Without the key, tokens are not derivable — which is what stops the log
+// itself from being a lookup table.
+func TestTokensDependOnTheKey(t *testing.T) {
+	_, _, a := mustNew(t, []string{"email"}).WithTokens([]byte("key-one")).ApplyDetailed("x@y.com")
+	_, _, b := mustNew(t, []string{"email"}).WithTokens([]byte("key-two")).ApplyDetailed("x@y.com")
+	if a[0].Token == b[0].Token {
+		t.Error("different keys must produce different tokens")
+	}
+}
+
+// The same string caught by two rules must not correlate across them.
+func TestTokensAreScopedToTheirRule(t *testing.T) {
+	r := mustNew(t, nil,
+		Rule{Name: "alpha", Pattern: `SECRET-[0-9]+`},
+		Rule{Name: "beta", Pattern: `SECRET-[0-9]+`},
+	).WithTokens([]byte("k"))
+	if r.token("alpha", "SECRET-1") == r.token("beta", "SECRET-1") {
+		t.Error("the same value under different rules must not share a token")
+	}
+}
+
+// Untokenised redaction keeps the old placeholder exactly, and reports no hits,
+// so nothing holds a plaintext value it was not asked to.
+func TestWithoutTokensNothingIsRetained(t *testing.T) {
+	r := mustNew(t, []string{"email"})
+	out, counts, hits := r.ApplyDetailed("mail grace@example.com")
+	if out != "mail [redacted:email]" {
+		t.Errorf("out = %q", out)
+	}
+	if counts["email"] != 1 {
+		t.Errorf("counts = %v", counts)
+	}
+	if hits != nil {
+		t.Errorf("no tokens configured, so no values should be handed back: %+v", hits)
+	}
+}

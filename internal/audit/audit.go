@@ -9,12 +9,14 @@ package audit
 
 import (
 	"encoding/json"
+	"fmt"
 	"io"
 	"os"
 	"sync"
 	"time"
 
 	"github.com/Grace/switchboard/internal/redact"
+	"github.com/Grace/switchboard/internal/vault"
 )
 
 // Record is one completion, as the log sees it.
@@ -25,12 +27,13 @@ type Record struct {
 	Seq  uint64 `json:"seq"`
 	Prev string `json:"prev,omitempty"`
 
-	Time    time.Time `json:"time"`
-	ID      string    `json:"id"`
-	Team    string    `json:"team,omitempty"`
-	Subject string    `json:"subject,omitempty"`
-	Model   string    `json:"model"`
-	Backend string    `json:"backend,omitempty"`
+	Time         time.Time `json:"time"`
+	ID           string    `json:"id"`
+	Conversation string    `json:"conversation,omitempty"`
+	Team         string    `json:"team,omitempty"`
+	Subject      string    `json:"subject,omitempty"`
+	Model        string    `json:"model"`
+	Backend      string    `json:"backend,omitempty"`
 
 	PromptTokens     int    `json:"prompt_tokens"`
 	CompletionTokens int    `json:"completion_tokens"`
@@ -61,6 +64,7 @@ type Log struct {
 
 	red     *redact.Redactor
 	content bool
+	vault   *vault.Writer
 
 	signer signer
 	seq    uint64
@@ -97,6 +101,15 @@ func newLog(w io.WriteCloser, red *redact.Redactor, content bool) *Log {
 	return &Log{w: w, enc: json.NewEncoder(w), red: red, content: content}
 }
 
+// WithVault seals redacted values to a key this process cannot read back, so an
+// investigation can recover them out of band. See internal/vault.
+func (l *Log) WithVault(w *vault.Writer) *Log {
+	if l != nil {
+		l.vault = w
+	}
+	return l
+}
+
 // Signed reports whether entries are being MACed with a key rather than only
 // digested. Callers surface this at startup: "auditing" and "auditing in a way
 // that survives someone editing the file" are different claims.
@@ -116,13 +129,22 @@ func (l *Log) Write(r Record) error {
 
 	if l.red != nil {
 		var c1, c2 map[string]int
-		prompt, c1 = l.red.Apply(prompt)
-		completion, c2 = l.red.Apply(completion)
+		var h1, h2 []redact.Hit
+		prompt, c1, h1 = l.red.ApplyDetailed(prompt)
+		completion, c2, h2 = l.red.ApplyDetailed(completion)
 		for k, v := range c1 {
 			counts[k] += v
 		}
 		for k, v := range c2 {
 			counts[k] += v
+		}
+		// Values are sealed to a key this process cannot read. If sealing
+		// fails, the entry is still written: losing the audit record because
+		// recovery was unavailable would be the worse outcome.
+		for _, h := range append(h1, h2...) {
+			if err := l.vault.Seal(h.Token, h.Rule, h.Value); err != nil {
+				return fmt.Errorf("sealing %s: %w", h.Rule, err)
+			}
 		}
 	}
 	if len(counts) > 0 {
