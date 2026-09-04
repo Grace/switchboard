@@ -17,13 +17,36 @@ switchboard is a small, readable implementation of that shape. It runs on a lapt
 
 ## Quickstart
 
-```sh
-go install github.com/Grace/switchboard/cmd/switchboard@latest
+Sixty seconds to a working endpoint. Pick one:
 
-switchboard init                # writes ~/.switchboard/switchboard.json
-switchboard models              # list what's configured
-switchboard serve               # http://127.0.0.1:11435
+```sh
+# Docker — serves the Bedrock path, credentials from your environment
+docker run --rm -p 11435:11435 \
+  -e AWS_REGION -e AWS_PROFILE -v ~/.aws:/home/nonroot/.aws:ro \
+  ghcr.io/grace/switchboard:latest
 ```
+
+```sh
+# Binary — no toolchain needed, macOS and Linux, amd64 and arm64
+# grab the tarball for your platform from the releases page, then:
+./switchboard init                # writes ~/.switchboard/switchboard.json
+./switchboard serve               # http://127.0.0.1:11435
+```
+
+```sh
+# From source, if you already have Go
+go install github.com/Grace/switchboard/cmd/switchboard@latest
+```
+
+Then, whichever you chose:
+
+```sh
+switchboard models              # list what's configured
+```
+
+The container image serves models in your AWS account. Local models need a
+`llama.cpp` process and access to the GPU, so run the binary on the host for
+those — same config file, same API.
 
 Point anything that speaks OpenAI at it:
 
@@ -105,7 +128,19 @@ Not done yet:
 
 - **Tool forwarding in the backends.** The neutral types, the OpenAI translation both directions, streamed tool-call deltas, and `finish_reason` correction are all implemented and tested — but neither shipped backend implements `ToolCaller`, so tool requests are currently refused rather than served. Wiring Bedrock's Converse tool blocks is the next piece.
 - **I/O controls.** Redaction of request and response content, and a structured audit log of what was sent to which provider, are the reason a gateway earns its place in a regulated network. Not built.
+- **Cost attribution past the proxy.** Token usage is recorded per request, but a caller identity is not carried through to Bedrock in a form the bill can see — so per-team spend collapses into the gateway's own service role. See [docs/cost-attribution.md](docs/cost-attribution.md).
 - **Retry and backpressure.** No throttling-aware retry, concurrency ceiling, or token budget yet.
+
+## Contributing and contact
+
+Issues and pull requests are welcome, and [GitHub Discussions](https://github.com/Grace/switchboard/discussions)
+is the right place for questions and design arguments.
+
+**Running this at work?** I would genuinely like to hear about it — what you put
+it in front of, what broke, and what you needed that is not there. Especially if
+you are hitting the cost-attribution problem above.
+
+**hello@gracefulco.de**
 
 ## License
 

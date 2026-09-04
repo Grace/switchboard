@@ -1,0 +1,39 @@
+version: 2
+
+before:
+  hooks:
+    - go mod tidy
+
+builds:
+  - id: switchboard
+    main: ./cmd/switchboard
+    binary: switchboard
+    env: [CGO_ENABLED=0]
+    flags: [-trimpath]
+    ldflags:
+      - -s -w -X main.version={{.Version}} -X main.commit={{.ShortCommit}}
+    goos: [linux, darwin]
+    goarch: [amd64, arm64]
+
+archives:
+  - formats: [tar.gz]
+    name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+
+checksum:
+  name_template: checksums.txt
+
+changelog:
+  use: github
+  sort: asc
+  filters:
+    exclude: ["^docs:", "^test:", "^chore:"]
+
+release:
+  footer: |
+    ## Install
+
+    ```sh
+    # macOS / Linux — download, verify, run
+    tar xzf switchboard_{{ .Version }}_$(uname -s | tr A-Z a-z)_$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/').tar.gz
+    ./switchboard serve
+    ```

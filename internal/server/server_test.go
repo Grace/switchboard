@@ -26,7 +26,7 @@ type fakeBackend struct {
 	got     *switchboard.ChatRequest
 
 	connected map[string]bool
-	closed   bool
+	closed    bool
 }
 
 func (f *fakeBackend) Name() string { return "fake" }
