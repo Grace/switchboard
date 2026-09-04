@@ -1,16 +1,22 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"log"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
+	"github.com/Grace/switchboard/internal/audit"
 	"github.com/Grace/switchboard/internal/config"
+	"github.com/Grace/switchboard/internal/redact"
 	"github.com/Grace/switchboard/internal/switchboard"
 	"github.com/Grace/switchboard/internal/wire"
 )
@@ -578,5 +584,103 @@ func TestBearerParsing(t *testing.T) {
 		if got != want || ok != (want != "") {
 			t.Errorf("bearer(%q) = %q,%v; want %q", header, got, ok, want)
 		}
+	}
+}
+
+// --- audit ---------------------------------------------------------------
+
+// End to end: a request carrying a team and an email address should produce an
+// audit record that names the team, counts the redaction, and does not contain
+// the address.
+func TestAuditRecordsRedactedCompletion(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "audit.jsonl")
+	red, err := redact.New([]string{"email"}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lg, err := audit.Open(path, red, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { lg.Close() })
+
+	reg := switchboard.NewRegistry()
+	reg.Register(&fakeBackend{chunks: []string{"reply to ops@example.com"}}, []string{"test-model"})
+	reg.SetDefault("test-model")
+	s := New(reg, log.New(io.Discard, "", 0)).
+		WithAttribution([]config.Team{{Name: "search", Keys: []string{"key-search-0123456789"}}}, false).
+		WithAudit(lg)
+	srv := httptest.NewServer(s.Handler())
+	t.Cleanup(srv.Close)
+
+	body := `{"messages":[{"role":"user","content":"mail grace@example.com"}]}`
+	if resp := postAs(t, srv.URL+"/v1/chat/completions", "key-search-0123456789", body); resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d", resp.StatusCode)
+	}
+	if err := lg.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(raw), "grace@example.com") || strings.Contains(string(raw), "ops@example.com") {
+		t.Fatalf("raw address reached the audit log: %s", raw)
+	}
+
+	var rec audit.Record
+	if err := json.Unmarshal(bytes.TrimSpace(raw), &rec); err != nil {
+		t.Fatalf("decode %q: %v", raw, err)
+	}
+	if rec.Team != "search" {
+		t.Errorf("team = %q, want search", rec.Team)
+	}
+	// One in the prompt, one in the completion.
+	if rec.Redactions["email"] != 2 {
+		t.Errorf("redactions = %v, want 2 emails", rec.Redactions)
+	}
+	if !strings.Contains(rec.Prompt, "[redacted:email]") {
+		t.Errorf("prompt = %q", rec.Prompt)
+	}
+	if rec.Model != "test-model" {
+		t.Errorf("model = %q", rec.Model)
+	}
+}
+
+// A backend failure is still a record: "nothing was sent" and "we do not know"
+// are different answers during an incident review.
+func TestAuditRecordsBackendErrors(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "audit.jsonl")
+	lg, err := audit.Open(path, nil, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reg := switchboard.NewRegistry()
+	reg.Register(&fakeBackend{err: errors.New("upstream exploded")}, []string{"test-model"})
+	reg.SetDefault("test-model")
+	s := New(reg, log.New(io.Discard, "", 0)).WithAudit(lg)
+	srv := httptest.NewServer(s.Handler())
+	t.Cleanup(srv.Close)
+
+	post(t, srv.URL+"/v1/chat/completions", `{"messages":[{"role":"user","content":"hi"}]}`)
+	if err := lg.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	raw, _ := os.ReadFile(path)
+	var rec audit.Record
+	if err := json.Unmarshal(bytes.TrimSpace(raw), &rec); err != nil {
+		t.Fatalf("decode %q: %v", raw, err)
+	}
+	if !strings.Contains(rec.Error, "upstream exploded") {
+		t.Errorf("error not recorded: %+v", rec)
+	}
+}
+
+func TestNoAuditLogIsFine(t *testing.T) {
+	srv := newTestServer(t, &fakeBackend{chunks: []string{"ok"}})
+	if resp := post(t, srv.URL+"/v1/chat/completions", `{"messages":[{"role":"user","content":"hi"}]}`); resp.StatusCode != http.StatusOK {
+		t.Errorf("status = %d without an audit log", resp.StatusCode)
 	}
 }

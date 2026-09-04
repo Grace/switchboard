@@ -6,7 +6,10 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"strings"
 
+	"github.com/Grace/switchboard/internal/audit"
+	"github.com/Grace/switchboard/internal/config"
 	"github.com/Grace/switchboard/internal/server"
 )
 
@@ -42,6 +45,27 @@ func runServe(ctx context.Context, args []string) error {
 	}
 
 	srv := server.New(reg, logger).WithAttribution(cfg.Teams, cfg.Attribution.RequireCaller)
+
+	if cfg.Audit.Enabled {
+		red, err := cfg.Redaction.Build()
+		if err != nil {
+			return fmt.Errorf("redaction: %w", err)
+		}
+		lg, err := audit.Open(config.ExpandPath(cfg.Audit.Path), red, cfg.Audit.LogContent)
+		if err != nil {
+			return fmt.Errorf("audit log: %w", err)
+		}
+		defer lg.Close()
+
+		what := "metadata only"
+		if cfg.Audit.LogContent {
+			what = "redacted content"
+		}
+		logger.Printf("audit log: %s (%s; rules: %s)",
+			cfg.Audit.Path, what, strings.Join(red.Rules(), ", "))
+		srv = srv.WithAudit(lg)
+	}
+
 	if err := srv.ListenAndServe(ctx, cfg.Listen); err != nil {
 		return fmt.Errorf("serve: %w", err)
 	}

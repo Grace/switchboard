@@ -1,6 +1,9 @@
 package config
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func base() *Config {
 	return &Config{
@@ -108,5 +111,75 @@ func TestTeamForKey(t *testing.T) {
 	}
 	if _, ok := TeamForKey(teams, ""); ok {
 		t.Error("empty key must not resolve")
+	}
+}
+
+// --- redaction and audit -------------------------------------------------
+
+// The rule worth protecting: content logging is the moment prompts stop being
+// transient and acquire a retention policy. Doing that with no redaction
+// configured is refused, not silently allowed.
+func TestLogContentRequiresRedaction(t *testing.T) {
+	c := base()
+	c.Audit = Audit{Enabled: true, Path: "/tmp/a.jsonl", LogContent: true}
+	err := c.Validate()
+	if err == nil {
+		t.Fatal("log_content with no redaction rules must be refused")
+	}
+	if !strings.Contains(err.Error(), "refusing") {
+		t.Errorf("error should say what it refused: %v", err)
+	}
+
+	c.Redaction = Redaction{Rules: []string{"email"}}
+	if err := c.Validate(); err != nil {
+		t.Errorf("with rules it should validate: %v", err)
+	}
+}
+
+func TestAuditNeedsPathAndCoherentFlags(t *testing.T) {
+	c := base()
+	c.Audit = Audit{Enabled: true}
+	if err := c.Validate(); err == nil {
+		t.Error("audit.enabled with no path must be refused")
+	}
+
+	c = base()
+	c.Audit = Audit{LogContent: true}
+	if err := c.Validate(); err == nil {
+		t.Error("log_content without enabled must be refused")
+	}
+}
+
+// A pattern that does not compile is a startup error in front of whoever wrote
+// it, not a rule that silently never fires.
+func TestBadRedactionRuleFailsAtLoad(t *testing.T) {
+	c := base()
+	c.Redaction = Redaction{Rules: []string{"no_such_rule"}}
+	if err := c.Validate(); err == nil {
+		t.Error("unknown built-in rule must be refused")
+	}
+
+	c = base()
+	c.Redaction = Redaction{Custom: []CustomRule{{Name: "x", Pattern: "([oops"}}}
+	if err := c.Validate(); err == nil {
+		t.Error("uncompilable custom pattern must be refused")
+	}
+}
+
+func TestRedactionBuildsWhatItDeclares(t *testing.T) {
+	r := Redaction{Rules: []string{"email"}, Custom: []CustomRule{{Name: "acct", Pattern: `ACCT-\d+`}}}
+	red, err := r.Build()
+	if err != nil {
+		t.Fatal(err)
+	}
+	out, counts := red.Apply("grace@example.com ACCT-99")
+	if counts["email"] != 1 || counts["acct"] != 1 {
+		t.Errorf("counts = %v (out %q)", counts, out)
+	}
+	if r.Empty() {
+		t.Error("declared rules should not report empty")
+	}
+	if !(Redaction{}).Empty() {
+		t.Error("no rules should report empty")
 	}
 }

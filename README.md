@@ -124,12 +124,14 @@ AWS credentials come from the standard chain — environment, shared config, SSO
 
 Working: routing, both backends, streaming and non-streaming completions, token usage accounting, model lifecycle, graceful drain on shutdown. The HTTP surface and the tool-translation layer are covered by tests.
 
+**Redaction and audit.** A structured JSONL record of what was sent to which provider, with redaction applied inside the log itself so no call site can skip it — which is what makes it a control rather than a convention that every application team has to remember. Content logging is refused outright unless redaction rules are configured. See [docs/redaction.md](docs/redaction.md).
+
 **Per-team cost attribution.** A gateway calls Bedrock under one role, so every team's spend lands on the bill as one identity. switchboard resolves a caller's key to a team, assumes a role with that team as the session name and a session tag, and makes the call with those credentials — so the provider bills an identity you can split on. Optionally fails closed on unattributed requests. See [docs/cost-attribution.md](docs/cost-attribution.md), including how to verify it against a real bill.
 
 Not done yet:
 
 - **Tool forwarding in the backends.** The neutral types, the OpenAI translation both directions, streamed tool-call deltas, and `finish_reason` correction are all implemented and tested — but neither shipped backend implements `ToolCaller`, so tool requests are currently refused rather than served. Wiring Bedrock's Converse tool blocks is the next piece.
-- **I/O controls.** Redaction of request and response content, and a structured audit log of what was sent to which provider, are the reason a gateway earns its place in a regulated network. Not built.
+- **Redaction toward the provider.** Content is redacted before it is written to the audit log, but it still reaches the model as written. Stripping it on the way *out* is a separate feature and is not built.
 - **Spend caps and chargeback reporting.** Per-team attribution now reaches the provider (see below), but there is no token budget, no enforcement when one is exceeded, and no rollup finance can read.
 - **Retry and backpressure.** No throttling-aware retry, concurrency ceiling, or token budget yet.
 

@@ -15,6 +15,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Grace/switchboard/internal/audit"
 	"github.com/Grace/switchboard/internal/config"
 	"github.com/Grace/switchboard/internal/switchboard"
 	"github.com/Grace/switchboard/internal/wire"
@@ -31,6 +32,44 @@ type Server struct {
 	// requireCaller refuses requests that present none.
 	teams         []config.Team
 	requireCaller bool
+
+	// audit records what was sent to which provider. Nil means no log.
+	audit *audit.Log
+}
+
+// WithAudit gives the server a log to record completions in. Redaction is the
+// log's own concern: the server hands it raw content and the log decides what
+// survives, so no call site here can forget to redact.
+func (s *Server) WithAudit(l *audit.Log) *Server {
+	s.audit = l
+	return s
+}
+
+// record writes one completion to the audit log, if there is one.
+func (s *Server) record(ctx context.Context, r audit.Record) {
+	if s.audit == nil {
+		return
+	}
+	if c, ok := switchboard.CallerFrom(ctx); ok {
+		r.Team = c.Team
+	}
+	if err := s.audit.Write(r); err != nil {
+		s.logger.Printf("audit: %v", err)
+	}
+}
+
+// promptText flattens a request into the text an audit log should consider.
+func promptText(req *switchboard.ChatRequest) string {
+	var b strings.Builder
+	for i, m := range req.Messages {
+		if i > 0 {
+			b.WriteString("\n")
+		}
+		b.WriteString(string(m.Role))
+		b.WriteString(": ")
+		b.WriteString(m.Content)
+	}
+	return b.String()
 }
 
 // New builds a server over a registry.
@@ -256,9 +295,20 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	result, err := backend.Chat(r.Context(), chatReq, func(switchboard.Chunk) error { return nil })
 	if err != nil {
 		s.logger.Printf("chat %s: %v", model, err)
+		s.record(r.Context(), audit.Record{
+			ID: id, Model: model, Backend: backend.Name(),
+			Prompt: promptText(chatReq), Error: err.Error(),
+		})
 		writeError(w, http.StatusBadGateway, "backend_error", err.Error())
 		return
 	}
+	s.record(r.Context(), audit.Record{
+		ID: id, Model: model, Backend: backend.Name(),
+		Prompt: promptText(chatReq), Completion: result.Text,
+		PromptTokens:     result.Usage.InputTokens,
+		CompletionTokens: result.Usage.OutputTokens,
+		StopReason:       result.StopReason,
+	})
 	writeJSON(w, http.StatusOK, s.response(id, model, result))
 }
 
@@ -309,6 +359,10 @@ func (s *Server) streamChat(w http.ResponseWriter, r *http.Request, backend swit
 		})
 	})
 	if err != nil {
+		s.record(r.Context(), audit.Record{
+			ID: id, Model: req.Model, Backend: backend.Name(), Streamed: true,
+			Prompt: promptText(req), Error: err.Error(),
+		})
 		// The headers are long gone, so the only honest way to report a
 		// mid-stream failure is an error frame before [DONE].
 		if r.Context().Err() == nil {
@@ -322,6 +376,14 @@ func (s *Server) streamChat(w http.ResponseWriter, r *http.Request, backend swit
 		}
 		return
 	}
+
+	s.record(r.Context(), audit.Record{
+		ID: id, Model: req.Model, Backend: backend.Name(), Streamed: true,
+		Prompt: promptText(req), Completion: result.Text,
+		PromptTokens:     result.Usage.InputTokens,
+		CompletionTokens: result.Usage.OutputTokens,
+		StopReason:       result.StopReason,
+	})
 
 	finish := finishReasonFor(result)
 	final := wire.ChatResponse{

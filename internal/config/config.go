@@ -66,6 +66,10 @@ type Config struct {
 
 	// Attribution splits provider spend back out by caller. See attribution.go.
 	Attribution Attribution `json:"attribution,omitempty"`
+	// Redaction strips sensitive content before anything is written down.
+	Redaction Redaction `json:"redaction,omitempty"`
+	// Audit records what was sent to which provider.
+	Audit Audit `json:"audit,omitempty"`
 	// Teams are the attribution units and their API keys.
 	Teams []Team `json:"teams,omitempty"`
 }
@@ -178,7 +182,10 @@ func (c *Config) Validate() error {
 	default:
 		return fmt.Errorf("local.device %q: want auto, metal, cuda, or cpu", c.Local.Device)
 	}
-	return c.Attribution.validate(c.Teams)
+	if err := c.Attribution.validate(c.Teams); err != nil {
+		return err
+	}
+	return c.validateIO()
 }
 
 // Save writes the config, creating the parent directory if needed.
