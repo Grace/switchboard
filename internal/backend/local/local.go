@@ -111,6 +111,14 @@ func New(opts Options, models []config.Line) *Backend {
 // Name implements switchboard.Backend.
 func (b *Backend) Name() string { return config.BackendLocal }
 
+// ToolsSupported implements server.ToolCaller.
+//
+// llama-server renders tool definitions through the model's own chat template,
+// which it applies by default (--jinja). Whether a given model then produces a
+// well-formed call is the model's business; the forwarding works either way,
+// and claiming otherwise would make the server refuse requests it can serve.
+func (b *Backend) ToolsSupported() bool { return true }
+
 // Models implements switchboard.Backend.
 func (b *Backend) Models(context.Context) ([]switchboard.Model, error) {
 	b.mu.Lock()
@@ -181,9 +189,61 @@ func toWire(req *switchboard.ChatRequest) wire.ChatRequest {
 		StreamOptions: &wire.StreamOptions{IncludeUsage: true},
 	}
 	for _, m := range req.Messages {
-		out.Messages = append(out.Messages, wire.Message{Role: string(m.Role), Content: m.Content})
+		msg := wire.Message{
+			Role:       string(m.Role),
+			Content:    m.Content,
+			ToolCallID: m.ToolCallID,
+		}
+		for _, tc := range m.ToolCalls {
+			msg.ToolCalls = append(msg.ToolCalls, wire.ToolCall{
+				ID:       tc.ID,
+				Type:     "function",
+				Function: wire.ToolCallFunction{Name: tc.Name, Arguments: tc.Arguments},
+			})
+		}
+		out.Messages = append(out.Messages, msg)
+	}
+
+	for _, t := range req.Tools {
+		out.Tools = append(out.Tools, wire.Tool{
+			Type: "function",
+			Function: wire.ToolFunction{
+				Name:        t.Name,
+				Description: t.Description,
+				Parameters:  t.Schema,
+			},
+		})
+	}
+	if choice := toWireToolChoice(req.ToolChoice); choice != nil {
+		out.ToolChoice = choice
 	}
 	return out
+}
+
+// toWireToolChoice renders the neutral choice back into OpenAI's polymorphic
+// field. Nil means "say nothing", which llama-server reads as auto.
+func toWireToolChoice(c *switchboard.ToolChoice) json.RawMessage {
+	if c == nil {
+		return nil
+	}
+	switch c.Mode {
+	case switchboard.ToolChoiceNone:
+		return json.RawMessage(`"none"`)
+	case switchboard.ToolChoiceAny:
+		// Neutral "any" is OpenAI's "required": call something, model's pick.
+		return json.RawMessage(`"required"`)
+	case switchboard.ToolChoiceTool:
+		named, err := json.Marshal(map[string]any{
+			"type":     "function",
+			"function": map[string]string{"name": c.Name},
+		})
+		if err != nil {
+			return nil
+		}
+		return named
+	default:
+		return json.RawMessage(`"auto"`)
+	}
 }
 
 // readSSE consumes an OpenAI-style event stream, emitting each delta.
@@ -193,6 +253,7 @@ func readSSE(r io.Reader, emit func(switchboard.Chunk) error) (*switchboard.Resu
 	scanner.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
 
 	var text strings.Builder
+	var tools switchboard.ToolCallAccumulator
 	result := &switchboard.Result{}
 
 	for scanner.Scan() {
@@ -221,7 +282,32 @@ func readSSE(r io.Reader, emit func(switchboard.Chunk) error) (*switchboard.Resu
 			if choice.FinishReason != nil && *choice.FinishReason != "" {
 				result.StopReason = *choice.FinishReason
 			}
-			if choice.Delta == nil || choice.Delta.Content == "" {
+			if choice.Delta == nil {
+				continue
+			}
+
+			// A frame carries text or a tool-call fragment, never both, so the
+			// tool branch cannot be folded into the content check below.
+			for _, tc := range choice.Delta.ToolCalls {
+				// Index is optional on the wire: a server streaming a single
+				// call may omit it entirely, which means index 0.
+				index := 0
+				if tc.Index != nil {
+					index = *tc.Index
+				}
+				delta := switchboard.ToolCallDelta{
+					Index:     index,
+					ID:        tc.ID,
+					Name:      tc.Function.Name,
+					Arguments: tc.Function.Arguments,
+				}
+				tools.Add(delta)
+				if err := emit(switchboard.Chunk{ToolCall: &delta}); err != nil {
+					return nil, err
+				}
+			}
+
+			if choice.Delta.Content == "" {
 				continue
 			}
 			text.WriteString(choice.Delta.Content)
@@ -235,6 +321,9 @@ func readSSE(r io.Reader, emit func(switchboard.Chunk) error) (*switchboard.Resu
 	}
 
 	result.Text = text.String()
+	// The non-streaming path and the finish reason both need the assembled
+	// calls, so report them here rather than making each caller reduce deltas.
+	result.ToolCalls = tools.Calls()
 	return result, nil
 }
 

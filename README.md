@@ -134,7 +134,7 @@ AWS credentials come from the standard chain — environment, shared config, SSO
 
 ## Status
 
-Working: routing, both backends, streaming and non-streaming completions, token usage accounting, model lifecycle, graceful drain on shutdown. The HTTP surface and the tool-translation layer are covered by tests.
+Working: routing, both backends, streaming and non-streaming completions, tool calling on the local backend, token usage accounting, model lifecycle, graceful drain on shutdown. The HTTP surface and the tool-translation layer are covered by tests.
 
 **SSO.** Callers can present an OIDC token instead of a shared key, so the audit log records a person rather than a credential. Verification is a deliberately narrow implementation over the standard library — RS256/ES256, verification only — with the algorithm chosen from the key rather than the token, and an adversarial test suite that constructs each classic attack and asserts it is refused. See [docs/sso.md](docs/sso.md).
 
@@ -148,7 +148,7 @@ Working: routing, both backends, streaming and non-streaming completions, token 
 
 Not done yet:
 
-- **Tool forwarding in the backends.** The neutral types, the OpenAI translation both directions, streamed tool-call deltas, and `finish_reason` correction are all implemented and tested — but neither shipped backend implements `ToolCaller`, so tool requests are currently refused rather than served. Wiring Bedrock's Converse tool blocks is the next piece.
+- **Tool forwarding on the Bedrock backend.** The local backend forwards tool definitions, `tool_choice`, and tool results to `llama-server`, and assembles streamed tool calls back out; Bedrock does not implement `ToolCaller` yet, so tool requests naming a Bedrock model are refused rather than silently served without them. Wiring Converse's tool blocks is the next piece.
 - **Redaction toward the provider.** Content is redacted before it is written to the audit log, but it still reaches the model as written. Stripping it on the way *out* is a separate feature and is not built.
 - **Spend caps and chargeback reporting.** Per-team attribution now reaches the provider (see below), but there is no token budget, no enforcement when one is exceeded, and no rollup finance can read.
 - **Retry and backpressure.** No throttling-aware retry, concurrency ceiling, or token budget yet.

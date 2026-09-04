@@ -316,3 +316,187 @@ func TestAcquireAndReleaseTouchTheClock(t *testing.T) {
 		t.Errorf("release: inflight=%d lastUsed=%v", inst.inflight, inst.lastUsed)
 	}
 }
+
+// --- tool forwarding ---------------------------------------------------
+//
+// The server refuses tool requests for any backend that does not implement
+// server.ToolCaller, so these cover both halves of the contract: that the
+// definitions reach llama-server, and that the calls it streams back come out
+// assembled.
+
+func TestToolsAreSupported(t *testing.T) {
+	b := New(Options{}, nil)
+	if !b.ToolsSupported() {
+		t.Error("ToolsSupported() = false; the server will refuse tool requests")
+	}
+}
+
+func TestChatForwardsToolDefinitions(t *testing.T) {
+	var got wire.ChatRequest
+	b, _ := stub(t, func(w http.ResponseWriter, r *http.Request) {
+		json.NewDecoder(r.Body).Decode(&got)
+		io.WriteString(w, sse(chunkFrame("ok")))
+	})
+
+	_, _ = collect(t, b, &switchboard.ChatRequest{
+		Model:    "test-model",
+		Messages: []switchboard.Message{{Role: switchboard.RoleUser, Content: "weather?"}},
+		Tools: []switchboard.Tool{{
+			Name:        "get_weather",
+			Description: "Get the weather",
+			Schema:      json.RawMessage(`{"type":"object"}`),
+		}},
+	})
+
+	if len(got.Tools) != 1 {
+		t.Fatalf("forwarded %d tools, want 1", len(got.Tools))
+	}
+	if got.Tools[0].Type != "function" {
+		t.Errorf("Type = %q, want function", got.Tools[0].Type)
+	}
+	if got.Tools[0].Function.Name != "get_weather" {
+		t.Errorf("Name = %q, want get_weather", got.Tools[0].Function.Name)
+	}
+	if string(got.Tools[0].Function.Parameters) != `{"type":"object"}` {
+		t.Errorf("Parameters = %s; the schema must reach the model unaltered",
+			got.Tools[0].Function.Parameters)
+	}
+}
+
+func TestChatForwardsToolChoice(t *testing.T) {
+	cases := []struct {
+		name   string
+		choice *switchboard.ToolChoice
+		want   string
+	}{
+		{"unset", nil, ""},
+		{"auto", &switchboard.ToolChoice{Mode: switchboard.ToolChoiceAuto}, `"auto"`},
+		{"none", &switchboard.ToolChoice{Mode: switchboard.ToolChoiceNone}, `"none"`},
+		// Neutral "any" is OpenAI's "required".
+		{"any", &switchboard.ToolChoice{Mode: switchboard.ToolChoiceAny}, `"required"`},
+		{"named", &switchboard.ToolChoice{Mode: switchboard.ToolChoiceTool, Name: "f"},
+			`{"function":{"name":"f"},"type":"function"}`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var got wire.ChatRequest
+			b, _ := stub(t, func(w http.ResponseWriter, r *http.Request) {
+				json.NewDecoder(r.Body).Decode(&got)
+				io.WriteString(w, sse(chunkFrame("ok")))
+			})
+			_, _ = collect(t, b, &switchboard.ChatRequest{
+				Model:      "test-model",
+				Messages:   []switchboard.Message{{Role: switchboard.RoleUser, Content: "hi"}},
+				ToolChoice: tc.choice,
+			})
+			if string(got.ToolChoice) != tc.want {
+				t.Errorf("tool_choice = %s, want %s", got.ToolChoice, tc.want)
+			}
+		})
+	}
+}
+
+// A tool result is a RoleTool turn naming the call it answers; llama-server
+// cannot match it to the assistant turn without both halves.
+func TestChatForwardsToolResults(t *testing.T) {
+	var got wire.ChatRequest
+	b, _ := stub(t, func(w http.ResponseWriter, r *http.Request) {
+		json.NewDecoder(r.Body).Decode(&got)
+		io.WriteString(w, sse(chunkFrame("done")))
+	})
+
+	_, _ = collect(t, b, &switchboard.ChatRequest{
+		Model: "test-model",
+		Messages: []switchboard.Message{
+			{Role: switchboard.RoleUser, Content: "weather?"},
+			{Role: switchboard.RoleAssistant, ToolCalls: []switchboard.ToolCall{
+				{ID: "call_1", Name: "get_weather", Arguments: `{"city":"Boston"}`},
+			}},
+			{Role: switchboard.RoleTool, ToolCallID: "call_1", Content: "18C"},
+		},
+	})
+
+	if n := len(got.Messages); n != 3 {
+		t.Fatalf("forwarded %d messages, want 3", n)
+	}
+	asst := got.Messages[1]
+	if len(asst.ToolCalls) != 1 || asst.ToolCalls[0].ID != "call_1" {
+		t.Errorf("assistant tool_calls = %+v, want one call_1", asst.ToolCalls)
+	}
+	if asst.ToolCalls[0].Function.Arguments != `{"city":"Boston"}` {
+		t.Errorf("arguments = %q, want the string the model produced",
+			asst.ToolCalls[0].Function.Arguments)
+	}
+	if got.Messages[2].ToolCallID != "call_1" {
+		t.Errorf("tool_call_id = %q, want call_1", got.Messages[2].ToolCallID)
+	}
+}
+
+// The shape llama-server actually streams: the opening frame carries id, type
+// and name, and every frame after it adds another fragment of the arguments.
+func TestChatAssemblesStreamedToolCalls(t *testing.T) {
+	frames := []string{
+		`{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"get_weather","arguments":"{\""}}]}}]}`,
+		`{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"city\":\"Boston\"}"}}]}}]}`,
+		`{"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}`,
+	}
+	b, _ := stub(t, func(w http.ResponseWriter, r *http.Request) {
+		io.WriteString(w, sse(frames...))
+	})
+
+	var deltas []switchboard.ToolCallDelta
+	res, err := b.Chat(context.Background(), &switchboard.ChatRequest{
+		Model:    "test-model",
+		Messages: []switchboard.Message{{Role: switchboard.RoleUser, Content: "weather?"}},
+	}, func(c switchboard.Chunk) error {
+		if c.ToolCall != nil {
+			deltas = append(deltas, *c.ToolCall)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("Chat: %v", err)
+	}
+
+	if len(deltas) != 2 {
+		t.Fatalf("emitted %d tool deltas, want 2", len(deltas))
+	}
+	if deltas[0].ID != "call_1" || deltas[0].Name != "get_weather" {
+		t.Errorf("first delta = %+v, want it to open the call", deltas[0])
+	}
+	if deltas[1].ID != "" || deltas[1].Name != "" {
+		t.Errorf("later delta repeats id/name: %+v", deltas[1])
+	}
+
+	if len(res.ToolCalls) != 1 {
+		t.Fatalf("assembled %d calls, want 1", len(res.ToolCalls))
+	}
+	call := res.ToolCalls[0]
+	if call.ID != "call_1" || call.Name != "get_weather" {
+		t.Errorf("call = %+v", call)
+	}
+	if call.Arguments != `{"city":"Boston"}` {
+		t.Errorf("Arguments = %q, want the fragments joined in order", call.Arguments)
+	}
+	if res.StopReason != "tool_calls" {
+		t.Errorf("StopReason = %q, want tool_calls", res.StopReason)
+	}
+}
+
+// A server streaming a single call may omit index entirely; dropping those
+// deltas would lose the call silently.
+func TestChatToleratesMissingToolCallIndex(t *testing.T) {
+	frames := []string{
+		`{"choices":[{"index":0,"delta":{"tool_calls":[{"id":"c1","function":{"name":"f","arguments":"{}"}}]}}]}`,
+	}
+	b, _ := stub(t, func(w http.ResponseWriter, r *http.Request) {
+		io.WriteString(w, sse(frames...))
+	})
+	res, _ := collect(t, b, &switchboard.ChatRequest{
+		Model:    "test-model",
+		Messages: []switchboard.Message{{Role: switchboard.RoleUser, Content: "hi"}},
+	})
+	if len(res.ToolCalls) != 1 || res.ToolCalls[0].ID != "c1" {
+		t.Fatalf("ToolCalls = %+v, want one call at the implied index 0", res.ToolCalls)
+	}
+}
