@@ -15,8 +15,26 @@ import (
 	"github.com/Grace/switchboard/internal/switchboard"
 )
 
-// Version is stamped at build time with -ldflags.
-var Version = "dev"
+// Stamped at build time with -ldflags. See .goreleaser.yaml and the Dockerfile,
+// which must name this package path — pointing them at `main` is a mistake that
+// only shows up as a release reporting "dev".
+var (
+	Version = "dev"
+	Commit  = ""
+	Date    = ""
+)
+
+// versionString renders whatever the build stamped.
+func versionString() string {
+	out := "switchboard " + Version
+	switch {
+	case Commit != "" && Date != "":
+		out += " (" + Commit + ", " + Date + ")"
+	case Commit != "":
+		out += " (" + Commit + ")"
+	}
+	return out
+}
 
 const usage = `switchboard — run your own models, on your machine or in your cloud
 
@@ -29,6 +47,7 @@ commands:
   connect    load a model into memory on a running server
   disconnect unload a model from a running server
   init       write a starter config file
+  redact     check redaction rules against text on stdin
   version    print the version
 
 run "switchboard <command> -h" for a command's flags.
@@ -55,8 +74,10 @@ func Main(ctx context.Context, args []string) int {
 		err = runDisconnect(ctx, args[1:])
 	case "init":
 		err = runInit(ctx, args[1:])
+	case "redact":
+		err = runRedact(ctx, args[1:])
 	case "version":
-		fmt.Println("switchboard", Version)
+		fmt.Println(versionString())
 	case "-h", "--help", "help":
 		fmt.Print(usage)
 	default:

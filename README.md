@@ -106,6 +106,18 @@ AWS credentials come from the standard chain — environment, shared config, SSO
 | `POST /v1/disconnect` | Unload it and reclaim the memory. |
 | `GET /healthz` | Liveness. |
 
+## Commands
+
+| Command | Purpose |
+| --- | --- |
+| `switchboard serve` | Serve the HTTP API. |
+| `switchboard run -m <model> "…"` | Talk to a model from the terminal, no server. |
+| `switchboard models` | List the routable roster. |
+| `switchboard connect` / `disconnect` | Load or unload a local model on a running server. |
+| `switchboard init` | Write a starter config. |
+| `switchboard redact` | Check redaction rules against real text before trusting them. |
+| `switchboard version` | Print version, commit and build date. |
+
 ## Design notes
 
 **The backend interface is four methods.** `Name`, `Models`, `Chat`, `Close`. Adding SageMaker, Azure OpenAI, MLX, or a raw cgo binding means implementing that and nothing else — no changes to the server, the registry, or the wire format.

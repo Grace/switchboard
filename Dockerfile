@@ -6,7 +6,7 @@ RUN go mod download
 COPY . .
 ARG VERSION=dev
 RUN CGO_ENABLED=0 go build -trimpath \
-      -ldflags="-s -w -X main.version=${VERSION}" \
+      -ldflags="-s -w -X github.com/Grace/switchboard/internal/cli.Version=${VERSION}" \
       -o /out/switchboard ./cmd/switchboard
 
 # Run

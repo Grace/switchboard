@@ -117,4 +117,15 @@ about one time in ten, and fails on the prefix.
   built.
 - **Custom rules are your responsibility to test.** `redaction.custom` is where
   site-specific identifiers go, and an untested pattern is a rule you believe in
-  without evidence.
+  without evidence. Check yours before you trust them:
+
+```sh
+switchboard redact -list                          # what is built in
+cat sample-prompts.txt | switchboard redact       # apply your config to real text
+```
+
+  Redacted text goes to stdout and the counts go to stderr, so it composes in a
+  pipe. The failure modes are silent in both directions — a rule that never
+  fires looks the same as one that was never needed, and an over-broad rule eats
+  the correlation ids you will want during an incident. One command tells you
+  which you have.

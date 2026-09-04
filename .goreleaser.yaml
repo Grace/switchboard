@@ -11,7 +11,10 @@ builds:
     env: [CGO_ENABLED=0]
     flags: [-trimpath]
     ldflags:
-      - -s -w -X main.version={{.Version}} -X main.commit={{.ShortCommit}}
+      - -s -w
+      - -X github.com/Grace/switchboard/internal/cli.Version={{.Version}}
+      - -X github.com/Grace/switchboard/internal/cli.Commit={{.ShortCommit}}
+      - -X github.com/Grace/switchboard/internal/cli.Date={{.CommitDate}}
     goos: [linux, darwin]
     goarch: [amd64, arm64]
 
