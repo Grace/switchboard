@@ -15,6 +15,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Grace/switchboard/internal/config"
 	"github.com/Grace/switchboard/internal/switchboard"
 	"github.com/Grace/switchboard/internal/wire"
 )
@@ -25,6 +26,11 @@ type Server struct {
 	logger *log.Logger
 	// now is injected so tests get deterministic timestamps.
 	now func() time.Time
+
+	// teams maps a presented key to the team it authenticates as, and
+	// requireCaller refuses requests that present none.
+	teams         []config.Team
+	requireCaller bool
 }
 
 // New builds a server over a registry.
@@ -33,6 +39,39 @@ func New(reg *switchboard.Registry, logger *log.Logger) *Server {
 		logger = log.Default()
 	}
 	return &Server{reg: reg, logger: logger, now: time.Now}
+}
+
+// WithAttribution gives the server the roster it authenticates callers against.
+// Without it every request is unattributed, which is the behaviour of a gateway
+// that has no idea who its callers are.
+func (s *Server) WithAttribution(teams []config.Team, requireCaller bool) *Server {
+	s.teams, s.requireCaller = teams, requireCaller
+	return s
+}
+
+// caller resolves the bearer token on a request to a team.
+//
+// A gateway is the last place that knows who is calling. If it does not write
+// that down here, nothing downstream can reconstruct it — which is why an
+// unattributed request is refused rather than quietly billed to everyone.
+func (s *Server) caller(r *http.Request) (switchboard.Caller, bool) {
+	key, ok := bearer(r.Header.Get("Authorization"))
+	if !ok {
+		return switchboard.Caller{}, false
+	}
+	team, ok := config.TeamForKey(s.teams, key)
+	if !ok {
+		return switchboard.Caller{}, false
+	}
+	return switchboard.Caller{Team: team}, true
+}
+
+func bearer(h string) (string, bool) {
+	const prefix = "Bearer "
+	if len(h) <= len(prefix) || !strings.EqualFold(h[:len(prefix)], prefix) {
+		return "", false
+	}
+	return strings.TrimSpace(h[len(prefix):]), true
 }
 
 // Handler returns the routed handler.
@@ -143,6 +182,14 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
+	if c, ok := s.caller(r); ok {
+		r = r.WithContext(switchboard.WithCaller(r.Context(), c))
+	} else if s.requireCaller {
+		writeError(w, http.StatusUnauthorized, "invalid_request_error",
+			"this gateway attributes spend per team: present a team key as a bearer token")
+		return
+	}
+
 	var req wire.ChatRequest
 	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 32<<20)).Decode(&req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid_request_error", fmt.Sprintf("malformed request body: %v", err))

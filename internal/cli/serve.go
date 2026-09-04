@@ -41,7 +41,8 @@ func runServe(ctx context.Context, args []string) error {
 		logger.Printf("  (no models configured — see 'switchboard init')")
 	}
 
-	if err := server.New(reg, logger).ListenAndServe(ctx, cfg.Listen); err != nil {
+	srv := server.New(reg, logger).WithAttribution(cfg.Teams, cfg.Attribution.RequireCaller)
+	if err := srv.ListenAndServe(ctx, cfg.Listen); err != nil {
 		return fmt.Errorf("serve: %w", err)
 	}
 	logger.Printf("shut down")

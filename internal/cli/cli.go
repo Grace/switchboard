@@ -107,8 +107,9 @@ func buildRegistry(cfg *config.Config) *switchboard.Registry {
 
 	if models := cfg.ModelsFor(config.BackendBedrock); len(models) > 0 {
 		reg.Register(bedrock.New(bedrock.Options{
-			Region:  cfg.Bedrock.Region,
-			Profile: cfg.Bedrock.Profile,
+			Region:      cfg.Bedrock.Region,
+			Profile:     cfg.Bedrock.Profile,
+			Attribution: cfg.Attribution,
 		}, models), names(models))
 	}
 

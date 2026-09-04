@@ -27,6 +27,9 @@ type Options struct {
 	Region string
 	// Profile selects a named profile from the shared config file.
 	Profile string
+	// Attribution, when enabled, makes each request carry the calling team's
+	// identity to the provider so the bill can be split by it.
+	Attribution config.Attribution
 }
 
 // Backend is a switchboard.Backend backed by Amazon Bedrock.
@@ -38,8 +41,15 @@ type Backend struct {
 	// The client is built on first use so that switchboard starts, serves local
 	// models, and lists its roster on a machine with no AWS credentials at all.
 	once    sync.Once
+	baseCfg aws.Config
 	client  *bedrockruntime.Client
 	initErr error
+
+	// Per-team clients, each holding credentials assumed for that team. See
+	// attribution.go.
+	attr   config.Attribution
+	mu     sync.Mutex
+	byTeam map[string]*bedrockruntime.Client
 }
 
 var _ switchboard.Backend = (*Backend)(nil)
@@ -48,6 +58,7 @@ var _ switchboard.Backend = (*Backend)(nil)
 func New(opts Options, models []config.Line) *Backend {
 	b := &Backend{
 		opts:  opts,
+		attr:  opts.Attribution,
 		specs: make(map[string]config.Line, len(models)),
 	}
 	for _, m := range models {
@@ -101,6 +112,7 @@ func (b *Backend) resolve(ctx context.Context) (*bedrockruntime.Client, error) {
 			b.initErr = errors.New("no AWS region: set bedrock.region in config, or AWS_REGION")
 			return
 		}
+		b.baseCfg = cfg
 		b.client = bedrockruntime.NewFromConfig(cfg)
 	})
 	return b.client, b.initErr
@@ -112,7 +124,7 @@ func (b *Backend) Chat(ctx context.Context, req *switchboard.ChatRequest, emit f
 	if !ok {
 		return nil, &switchboard.UnknownModelError{Model: req.Model}
 	}
-	client, err := b.resolve(ctx)
+	client, err := b.clientFor(ctx)
 	if err != nil {
 		return nil, err
 	}

@@ -10,6 +10,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/Grace/switchboard/internal/config"
 	"github.com/Grace/switchboard/internal/switchboard"
 	"github.com/Grace/switchboard/internal/wire"
 )
@@ -24,6 +25,9 @@ type fakeBackend struct {
 	noTools bool
 	err     error
 	got     *switchboard.ChatRequest
+	// onChat observes the request context, so a test can assert on what the
+	// server resolved before the backend was reached.
+	onChat func(context.Context)
 
 	connected map[string]bool
 	closed    bool
@@ -44,6 +48,9 @@ func (f *fakeBackend) Close() error {
 
 func (f *fakeBackend) Chat(ctx context.Context, req *switchboard.ChatRequest, emit func(switchboard.Chunk) error) (*switchboard.Result, error) {
 	f.got = req
+	if f.onChat != nil {
+		f.onChat(ctx)
+	}
 	if f.err != nil {
 		return nil, f.err
 	}
@@ -470,6 +477,106 @@ func TestFinishReason(t *testing.T) {
 	for in, want := range cases {
 		if got := finishReason(in); got != want {
 			t.Errorf("finishReason(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+// --- attribution ---------------------------------------------------------
+
+func newAttributedServer(t *testing.T, backend switchboard.Backend, require bool) *httptest.Server {
+	t.Helper()
+	reg := switchboard.NewRegistry()
+	reg.Register(backend, []string{"test-model"})
+	reg.SetDefault("test-model")
+
+	s := New(reg, log.New(io.Discard, "", 0)).
+		WithAttribution([]config.Team{
+			{Name: "search", Keys: []string{"key-search-0123456789"}},
+			{Name: "billing", Keys: []string{"key-billing-0123456789"}},
+		}, require)
+	srv := httptest.NewServer(s.Handler())
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+func postAs(t *testing.T, url, key, body string) *http.Response {
+	t.Helper()
+	req, err := http.NewRequest(http.MethodPost, url, strings.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	if key != "" {
+		req.Header.Set("Authorization", "Bearer "+key)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("POST %s: %v", url, err)
+	}
+	t.Cleanup(func() { resp.Body.Close() })
+	return resp
+}
+
+const chatBody = `{"messages":[{"role":"user","content":"hi"}]}`
+
+// The whole point: the backend learns who called, because nothing downstream
+// of the gateway can work it out afterwards.
+func TestCallerReachesTheBackend(t *testing.T) {
+	var seen string
+	backend := &fakeBackend{onChat: func(ctx context.Context) {
+		if c, ok := switchboard.CallerFrom(ctx); ok {
+			seen = c.Team
+		}
+	}}
+	srv := newAttributedServer(t, backend, false)
+
+	if resp := postAs(t, srv.URL+"/v1/chat/completions", "key-billing-0123456789", chatBody); resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	if seen != "billing" {
+		t.Errorf("backend saw team %q, want billing", seen)
+	}
+}
+
+func TestUnattributedIsServedWhenNotRequired(t *testing.T) {
+	var attributed bool
+	backend := &fakeBackend{onChat: func(ctx context.Context) {
+		_, attributed = switchboard.CallerFrom(ctx)
+	}}
+	srv := newAttributedServer(t, backend, false)
+
+	if resp := postAs(t, srv.URL+"/v1/chat/completions", "", chatBody); resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	if attributed {
+		t.Error("a request with no key must not arrive attributed")
+	}
+}
+
+// Fail closed: unattributed spend is spend nobody is accountable for.
+func TestUnattributedIsRefusedWhenRequired(t *testing.T) {
+	srv := newAttributedServer(t, &fakeBackend{}, true)
+	for _, key := range []string{"", "not-a-real-key-000000"} {
+		resp := postAs(t, srv.URL+"/v1/chat/completions", key, chatBody)
+		if resp.StatusCode != http.StatusUnauthorized {
+			t.Errorf("key %q: status = %d, want 401", key, resp.StatusCode)
+		}
+	}
+}
+
+func TestBearerParsing(t *testing.T) {
+	for header, want := range map[string]string{
+		"Bearer abc":  "abc",
+		"bearer abc":  "abc",
+		"Bearer  abc": "abc",
+		"":            "",
+		"abc":         "",
+		"Basic abc":   "",
+		"Bearer":      "",
+	} {
+		got, ok := bearer(header)
+		if got != want || ok != (want != "") {
+			t.Errorf("bearer(%q) = %q,%v; want %q", header, got, ok, want)
 		}
 	}
 }

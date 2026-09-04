@@ -124,11 +124,13 @@ AWS credentials come from the standard chain — environment, shared config, SSO
 
 Working: routing, both backends, streaming and non-streaming completions, token usage accounting, model lifecycle, graceful drain on shutdown. The HTTP surface and the tool-translation layer are covered by tests.
 
+**Per-team cost attribution.** A gateway calls Bedrock under one role, so every team's spend lands on the bill as one identity. switchboard resolves a caller's key to a team, assumes a role with that team as the session name and a session tag, and makes the call with those credentials — so the provider bills an identity you can split on. Optionally fails closed on unattributed requests. See [docs/cost-attribution.md](docs/cost-attribution.md), including how to verify it against a real bill.
+
 Not done yet:
 
 - **Tool forwarding in the backends.** The neutral types, the OpenAI translation both directions, streamed tool-call deltas, and `finish_reason` correction are all implemented and tested — but neither shipped backend implements `ToolCaller`, so tool requests are currently refused rather than served. Wiring Bedrock's Converse tool blocks is the next piece.
 - **I/O controls.** Redaction of request and response content, and a structured audit log of what was sent to which provider, are the reason a gateway earns its place in a regulated network. Not built.
-- **Cost attribution past the proxy.** Token usage is recorded per request, but a caller identity is not carried through to Bedrock in a form the bill can see — so per-team spend collapses into the gateway's own service role. See [docs/cost-attribution.md](docs/cost-attribution.md).
+- **Spend caps and chargeback reporting.** Per-team attribution now reaches the provider (see below), but there is no token budget, no enforcement when one is exceeded, and no rollup finance can read.
 - **Retry and backpressure.** No throttling-aware retry, concurrency ceiling, or token budget yet.
 
 ## Contributing and contact

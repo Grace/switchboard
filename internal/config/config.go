@@ -63,6 +63,11 @@ type Config struct {
 	Local        Local   `json:"local"`
 	Bedrock      Bedrock `json:"bedrock"`
 	Models       []Line  `json:"models"`
+
+	// Attribution splits provider spend back out by caller. See attribution.go.
+	Attribution Attribution `json:"attribution,omitempty"`
+	// Teams are the attribution units and their API keys.
+	Teams []Team `json:"teams,omitempty"`
 }
 
 // Duration is a time.Duration that round-trips as a JSON string ("10m").
@@ -173,7 +178,7 @@ func (c *Config) Validate() error {
 	default:
 		return fmt.Errorf("local.device %q: want auto, metal, cuda, or cpu", c.Local.Device)
 	}
-	return nil
+	return c.Attribution.validate(c.Teams)
 }
 
 // Save writes the config, creating the parent directory if needed.
