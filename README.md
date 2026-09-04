@@ -148,6 +148,9 @@ Not done yet:
 - **Redaction toward the provider.** Content is redacted before it is written to the audit log, but it still reaches the model as written. Stripping it on the way *out* is a separate feature and is not built.
 - **Spend caps and chargeback reporting.** Per-team attribution now reaches the provider (see below), but there is no token budget, no enforcement when one is exceeded, and no rollup finance can read.
 - **Retry and backpressure.** No throttling-aware retry, concurrency ceiling, or token budget yet.
+- **SSO.** Authentication is static per-team keys. No OIDC, no per-user attribution, no rotation workflow. This is the most-requested gap and the next thing being built.
+
+For a security review, [docs/controls.md](docs/controls.md) maps what switchboard does against SOC 2, ISO 27001, HIPAA, NIST and EU AI Act control objectives — including, deliberately, everything it does not do.
 
 ## Contributing and contact
 
