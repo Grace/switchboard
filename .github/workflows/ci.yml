@@ -26,7 +26,21 @@ jobs:
           fi
 
       - run: go vet ./...
-      - run: go test -race ./...
+
+      # -coverpkg matters here. Per-package coverage attributes a helper only to
+      # tests in its own package, so a type exercised entirely by another
+      # package's tests reports 0.0% and looks untested when it is not.
+      - name: test
+        run: go test -race -coverpkg=./... -coverprofile=coverage.out ./...
+
+      - name: coverage
+        run: |
+          go tool cover -func=coverage.out | tail -1
+          echo "### Coverage" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          go tool cover -func=coverage.out | grep -vE "\s100\.0%$" | tail -25 >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+
       - run: go build ./...
 
   docker:
