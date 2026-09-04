@@ -48,6 +48,7 @@ commands:
   disconnect unload a model from a running server
   init       write a starter config file
   redact     check redaction rules against text on stdin
+  audit      verify the audit chain, or reconstruct one decision
   version    print the version
 
 run "switchboard <command> -h" for a command's flags.
@@ -76,6 +77,8 @@ func Main(ctx context.Context, args []string) int {
 		err = runInit(ctx, args[1:])
 	case "redact":
 		err = runRedact(ctx, args[1:])
+	case "audit":
+		err = runAudit(ctx, args[1:])
 	case "version":
 		fmt.Println(versionString())
 	case "-h", "--help", "help":

@@ -18,7 +18,13 @@ import (
 )
 
 // Record is one completion, as the log sees it.
+//
+// Seq, Prev and MAC are the chain. They come first so a reader sees the
+// position of an entry before its contents, and they are what Verify walks.
 type Record struct {
+	Seq  uint64 `json:"seq"`
+	Prev string `json:"prev,omitempty"`
+
 	Time    time.Time `json:"time"`
 	ID      string    `json:"id"`
 	Team    string    `json:"team,omitempty"`
@@ -40,9 +46,13 @@ type Record struct {
 	// are redacted before they get here.
 	Prompt     string `json:"prompt,omitempty"`
 	Completion string `json:"completion,omitempty"`
+
+	// MAC covers every field above, including Prev, which is what binds one
+	// entry to the last. It is written last and excluded from its own input.
+	MAC string `json:"mac"`
 }
 
-// Log is an append-only JSONL audit log.
+// Log is an append-only, hash-chained JSONL audit log.
 type Log struct {
 	mu  sync.Mutex
 	w   io.WriteCloser
@@ -50,6 +60,10 @@ type Log struct {
 
 	red     *redact.Redactor
 	content bool
+
+	signer signer
+	seq    uint64
+	prev   string
 }
 
 // Open opens or creates the log at path.
@@ -62,16 +76,30 @@ func Open(path string, red *redact.Redactor, content bool) (*Log, error) {
 	if content && red == nil {
 		return nil, errContentWithoutRedaction
 	}
+	// Recover the chain before opening for append, so a restart continues the
+	// existing log rather than starting a second one inside the same file.
+	seq, prev, err := tailState(path)
+	if err != nil {
+		return nil, err
+	}
 	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
 	if err != nil {
 		return nil, err
 	}
-	return newLog(f, red, content), nil
+	l := newLog(f, red, content)
+	l.signer = newSigner(keyFromEnv())
+	l.seq, l.prev = seq, prev
+	return l, nil
 }
 
 func newLog(w io.WriteCloser, red *redact.Redactor, content bool) *Log {
 	return &Log{w: w, enc: json.NewEncoder(w), red: red, content: content}
 }
+
+// Signed reports whether entries are being MACed with a key rather than only
+// digested. Callers surface this at startup: "auditing" and "auditing in a way
+// that survives someone editing the file" are different claims.
+func (l *Log) Signed() bool { return l != nil && l.signer.keyed }
 
 // Write redacts and appends one record.
 //
@@ -111,7 +139,19 @@ func (l *Log) Write(r Record) error {
 
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	return l.enc.Encode(r)
+
+	l.seq++
+	signed, err := l.signer.sign(r, l.seq, l.prev)
+	if err != nil {
+		l.seq--
+		return err
+	}
+	if err := l.enc.Encode(signed); err != nil {
+		l.seq--
+		return err
+	}
+	l.prev = signed.MAC
+	return nil
 }
 
 // Close closes the underlying file.

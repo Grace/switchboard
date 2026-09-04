@@ -61,8 +61,14 @@ func runServe(ctx context.Context, args []string) error {
 		if cfg.Audit.LogContent {
 			what = "redacted content"
 		}
-		logger.Printf("audit log: %s (%s; rules: %s)",
-			cfg.Audit.Path, what, strings.Join(red.Rules(), ", "))
+		// "auditing" and "auditing in a way that survives someone editing the
+		// file" are different claims, so the operator is told which they have.
+		chain := "unsigned, set " + audit.KeyEnv + " to sign"
+		if lg.Signed() {
+			chain = "signed"
+		}
+		logger.Printf("audit log: %s (%s; %s; rules: %s)",
+			cfg.Audit.Path, what, chain, strings.Join(red.Rules(), ", "))
 		srv = srv.WithAudit(lg)
 	}
 

@@ -136,6 +136,8 @@ AWS credentials come from the standard chain — environment, shared config, SSO
 
 Working: routing, both backends, streaming and non-streaming completions, token usage accounting, model lifecycle, graceful drain on shutdown. The HTTP surface and the tool-translation layer are covered by tests.
 
+**Tamper-evident audit.** Each entry carries the digest of the one before it, so an alteration, deletion or reordering is detectable — `switchboard audit verify` reports the first entry that does not hold, and exits non-zero. `SWITCHBOARD_AUDIT_KEY` makes an edit require the key as well as file access. `switchboard audit show -id …` reconstructs an individual decision, which is what Article 12 of the EU AI Act asks logging to permit.
+
 **Redaction and audit.** A structured JSONL record of what was sent to which provider, with redaction applied inside the log itself so no call site can skip it — which is what makes it a control rather than a convention that every application team has to remember. Content logging is refused outright unless redaction rules are configured. See [docs/redaction.md](docs/redaction.md).
 
 **Per-team cost attribution.** A gateway calls Bedrock under one role, so every team's spend lands on the bill as one identity. switchboard resolves a caller's key to a team, assumes a role with that team as the session name and a session tag, and makes the call with those credentials — so the provider bills an identity you can split on. Optionally fails closed on unattributed requests. See [docs/cost-attribution.md](docs/cost-attribution.md), including how to verify it against a real bill.
