@@ -173,9 +173,14 @@ func (b *Backend) Chat(ctx context.Context, req *switchboard.ChatRequest, emit f
 			result.StopReason = string(e.Value.StopReason)
 		case *types.ConverseStreamOutputMemberMetadata:
 			if u := e.Value.Usage; u != nil {
+				// Cache counts are disjoint from InputTokens and are billed at
+				// their own rates, so they are carried separately all the way
+				// to the audit entry rather than summed here.
 				result.Usage = switchboard.Usage{
-					InputTokens:  int(aws.ToInt32(u.InputTokens)),
-					OutputTokens: int(aws.ToInt32(u.OutputTokens)),
+					InputTokens:      int(aws.ToInt32(u.InputTokens)),
+					OutputTokens:     int(aws.ToInt32(u.OutputTokens)),
+					CacheWriteTokens: int(aws.ToInt32(u.CacheWriteInputTokens)),
+					CacheReadTokens:  int(aws.ToInt32(u.CacheReadInputTokens)),
 				}
 			}
 		}

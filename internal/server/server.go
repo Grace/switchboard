@@ -138,7 +138,11 @@ func (s *Server) charge(ctx context.Context, usage switchboard.Usage) {
 	if c, ok := switchboard.CallerFrom(ctx); ok {
 		team = c.Team
 	}
-	s.limits.Charge(team, usage.InputTokens+usage.OutputTokens)
+	// Cache reads count. They are cheaper, not free, and a budget that ignored
+	// them would let a caller with a large cached prompt consume most of a
+	// provider's capacity while charging almost nothing against its allowance —
+	// which is the shape of the limit being bypassed rather than applied.
+	s.limits.Charge(team, usage.PromptTokens()+usage.OutputTokens)
 }
 
 // WithOIDC lets the server accept identity-provider tokens as well as static
@@ -537,16 +541,19 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 
 	result, err := backend.Chat(r.Context(), chatReq, func(switchboard.Chunk) error { return nil })
 	if err != nil {
+		telemetry.Tools(span, auditToolsOffered(chatReq.Tools), nil)
 		telemetry.Finish(span, id, 0, 0, "", err)
 		s.logger.Printf("chat %s: %v", model, err)
 		s.observe(r.Context(), model, backend.Name(), "error", switchboard.Usage{})
 		_ = s.record(r.Context(), audit.Record{
 			ID: id, Model: model, Backend: backend.Name(),
 			Prompt: promptText(chatReq), Error: err.Error(),
+			ToolsOffered: auditToolsOffered(chatReq.Tools),
 		})
 		writeError(w, http.StatusBadGateway, "backend_error", err.Error())
 		return
 	}
+	telemetry.Tools(span, auditToolsOffered(chatReq.Tools), traceTools(result.ToolCalls))
 	telemetry.Finish(span, id, result.Usage.InputTokens, result.Usage.OutputTokens, result.StopReason, nil)
 	s.charge(r.Context(), result.Usage)
 	s.observe(r.Context(), model, backend.Name(), "ok", result.Usage)
@@ -555,6 +562,10 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		Prompt: promptText(chatReq), Completion: result.Text,
 		PromptTokens:     result.Usage.InputTokens,
 		CompletionTokens: result.Usage.OutputTokens,
+		CacheWriteTokens: result.Usage.CacheWriteTokens,
+		CacheReadTokens:  result.Usage.CacheReadTokens,
+		ToolsOffered:     auditToolsOffered(chatReq.Tools),
+		ToolCalls:        auditToolCalls(result.ToolCalls),
 		StopReason:       result.StopReason,
 	})
 	writeJSON(w, http.StatusOK, s.response(id, model, result))
@@ -607,11 +618,13 @@ func (s *Server) streamChat(w http.ResponseWriter, r *http.Request, backend swit
 		})
 	})
 	if err != nil {
+		telemetry.Tools(span, auditToolsOffered(req.Tools), nil)
 		telemetry.Finish(span, id, 0, 0, "", err)
 		s.observe(r.Context(), req.Model, backend.Name(), "error", switchboard.Usage{})
 		_ = s.record(r.Context(), audit.Record{
 			ID: id, Model: req.Model, Backend: backend.Name(), Streamed: true,
 			Prompt: promptText(req), Error: err.Error(),
+			ToolsOffered: auditToolsOffered(req.Tools),
 		})
 		// The headers are long gone, so the only honest way to report a
 		// mid-stream failure is an error frame before [DONE].
@@ -627,6 +640,7 @@ func (s *Server) streamChat(w http.ResponseWriter, r *http.Request, backend swit
 		return
 	}
 
+	telemetry.Tools(span, auditToolsOffered(req.Tools), traceTools(result.ToolCalls))
 	telemetry.Finish(span, id, result.Usage.InputTokens, result.Usage.OutputTokens, result.StopReason, nil)
 	s.charge(r.Context(), result.Usage)
 	s.observe(r.Context(), req.Model, backend.Name(), "ok", result.Usage)
@@ -635,6 +649,10 @@ func (s *Server) streamChat(w http.ResponseWriter, r *http.Request, backend swit
 		Prompt: promptText(req), Completion: result.Text,
 		PromptTokens:     result.Usage.InputTokens,
 		CompletionTokens: result.Usage.OutputTokens,
+		CacheWriteTokens: result.Usage.CacheWriteTokens,
+		CacheReadTokens:  result.Usage.CacheReadTokens,
+		ToolsOffered:     auditToolsOffered(req.Tools),
+		ToolCalls:        auditToolCalls(result.ToolCalls),
 		StopReason:       result.StopReason,
 	})
 
@@ -873,4 +891,47 @@ func (s *Server) listenAndServe(ctx context.Context, addr string, t TLS) error {
 		defer cancel()
 		return srv.Shutdown(shutdownCtx)
 	}
+}
+
+// auditTools renders a request's tool definitions and a result's tool calls for
+// the audit record.
+//
+// Offered and invoked are both recorded because neither answers the other's
+// question. Offered bounds what the model could have done; invoked is what it
+// did. A record with only the second cannot show that a call was outside the
+// permissions in force, which is the finding an incident review is looking for.
+func auditToolsOffered(tools []switchboard.Tool) []string {
+	if len(tools) == 0 {
+		return nil
+	}
+	names := make([]string, 0, len(tools))
+	for _, t := range tools {
+		names = append(names, t.Name)
+	}
+	return names
+}
+
+func auditToolCalls(calls []switchboard.ToolCall) []audit.ToolCall {
+	if len(calls) == 0 {
+		return nil
+	}
+	out := make([]audit.ToolCall, 0, len(calls))
+	for _, c := range calls {
+		out = append(out, audit.ToolCall{Name: c.Name, ID: c.ID, Arguments: c.Arguments})
+	}
+	return out
+}
+
+// traceTools is the same information stripped of arguments, for the span. The
+// two conversions are separate rather than one shared shape precisely so that
+// adding an argument to the trace has to be a deliberate act.
+func traceTools(calls []switchboard.ToolCall) []telemetry.Invocation {
+	if len(calls) == 0 {
+		return nil
+	}
+	out := make([]telemetry.Invocation, 0, len(calls))
+	for _, c := range calls {
+		out = append(out, telemetry.Invocation{Name: c.Name, ID: c.ID})
+	}
+	return out
 }

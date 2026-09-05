@@ -81,6 +81,25 @@ type Chunk struct {
 type Usage struct {
 	InputTokens  int `json:"input_tokens"`
 	OutputTokens int `json:"output_tokens"`
+	// CacheWriteTokens and CacheReadTokens are the parts of the input that were
+	// written to, or served from, a provider-side prompt cache.
+	//
+	// They are counted separately because they are billed separately — a cache
+	// read is a fraction of the base input rate and a cache write is a premium
+	// on it. A gateway that folded them into InputTokens would produce a cost
+	// figure wrong by an order of magnitude for anyone with a large stable
+	// system prompt, and would produce it silently.
+	//
+	// They are disjoint from InputTokens, matching how providers report them:
+	// a request whose prompt was entirely a cache hit reports almost no input
+	// tokens and a large cache read. Adding all three is the total consumed.
+	CacheWriteTokens int `json:"cache_write_tokens,omitempty"`
+	CacheReadTokens  int `json:"cache_read_tokens,omitempty"`
+}
+
+// PromptTokens is everything that went in, however it was billed.
+func (u Usage) PromptTokens() int {
+	return u.InputTokens + u.CacheWriteTokens + u.CacheReadTokens
 }
 
 // Result is the completed response, returned alongside the streamed chunks.

@@ -134,6 +134,44 @@ func Finish(span trace.Span, auditID string, promptTokens, replyTokens int, stop
 	span.End()
 }
 
+// Invocation is one tool call, reduced to what may leave the process.
+type Invocation struct {
+	Name string
+	ID   string
+}
+
+// Tools records what the model was permitted to do and what it did.
+//
+// Names and call ids only, never arguments. This is the boundary that matters:
+// telemetry leaves for a collector switchboard does not control and has no
+// redaction step of its own, while an argument to transfer_funds is content and
+// carries whatever the model put in it. Content goes to the audit log behind
+// the redactor, or nowhere. A trace that showed the argument would route around
+// the one chokepoint the whole design depends on.
+//
+// Offered is recorded alongside called because the gap between them is the
+// interesting part, and because a trace showing only the calls cannot show that
+// one fell outside the permissions in force.
+func Tools(span trace.Span, offered []string, called []Invocation) {
+	if span == nil || (len(offered) == 0 && len(called) == 0) {
+		return
+	}
+	if len(offered) > 0 {
+		span.SetAttributes(attribute.StringSlice("switchboard.tools.offered", offered))
+	}
+	span.SetAttributes(attribute.Int("gen_ai.tool.call_count", len(called)))
+	for _, c := range called {
+		attrs := []attribute.KeyValue{attribute.String("gen_ai.tool.name", c.Name)}
+		if c.ID != "" {
+			attrs = append(attrs, attribute.String("gen_ai.tool.call.id", c.ID))
+		}
+		// One event per call rather than one attribute listing them: a tool
+		// called twice in a turn is two things that happened, and an attribute
+		// would collapse them into a set.
+		span.AddEvent("gen_ai.tool.call", trace.WithAttributes(attrs...))
+	}
+}
+
 // IDs returns the trace and span ids on a context, for the audit record.
 func IDs(ctx context.Context) (traceID, spanID string) {
 	sc := trace.SpanContextFromContext(ctx)
@@ -153,6 +191,7 @@ func (t *Tracer) Shutdown(ctx context.Context) error {
 type noopSpan struct{ trace.Span }
 
 func (noopSpan) End(...trace.SpanEndOption)              {}
+func (noopSpan) AddEvent(string, ...trace.EventOption)   {}
 func (noopSpan) SetAttributes(...attribute.KeyValue)     {}
 func (noopSpan) RecordError(error, ...trace.EventOption) {}
 func (noopSpan) SetStatus(codes.Code, string)            {}

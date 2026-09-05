@@ -44,8 +44,20 @@ type Record struct {
 	Policy  string `json:"policy,omitempty"`
 	Backend string `json:"backend,omitempty"`
 
-	PromptTokens     int    `json:"prompt_tokens"`
-	CompletionTokens int    `json:"completion_tokens"`
+	PromptTokens     int `json:"prompt_tokens"`
+	CompletionTokens int `json:"completion_tokens"`
+	// CacheWriteTokens and CacheReadTokens split the prompt by how the provider
+	// billed it. They are omitted when zero, which is what lets a log written
+	// before these fields existed still verify: an old entry decoded and
+	// re-encoded produces the same bytes, because absent and zero are the same
+	// thing on the wire.
+	//
+	// They are recorded rather than derived because they cannot be recovered
+	// later. Rates change and can be reapplied to history; what the provider
+	// said it served from cache at 09:14 on a Tuesday is observable once. An
+	// append-only log that did not capture it has lost it permanently.
+	CacheWriteTokens int    `json:"cache_write_tokens,omitempty"`
+	CacheReadTokens  int    `json:"cache_read_tokens,omitempty"`
 	StopReason       string `json:"stop_reason,omitempty"`
 	Streamed         bool   `json:"streamed,omitempty"`
 	Error            string `json:"error,omitempty"`
@@ -55,6 +67,21 @@ type Record struct {
 	// is useful even when you deliberately kept none of them.
 	Redactions map[string]int `json:"redactions,omitempty"`
 
+	// ToolsOffered names the functions the caller made available on this
+	// request. It is metadata, not content, and is recorded unconditionally:
+	// what a model was *permitted* to do bounds what it could have done, and a
+	// record of an agent's actions that omits its permissions cannot be read
+	// afterwards. Names only — a schema is the caller's business.
+	ToolsOffered []string `json:"tools_offered,omitempty"`
+	// ToolCalls are the calls the model chose to make.
+	//
+	// These are the agent's actions, and they are the part a completion log
+	// misses entirely: "asked X, replied Y" is not a record of a system that
+	// then transferred funds. Names are always recorded; arguments follow the
+	// same rule as prompts — present only where content logging was turned on,
+	// and redacted before they get here.
+	ToolCalls []ToolCall `json:"tool_calls,omitempty"`
+
 	// Prompt and Completion are present only when content logging is on, and
 	// are redacted before they get here.
 	Prompt     string `json:"prompt,omitempty"`
@@ -63,6 +90,18 @@ type Record struct {
 	// MAC covers every field above, including Prev, which is what binds one
 	// entry to the last. It is written last and excluded from its own input.
 	MAC string `json:"mac"`
+}
+
+// ToolCall is one invocation the model asked for.
+//
+// Name and ID are metadata and are always kept. Arguments are content: a call
+// to transfer_funds carries an account number, and a call to search_customer
+// carries whatever the model decided to look up. They are redacted at the same
+// chokepoint as prompts and dropped entirely when content logging is off.
+type ToolCall struct {
+	Name      string `json:"name"`
+	ID        string `json:"id,omitempty"`
+	Arguments string `json:"arguments,omitempty"`
 }
 
 // Log is an append-only, hash-chained JSONL audit log.
@@ -231,6 +270,10 @@ func (l *Log) Write(r Record) error {
 		return nil
 	}
 	prompt, completion := r.Prompt, r.Completion
+	// Copy the calls before redacting: the caller handed us a slice it may
+	// still be using, and rewriting arguments in place would edit the request
+	// that produced them.
+	calls := append([]ToolCall(nil), r.ToolCalls...)
 	counts := map[string]int{}
 
 	if l.red != nil {
@@ -244,10 +287,22 @@ func (l *Log) Write(r Record) error {
 		for k, v := range c2 {
 			counts[k] += v
 		}
+		hits := append(h1, h2...)
+		// Tool arguments go through the same redactor. A call is where the
+		// structured identifiers actually live — an account number reaches the
+		// log as an argument far more often than as prose.
+		for i := range calls {
+			args, c, h := l.red.ApplyDetailed(calls[i].Arguments)
+			calls[i].Arguments = args
+			for k, v := range c {
+				counts[k] += v
+			}
+			hits = append(hits, h...)
+		}
 		// Values are sealed to a key this process cannot read. If sealing
 		// fails, the entry is still written: losing the audit record because
 		// recovery was unavailable would be the worse outcome.
-		for _, h := range append(h1, h2...) {
+		for _, h := range hits {
 			if err := l.vault.Seal(h.Token, h.Rule, h.Value); err != nil {
 				return fmt.Errorf("sealing %s: %w", h.Rule, err)
 			}
@@ -264,7 +319,13 @@ func (l *Log) Write(r Record) error {
 		r.Prompt, r.Completion = prompt, completion
 	} else {
 		r.Prompt, r.Completion = "", ""
+		// The names stay. That a model called transfer_funds is the fact worth
+		// keeping; what it passed is the part that carries the customer.
+		for i := range calls {
+			calls[i].Arguments = ""
+		}
 	}
+	r.ToolCalls = calls
 	if r.Time.IsZero() {
 		r.Time = time.Now().UTC()
 	}

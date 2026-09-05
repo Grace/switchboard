@@ -8,6 +8,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/Grace/switchboard/internal/redact"
 )
@@ -156,4 +157,108 @@ func readFile(t *testing.T, path string) string {
 		t.Fatal(err)
 	}
 	return string(b)
+}
+
+// Tool calls are the agent's actions, and they follow the same rule as prompts:
+// the fact is always kept, the content only where content logging was chosen.
+func TestToolArgumentsAreContentButToolNamesAreNot(t *testing.T) {
+	dir := t.TempDir()
+	red, err := redact.New([]string{"email"}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	call := ToolCall{
+		Name: "email_customer", ID: "call_1",
+		Arguments: `{"to":"dana@example.com","body":"your refund"}`,
+	}
+
+	// Content off: the call is recorded, the arguments are not.
+	path := filepath.Join(dir, "metadata.jsonl")
+	t.Setenv(keyEnv, "k")
+	l, err := Open(path, red, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := l.Write(Record{
+		Time: time.Now().UTC(), ID: "a", Model: "m",
+		ToolsOffered: []string{"email_customer", "lookup_account"},
+		ToolCalls:    []ToolCall{call},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	l.Close()
+
+	raw, _ := os.ReadFile(path)
+	body := string(raw)
+	for _, want := range []string{"email_customer", "lookup_account", "call_1"} {
+		if !strings.Contains(body, want) {
+			t.Errorf("metadata log lost %q — that a tool was called is the fact worth keeping", want)
+		}
+	}
+	if strings.Contains(body, "dana@example.com") || strings.Contains(body, "your refund") {
+		t.Error("tool arguments reached a log with content logging off")
+	}
+
+	// Content on: arguments are kept, and redacted on the way through.
+	path = filepath.Join(dir, "content.jsonl")
+	l, err = Open(path, red, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := l.Write(Record{
+		Time: time.Now().UTC(), ID: "b", Model: "m", ToolCalls: []ToolCall{call},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	l.Close()
+
+	raw, _ = os.ReadFile(path)
+	body = string(raw)
+	if strings.Contains(body, "dana@example.com") {
+		t.Error("an address in a tool argument was not redacted")
+	}
+	if !strings.Contains(body, "your refund") {
+		t.Error("content logging on should keep the argument, redacted")
+	}
+
+	// The caller's own slice must not have been rewritten underneath it.
+	if call.Arguments != `{"to":"dana@example.com","body":"your refund"}` {
+		t.Errorf("Write edited the caller's tool call: %s", call.Arguments)
+	}
+}
+
+// Redaction counts have to include what was removed from arguments, or the
+// panel reporting "three addresses crossed the boundary" is wrong.
+func TestRedactionsInToolArgumentsAreCounted(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "audit.jsonl")
+	t.Setenv(keyEnv, "k")
+	red, err := redact.New([]string{"email"}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	l, err := Open(path, red, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := l.Write(Record{
+		Time: time.Now().UTC(), ID: "a", Model: "m",
+		Prompt: "mail lee@example.com",
+		ToolCalls: []ToolCall{
+			{Name: "email", Arguments: `{"to":"dana@example.com"}`},
+			{Name: "email", Arguments: `{"to":"kim@example.com"}`},
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	l.Close()
+
+	var rec Record
+	raw, _ := os.ReadFile(path)
+	if err := json.Unmarshal([]byte(strings.TrimSpace(string(raw))), &rec); err != nil {
+		t.Fatal(err)
+	}
+	if got := rec.Redactions["email"]; got != 3 {
+		t.Errorf("email redactions = %d, want 3 (one prompt, two arguments)", got)
+	}
 }

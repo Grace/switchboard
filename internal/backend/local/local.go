@@ -273,6 +273,9 @@ func readSSE(r io.Reader, emit func(switchboard.Chunk) error) (*switchboard.Resu
 			continue
 		}
 		if frame.Usage != nil {
+			// No cache split: llama-server's prompt cache is a local latency
+			// optimisation with no separate price, so there is nothing to
+			// attribute. Leaving the fields zero is the accurate statement.
 			result.Usage = switchboard.Usage{
 				InputTokens:  frame.Usage.PromptTokens,
 				OutputTokens: frame.Usage.CompletionTokens,

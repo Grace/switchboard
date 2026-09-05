@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -121,10 +122,23 @@ func TestRedactionCountsExportWithoutValues(t *testing.T) {
 		t.Errorf("redaction counts not exported: %s", truncate(s))
 	}
 	// Nothing resembling a value should be anywhere near it.
-	for _, forbidden := range []string{"@", "4111"} {
+	//
+	// The canaries are multi-character on purpose. This searches a binary
+	// protobuf body, so a single-byte needle matches by coincidence — "@" is
+	// 0x40, which turns up in encoded timestamps often enough to fail this test
+	// roughly one run in eight. A flaky assertion about a security property is
+	// worse than none: it gets muted, and then it is not an assertion.
+	for _, forbidden := range []string{"@example.com", "4111 1111", "dana@"} {
 		if strings.Contains(s, forbidden) {
 			t.Errorf("export contains %q, which should never leave with a count", forbidden)
 		}
+	}
+	// The stronger guarantee is in the signature rather than the bytes:
+	// Redacted takes counts by rule and has nowhere to put a value. This pins
+	// that, so a future change widening it fails here.
+	if got := reflect.TypeOf(m.Redacted).In(1); got != reflect.TypeOf(map[string]int(nil)) {
+		t.Errorf("Redacted takes %v; it must take counts by rule, with no way to "+
+			"carry a redacted value", got)
 	}
 }
 

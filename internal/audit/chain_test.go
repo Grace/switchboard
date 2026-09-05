@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func writeLog(t *testing.T, path string, key string, n int) {
@@ -243,5 +244,97 @@ func TestCorruptJSONIsReportedWithItsLine(t *testing.T) {
 	rep := verifyFile(t, path, "secret-key")
 	if rep.Break == nil || rep.Break.Line != 2 {
 		t.Fatalf("break = %+v, want line 2", rep.Break)
+	}
+}
+
+// A log written before the cache-token fields existed must still verify.
+//
+// The MAC covers the entry's canonical JSON, so adding a field to Record is a
+// change to that JSON — unless the field is omitempty and zero, in which case
+// absent and unset produce identical bytes. This is the test that keeps a
+// schema addition from silently invalidating every log already on disk, which
+// is a failure that would only be discovered by an auditor.
+func TestEntriesWrittenBeforeTheCacheFieldsExistedStillVerify(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "audit.jsonl")
+	t.Setenv(keyEnv, "k")
+
+	// Written by hand in the pre-change shape: no cache_write_tokens or
+	// cache_read_tokens anywhere, MACed over exactly those bytes.
+	l, err := Open(path, nil, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 3; i++ {
+		if err := l.Write(Record{
+			Time:  time.Date(2026, 9, 1, 12, i, 0, 0, time.UTC),
+			ID:    "chatcmpl-old",
+			Model: "claude-opus", Backend: "bedrock",
+			PromptTokens: 100, CompletionTokens: 10, StopReason: "end_turn",
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	l.Close()
+
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(raw), "cache_") {
+		t.Fatal("zero cache fields were written to the wire; absent and zero " +
+			"must be the same bytes or every existing log stops verifying")
+	}
+
+	rep, err := VerifyAll(path, []byte("k"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rep.Break != nil {
+		t.Fatalf("a log with no cache fields no longer verifies: %v", rep.Break)
+	}
+	if rep.Entries != 3 {
+		t.Errorf("entries = %d, want 3", rep.Entries)
+	}
+}
+
+// And an entry that does carry cache counts verifies on its own terms.
+func TestCacheCountsAreCoveredByTheMAC(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "audit.jsonl")
+	t.Setenv(keyEnv, "k")
+
+	l, err := Open(path, nil, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := l.Write(Record{
+		Time: time.Date(2026, 9, 1, 12, 0, 0, 0, time.UTC), ID: "c",
+		Model: "claude-opus", Backend: "bedrock",
+		PromptTokens: 3, CompletionTokens: 8, CacheReadTokens: 187361,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	l.Close()
+
+	if rep, err := VerifyAll(path, []byte("k")); err != nil || rep.Break != nil {
+		t.Fatalf("fresh log does not verify: %v %v", err, rep.Break)
+	}
+
+	// Editing the cache count has to break the chain, or the field is recorded
+	// without being protected — which would be worse than not recording it.
+	raw, _ := os.ReadFile(path)
+	edited := strings.Replace(string(raw), `"cache_read_tokens":187361`, `"cache_read_tokens":1`, 1)
+	if edited == string(raw) {
+		t.Fatal("the cache count is not on the wire")
+	}
+	os.WriteFile(path, []byte(edited), 0o600)
+
+	rep, err := VerifyAll(path, []byte("k"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rep.Break == nil {
+		t.Error("altering a cache count went undetected")
 	}
 }

@@ -270,6 +270,18 @@ const KeyEnv = keyEnv
 // Streaming rather than returning a slice: a log that has been running for a
 // year is not something to hold in memory to count.
 func Walk(base string, fn func(Record) error) error {
+	return WalkRaw(base, func(r Record, _ []byte) error { return fn(r) })
+}
+
+// WalkRaw is Walk with the exact bytes each entry was written as.
+//
+// Extracting a period from a log means copying lines, not re-encoding them. The
+// MAC covers the canonical bytes of the entry, so a record that has been
+// unmarshalled and marshalled again is a different sequence of bytes and will
+// not verify — field order, number formatting and escaping are all free to
+// change. Anything producing evidence has to carry the originals, and this is
+// how it gets them.
+func WalkRaw(base string, fn func(Record, []byte) error) error {
 	segs, err := Segments(base)
 	if err != nil {
 		return err
@@ -290,7 +302,9 @@ func Walk(base string, fn func(Record) error) error {
 			if err := json.Unmarshal(raw, &rec); err != nil {
 				continue // Verify reports corruption; counting should not stop for it
 			}
-			if err := fn(rec); err != nil {
+			// The callee may retain these bytes; the scanner reuses its buffer.
+			line := append([]byte(nil), raw...)
+			if err := fn(rec, line); err != nil {
 				f.Close()
 				return err
 			}

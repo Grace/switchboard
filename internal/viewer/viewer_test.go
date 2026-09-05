@@ -13,6 +13,13 @@ import (
 	"github.com/Grace/switchboard/internal/redact"
 )
 
+// testPrices is a rate card for the demo log's one model. It is invented for
+// the test and says so — switchboard ships no price list, so a test that wants
+// money has to declare what it costs, exactly as a deployment does.
+var testPrices = Prices{Currency: "USD", Model: map[string]Price{
+	"claude-opus": {InPerMTok: 15, OutPerMTok: 75},
+}}
+
 func demoLog(t *testing.T, withContent bool) string {
 	t.Helper()
 	dir := t.TempDir()
@@ -56,7 +63,7 @@ func demoLog(t *testing.T, withContent bool) string {
 
 func TestSummariseCountsWhatThePageShows(t *testing.T) {
 	path := demoLog(t, false)
-	s, err := Summarise(path, []byte("k"))
+	s, err := Summarise(path, []byte("k"), Query{}, testPrices)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -90,7 +97,7 @@ func TestSummariseCountsWhatThePageShows(t *testing.T) {
 
 // The panel no time-series tool has: the rules changed here.
 func TestPolicyChangesAppearAsSeparateWindows(t *testing.T) {
-	s, err := Summarise(demoLog(t, false), []byte("k"))
+	s, err := Summarise(demoLog(t, false), []byte("k"), Query{}, testPrices)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -107,7 +114,7 @@ func TestPolicyChangesAppearAsSeparateWindows(t *testing.T) {
 
 // Distinct people are only knowable where callers presented an identity.
 func TestSubjectsAreCountedDistinctly(t *testing.T) {
-	s, _ := Summarise(demoLog(t, false), []byte("k"))
+	s, _ := Summarise(demoLog(t, false), []byte("k"), Query{}, testPrices)
 	for _, tm := range s.Teams {
 		if tm.Subjects != 1 {
 			t.Errorf("team %s: subjects = %d, want 1", tm.Team, tm.Subjects)
@@ -124,7 +131,7 @@ func TestABrokenChainIsSurfaced(t *testing.T) {
 	lines[3] = strings.Replace(lines[3], `"model":"claude-opus"`, `"model":"something-else"`, 1)
 	os.WriteFile(path, []byte(strings.Join(lines, "\n")+"\n"), 0o600)
 
-	s, err := Summarise(path, []byte("k"))
+	s, err := Summarise(path, []byte("k"), Query{}, testPrices)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -139,7 +146,7 @@ func TestABrokenChainIsSurfaced(t *testing.T) {
 // Redaction counts belong on the page; values never do.
 func TestPageShowsCountsAndNeverValues(t *testing.T) {
 	path := demoLog(t, true)
-	srv, ln, err := Serve("127.0.0.1:0", path, []byte("k"), false)
+	srv, ln, err := Serve("127.0.0.1:0", path, []byte("k"), testPrices, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -174,11 +181,11 @@ func TestPageShowsCountsAndNeverValues(t *testing.T) {
 func TestNonLoopbackIsRefusedUnlessDemanded(t *testing.T) {
 	path := demoLog(t, false)
 	for _, addr := range []string{"0.0.0.0:11436", "10.0.0.5:11436"} {
-		if _, _, err := Serve(addr, path, nil, false); err == nil {
+		if _, _, err := Serve(addr, path, nil, testPrices, false); err == nil {
 			t.Errorf("%s should be refused without -allow-remote", addr)
 		}
 	}
-	if _, ln, err := Serve("127.0.0.1:0", path, nil, false); err != nil {
+	if _, ln, err := Serve("127.0.0.1:0", path, nil, testPrices, false); err != nil {
 		t.Errorf("loopback should be allowed: %v", err)
 	} else {
 		ln.Close()
@@ -187,7 +194,7 @@ func TestNonLoopbackIsRefusedUnlessDemanded(t *testing.T) {
 
 func TestReadOnly(t *testing.T) {
 	path := demoLog(t, false)
-	srv, ln, err := Serve("127.0.0.1:0", path, []byte("k"), false)
+	srv, ln, err := Serve("127.0.0.1:0", path, []byte("k"), testPrices, false)
 	if err != nil {
 		t.Fatal(err)
 	}

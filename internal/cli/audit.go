@@ -18,7 +18,7 @@ const auditUsage = `usage: switchboard audit <verify|show> [flags]
   verify   walk the chain and report the first entry that does not hold
   show     print every entry for one completion id
   recover  decrypt sealed values, given the private key
-  view     serve a read-only page of this log on loopback
+  view     serve a read-only page of this log on loopback, or -out it to a file
 
 An audit log is evidence only if an edit to it is detectable. Each entry
 carries the digest of the one before it, and its own digest covers that link,
@@ -46,6 +46,7 @@ func runAudit(_ context.Context, args []string) error {
 	token := fs.String("token", "", "value token to recover; omit for all")
 	addr := fs.String("addr", "127.0.0.1:11436", "address for view")
 	allowRemote := fs.Bool("allow-remote", false, "let view bind somewhere other than loopback")
+	out := fs.String("out", "", "for view: write the page to this file and exit, instead of serving")
 	if err := parse(fs, rest); err != nil {
 		return err
 	}
@@ -74,7 +75,15 @@ func runAudit(_ context.Context, args []string) error {
 		}
 		return auditShow(logPath, *id)
 	case "view":
-		return auditView(logPath, *addr, *allowRemote)
+		// The rate card comes from the same file as everything else, so the
+		// page's money is the deployment's own declared rates rather than a
+		// price list baked into this binary. Without one it shows tokens and
+		// says nothing about cost.
+		prices, err := viewerPrices(*cfgPath)
+		if err != nil {
+			return err
+		}
+		return auditView(logPath, *addr, prices, *allowRemote, *out)
 	case "recover":
 		if *keyPath == "" {
 			return fmt.Errorf("recover needs -key: the gateway is never given the " +
@@ -182,9 +191,46 @@ func auditRecover(vaultPath, keyPath, token string) error {
 	return nil
 }
 
-// auditView serves the log as a page. Read-only, loopback, no state.
-func auditView(logPath, addr string, allowRemote bool) error {
-	srv, ln, err := viewer.Serve(addr, logPath, audit.KeyFromEnv(), allowRemote)
+// viewerPrices reads the rate card out of the config, tolerating the absence of
+// a config file entirely — pointing this at a log downloaded from an archive is
+// a supported thing to do, and it should not require the deployment's config to
+// be present on the machine doing the reading.
+func viewerPrices(cfgPath string) (viewer.Prices, error) {
+	cfg, found, err := config.LoadForReport(config.ExpandPath(cfgPath))
+	if err != nil || !found {
+		return viewer.Prices{}, err
+	}
+	p := viewer.Prices{Currency: cfg.Pricing.Currency}
+	if len(cfg.Pricing.Models) > 0 {
+		p.Model = make(map[string]viewer.Price, len(cfg.Pricing.Models))
+		for name, r := range cfg.Pricing.Models {
+			p.Model[name] = viewer.Price{
+				InPerMTok: r.InputPerMTok, OutPerMTok: r.OutputPerMTok,
+				CacheWrite: r.CacheWritePerMTok, CacheReadPer: r.CacheReadPerMTok,
+			}
+		}
+	}
+	return p, nil
+}
+
+// auditView serves the log as a page, or writes it to a file.
+//
+// The file form exists because the useful thing to do with a view of an
+// incident is attach it to the incident. It is one self-contained page with no
+// script and no external reference, so it survives being mailed to someone who
+// cannot reach the host it came from.
+func auditView(logPath, addr string, prices viewer.Prices, allowRemote bool, out string) error {
+	if out != "" {
+		n, err := viewer.WriteFile(out, logPath, audit.KeyFromEnv(), prices)
+		if err != nil {
+			return err
+		}
+		fmt.Printf("wrote %s (%d bytes) from %s\n", out, n, logPath)
+		fmt.Println("\nSelf-contained: no script, no external reference. It shows the whole")
+		fmt.Println("log; to capture one slice, serve it and save the filtered URL.")
+		return nil
+	}
+	srv, ln, err := viewer.Serve(addr, logPath, audit.KeyFromEnv(), prices, allowRemote)
 	if err != nil {
 		return err
 	}
