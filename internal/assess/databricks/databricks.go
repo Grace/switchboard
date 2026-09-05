@@ -155,6 +155,9 @@ func (e *Endpoint) Deployment(profile assess.Profile) assess.Deployment {
 	// workspace admin can still rewrite it — there is no verification step that
 	// fails. That is a real No rather than an Unknown.
 	d.Audit.TamperEvident = assess.No
+	d.Audit.TamperEvidentDetail = "The inference table is a versioned Delta table. " +
+		"History is retained, and a workspace admin can still rewrite it; nothing " +
+		"verifies the record, so there is no check that fails when it changes."
 	// Nothing in the endpoint configuration refuses a request whose payload
 	// cannot be logged, so an unrecordable completion is served.
 	d.Audit.FailClosed = assess.No

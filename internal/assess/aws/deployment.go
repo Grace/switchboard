@@ -172,6 +172,12 @@ func (e *Export) mapObjectLock(d *assess.Deployment, bucket string) {
 	switch mode {
 	case "COMPLIANCE":
 		d.Audit.TamperEvident = assess.Yes
+		d.Audit.TamperEvidentDetail = "S3 Object Lock in COMPLIANCE mode: for the " +
+			"retention period no principal, including the account root, can delete or " +
+			"overwrite a log object. That is immutability at the storage layer rather " +
+			"than tamper-evidence in the record — it prevents an edit rather than " +
+			"revealing one — and it covers nothing that happened before an object " +
+			"was written."
 		d.Caveats = append(d.Caveats,
 			"Object Lock is in COMPLIANCE mode: for the retention period no principal, "+
 				"including the account root, can delete or overwrite a log object. This is "+
@@ -180,6 +186,10 @@ func (e *Export) mapObjectLock(d *assess.Deployment, bucket string) {
 				"cover anything that happened before an object was written.")
 	case "GOVERNANCE":
 		d.Audit.TamperEvident = assess.No
+		d.Audit.TamperEvidentDetail = "S3 Object Lock is in GOVERNANCE mode, which a " +
+			"principal holding s3:BypassGovernanceRetention can override. It protects " +
+			"against accident and not against intent, so an auditor asking whether the " +
+			"record could have been changed has to be told that it could."
 		d.Caveats = append(d.Caveats,
 			"Object Lock is in GOVERNANCE mode, which a principal holding "+
 				"s3:BypassGovernanceRetention can override. It protects against accident "+

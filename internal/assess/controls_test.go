@@ -181,3 +181,34 @@ func TestSilentSourceGetsUnknownAgency(t *testing.T) {
 		}
 	}
 }
+
+// The scorer must not name a mechanism it was never told about.
+//
+// This is a regression. The tamper-evidence row once hardcoded switchboard's
+// own hash chain, so a Bedrock account with S3 Object Lock was reported to a
+// reviewer as "hash-chained" — an invented assurance, which is worse than an
+// invented finding because nobody goes looking to disprove good news.
+func TestTamperEvidenceDoesNotInventAMechanism(t *testing.T) {
+	d := Deployment{Source: "aws-bedrock"}
+	d.Audit.Enabled = Yes
+	d.Audit.TamperEvident = Yes
+	c := find(t, Assess(d), "protected from modification")
+	if strings.Contains(strings.ToLower(c.Evidence), "hash") {
+		t.Errorf("a source that never mentioned a hash chain was told it has one: %q", c.Evidence)
+	}
+	// Silence has to read as a question, not as a description.
+	if !strings.Contains(c.Evidence, "does not say by what mechanism") {
+		t.Errorf("an adapter that supplied no mechanism should be asked for one: %q", c.Evidence)
+	}
+}
+
+// And when the adapter does supply one, that is what the reviewer reads.
+func TestTamperEvidenceUsesTheAdaptersMechanism(t *testing.T) {
+	d := Deployment{Source: "aws-bedrock"}
+	d.Audit.Enabled = Yes
+	d.Audit.TamperEvident = Yes
+	d.Audit.TamperEvidentDetail = "S3 Object Lock in COMPLIANCE mode."
+	if got := find(t, Assess(d), "protected from modification").Evidence; got != "S3 Object Lock in COMPLIANCE mode." {
+		t.Errorf("adapter detail was not used: %q", got)
+	}
+}

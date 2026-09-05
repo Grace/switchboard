@@ -143,6 +143,18 @@ type Audit struct {
 	Path    string  `json:"path,omitempty"`
 	// TamperEvident means altering a past entry is detectable.
 	TamperEvident Support `json:"tamper_evident"`
+	// TamperEvidentDetail is how this deployment resists modification, in its
+	// own terms, supplied by the adapter.
+	//
+	// This field exists because the scorer once described the mechanism itself,
+	// which meant a Bedrock account with S3 Object Lock was reported to a
+	// reviewer as "hash-chained". Every deployment resists modification
+	// differently — a chained record reveals an edit, object immutability
+	// prevents one, and a versioned table does neither — and the difference is
+	// the entire content of the row. A scorer that names a mechanism it was
+	// never told about invents assurance, which is worse than inventing a
+	// finding: nobody goes looking to disprove good news.
+	TamperEvidentDetail string `json:"tamper_evident_detail,omitempty"`
 	// FailClosed means a completion that cannot be recorded is refused rather
 	// than served unrecorded.
 	FailClosed Support `json:"fail_closed"`

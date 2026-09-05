@@ -46,7 +46,10 @@ func (c *Config) Deployment() assess.Deployment {
 			Path:    c.Audit.Path,
 			// The chain is a property of the log format, so it is on whenever
 			// the log is.
-			TamperEvident:  assess.Bool(c.Audit.Enabled),
+			TamperEvident: assess.Bool(c.Audit.Enabled),
+			TamperEvidentDetail: "Hash-chained, so alteration, deletion and reordering are " +
+				"detectable. Tail truncation is not detectable from the file alone, and a " +
+				"key holder can rewrite history. Anchor the head externally.",
 			FailClosed:     assess.Bool(c.Audit.Required),
 			VerifyInterval: c.Audit.VerifyInterval.Duration(),
 			Retention:      c.Audit.Retention.Duration(),

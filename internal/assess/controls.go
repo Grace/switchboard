@@ -397,18 +397,25 @@ type unknownFunc func(section, objective string, rs []Ref, what string)
 func assessAuditDetail(add addFunc, unknown unknownFunc, d Deployment, reg Regime, hasRegime bool) {
 	const audit = "Audit and accountability"
 
+	// The mechanism comes from the adapter. The scorer knows that modification
+	// is or is not detectable here; it does not know how, and guessing produced
+	// a report that told a Bedrock account it was hash-chained.
+	tamperRefs := refs("SOC 2", "CC7.2", "ISO 27001", "A.8.15", "NIST 800-53", "AU-9")
+	detail := d.Audit.TamperEvidentDetail
 	switch d.Audit.TamperEvident {
 	case Yes:
-		add(audit, "Records are protected from modification",
-			refs("SOC 2", "CC7.2", "ISO 27001", "A.8.15", "NIST 800-53", "AU-9"), StatusPartial,
-			"Hash-chained, so alteration, deletion and reordering are detectable. Tail "+
-				"truncation is not detectable from the file alone, and a key holder can "+
-				"rewrite history. Anchor the head externally.")
+		if detail == "" {
+			detail = fmt.Sprintf("Altering a past record is detectable. The %s "+
+				"configuration does not say by what mechanism, so ask how, and ask "+
+				"what it does not cover.", d.Source)
+		}
+		add(audit, "Records are protected from modification", tamperRefs, StatusPartial, detail)
 	case No:
-		add(audit, "Records are protected from modification",
-			refs("SOC 2", "CC7.2", "ISO 27001", "A.8.15", "NIST 800-53", "AU-9"), StatusUnmet,
-			"Records are append-only at best. Anyone with write access to the store can "+
-				"edit a past entry undetectably.")
+		if detail == "" {
+			detail = "Records are append-only at best. Anyone with write access to the " +
+				"store can edit a past entry undetectably."
+		}
+		add(audit, "Records are protected from modification", tamperRefs, StatusUnmet, detail)
 	default:
 		unknown(audit, "Records are protected from modification",
 			refs("SOC 2", "CC7.2", "NIST 800-53", "AU-9"), "past records can be altered undetectably")
