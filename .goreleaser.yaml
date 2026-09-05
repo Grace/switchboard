@@ -25,6 +25,29 @@ archives:
 checksum:
   name_template: checksums.txt
 
+# An SBOM answers "what is in this binary" without the reviewer having to take
+# our word for it, and it is the first thing a supply-chain question asks for.
+sboms:
+  - artifacts: archive
+    documents:
+      - "${artifact}.sbom.spdx.json"
+
+# Keyless signing: the certificate is issued to the GitHub Actions identity that
+# built the release and recorded in the public transparency log, so a signature
+# proves which workflow, at which commit, produced the artifact. There is no
+# private key to hold, and therefore none to leak or rotate.
+signs:
+  - cmd: cosign
+    certificate: "${artifact}.pem"
+    args:
+      - sign-blob
+      - "--output-certificate=${certificate}"
+      - "--output-signature=${signature}"
+      - "${artifact}"
+      - "--yes"
+    artifacts: checksum
+    output: true
+
 changelog:
   use: github
   sort: asc

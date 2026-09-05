@@ -55,7 +55,7 @@ certification. switchboard is software you run; the controls are yours.
 |---|---|---|---|
 | Configuration is validated before use | SOC 2 CC8.1 · NIST CM-3 | ✅ | The whole config is validated at load, before the listener opens. Unknown fields are rejected rather than ignored, so a misspelled key fails in front of whoever typed it instead of silently widening behaviour. |
 | Insecure combinations are refused | SOC 2 CC8.1 | ✅ | Content logging without redaction rules, and `require_caller` without attribution, are both refused at startup. |
-| Builds are reproducible and attributable | SOC 2 CC8.1 · SLSA | ◐ | Tagged releases build from source in CI with pinned Go, publishing checksums; version, commit and build date are stamped into the binary. **No signed provenance or SBOM.** |
+| Builds are reproducible and attributable | SOC 2 CC8.1 · SLSA · NIST SR-4 | ✅ | Tagged releases build from source in CI with pinned Go. Checksums and container images are signed with keyless cosign, so a signature identifies the workflow, repository and tag that produced the artifact and is recorded in a public transparency log. Every archive ships an SPDX SBOM. See [verifying.md](verifying.md). |
 | Dependencies are minimal and auditable | ISO 27001 A.8.30 | ✅ | Standard library plus the AWS SDK. `go.mod` is the whole list; token verification is in-tree rather than a JOSE dependency. |
 
 ## Availability and operations

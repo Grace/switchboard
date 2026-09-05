@@ -62,6 +62,11 @@ Or from the terminal, without a server:
 switchboard run -m qwen3-8b "explain the borrow checker"
 ```
 
+Releases are signed with keyless cosign and ship an SPDX SBOM — see
+[docs/verifying.md](docs/verifying.md) for how to check one, including the
+`--certificate-identity` pin that makes the signature mean *this* workflow
+rather than any workflow.
+
 ## Configuration
 
 `~/.switchboard/switchboard.json`, or wherever `SWITCHBOARD_CONFIG` points. Unknown fields are rejected at load time, and the file is validated before the process starts rather than at first request.
