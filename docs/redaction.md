@@ -291,6 +291,34 @@ returns which model answered, on whose behalf, the token counts, the stop
 reason, what was redacted on the way in, and — when content logging is on — the
 redacted prompt and completion.
 
+## Which rules were in force
+
+An entry saying what happened, without saying what the rules were, cannot answer
+the question a security audit actually asks: *was this allowed under the policy
+at the time?*
+
+Every entry carries a `policy` fingerprint — a digest of the configuration that
+produced it:
+
+```json
+{ "seq": 4812, "policy": "99a5b0ae8aa1", "team": "search", "model": "claude-opus" }
+```
+
+So you can tell which entries were made under which policy, and see that policy
+changed in the middle of a window you were looking at. Startup prints it, so the
+value in the log can be matched to a deploy.
+
+**It is not a hash of the whole file, deliberately.** A changed listen address or
+log path is not a policy change, and a fingerprint that moves for those reasons
+trains people to ignore it. It covers what alters what the gateway will allow,
+redact, attribute or refuse: models, teams and their allowances, attribution,
+identity, redaction rules, audit and sealing settings, limits, and whether
+mutual TLS is required.
+
+**Rotating a key does not move it; adding one does.** A new credential for a
+team is a policy change. Replacing an existing one is not — and a fingerprint is
+not a place to put a digest of a secret.
+
 ## When the log cannot be written
 
 A gateway that keeps answering while unable to record anything is worse than one

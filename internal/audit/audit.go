@@ -33,7 +33,11 @@ type Record struct {
 	Team         string    `json:"team,omitempty"`
 	Subject      string    `json:"subject,omitempty"`
 	Model        string    `json:"model"`
-	Backend      string    `json:"backend,omitempty"`
+	// Policy is the fingerprint of the configuration in force. Without it the
+	// log says what happened but not what the rules were, and "was this allowed
+	// under the policy at the time" is unanswerable.
+	Policy  string `json:"policy,omitempty"`
+	Backend string `json:"backend,omitempty"`
 
 	PromptTokens     int    `json:"prompt_tokens"`
 	CompletionTokens int    `json:"completion_tokens"`
@@ -87,6 +91,10 @@ type Log struct {
 	// only after it has run successfully.
 	archiveCmd string
 	archiveErr error
+
+	// policy stamps every entry, so the rules in force are recorded alongside
+	// what happened under them.
+	policy string
 
 	// chain is the last self-verification result. See watch.go.
 	chain *ChainState
@@ -182,6 +190,15 @@ func (l *Log) WithVault(w *vault.Writer) *Log {
 	return l
 }
 
+// WithPolicy stamps every entry with the fingerprint of the configuration that
+// produced it.
+func (l *Log) WithPolicy(fingerprint string) *Log {
+	if l != nil {
+		l.policy = fingerprint
+	}
+	return l
+}
+
 // Signed reports whether entries are being MACed with a key rather than only
 // digested. Callers surface this at startup: "auditing" and "auditing in a way
 // that survives someone editing the file" are different claims.
@@ -230,6 +247,9 @@ func (l *Log) Write(r Record) error {
 	}
 	if r.Time.IsZero() {
 		r.Time = time.Now().UTC()
+	}
+	if r.Policy == "" {
+		r.Policy = l.policy
 	}
 
 	l.mu.Lock()

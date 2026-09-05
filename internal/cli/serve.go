@@ -84,6 +84,7 @@ func runServe(ctx context.Context, args []string) error {
 		if err != nil {
 			return fmt.Errorf("audit log: %w", err)
 		}
+		lg = lg.WithPolicy(cfg.PolicyFingerprint())
 		lg = lg.WithRotation(audit.Rotation{
 			MaxBytes:       cfg.Audit.MaxBytes,
 			Retention:      time.Duration(cfg.Audit.Retention),
@@ -162,6 +163,7 @@ func runServe(ctx context.Context, args []string) error {
 		}
 		logger.Printf("audit log: %s (%s; %s; rules: %s)",
 			cfg.Audit.Path, what, chain, strings.Join(red.Rules(), ", "))
+		logger.Printf("policy fingerprint: %s", cfg.PolicyFingerprint())
 		srv = srv.WithAudit(lg, cfg.Audit.Required)
 	}
 
