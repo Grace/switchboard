@@ -192,6 +192,10 @@ Not done yet:
 - **Redaction toward the provider.** Content is redacted before it is written to the audit log, but it still reaches the model as written. Stripping it on the way *out* is a separate feature and is not built.
 - **Spend caps and chargeback reporting.** Per-team attribution now reaches the provider (see below), but there is no token budget, no enforcement when one is exceeded, and no rollup finance can read.
 - **Retry and backpressure.** No throttling-aware retry yet. Rate, concurrency and token budgets are enforced (see below); retrying a throttled provider is not.
+An expression layer for conditional admission is [proposed but not
+built](docs/policy-proposal.md) — written down so the design, and the dependency
+it would cost, can be argued with before there is code to defend.
+
 For a security review, [docs/controls.md](docs/controls.md) maps what switchboard does against SOC 2, ISO 27001, HIPAA, NIST and EU AI Act control objectives — including, deliberately, everything it does not do.
 
 ## Contributing and contact
