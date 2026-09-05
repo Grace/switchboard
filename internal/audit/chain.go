@@ -264,3 +264,42 @@ func KeyFromEnv() []byte { return keyFromEnv() }
 
 // KeyEnv names the environment variable holding the audit key.
 const KeyEnv = keyEnv
+
+// Walk visits every entry across every segment, oldest first.
+//
+// Streaming rather than returning a slice: a log that has been running for a
+// year is not something to hold in memory to count.
+func Walk(base string, fn func(Record) error) error {
+	segs, err := Segments(base)
+	if err != nil {
+		return err
+	}
+	for _, s := range segs {
+		f, err := os.Open(s)
+		if err != nil {
+			return err
+		}
+		sc := bufio.NewScanner(f)
+		sc.Buffer(make([]byte, 0, 64*1024), 8*1024*1024)
+		for sc.Scan() {
+			raw := bytes.TrimSpace(sc.Bytes())
+			if len(raw) == 0 {
+				continue
+			}
+			var rec Record
+			if err := json.Unmarshal(raw, &rec); err != nil {
+				continue // Verify reports corruption; counting should not stop for it
+			}
+			if err := fn(rec); err != nil {
+				f.Close()
+				return err
+			}
+		}
+		if err := sc.Err(); err != nil {
+			f.Close()
+			return err
+		}
+		f.Close()
+	}
+	return nil
+}

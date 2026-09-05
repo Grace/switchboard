@@ -291,6 +291,27 @@ returns which model answered, on whose behalf, the token counts, the stop
 reason, what was redacted on the way in, and — when content logging is on — the
 redacted prompt and completion.
 
+## Looking at it
+
+```
+$ switchboard audit view
+reading  ~/.switchboard/audit.jsonl
+serving  http://127.0.0.1:11436
+```
+
+Read-only, loopback, no state and no database. Spend by team, models, redaction
+counts, the most recent entries, and a policy timeline showing where the rules
+changed underneath the window you are looking at.
+
+It reads whatever log you point it at, so a segment pulled from an archive
+during an incident works the same way. It shows what the log contains — metadata
+unless content logging was turned on, already through redaction — and it never
+opens the vault: sealed values need the incident-response key, and recovering
+one stays a command run by a person.
+
+Binding anywhere but loopback is refused unless demanded, because the page shows
+who spent what and has no authentication.
+
 ## Which rules were in force
 
 An entry saying what happened, without saying what the rules were, cannot answer

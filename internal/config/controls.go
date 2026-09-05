@@ -179,7 +179,7 @@ func (c *Config) Controls() ControlReport {
 
 		if v := c.Audit.VerifyInterval.Duration(); v > 0 {
 			add(audit, "Logs are reviewed", "SOC 2 CC7.2 · NIST AU-6", StatusMet,
-				fmt.Sprintf("Chain verified at startup and every %s.", v))
+				fmt.Sprintf("Chain verified at startup and every %s.", roughly(v)))
 		} else {
 			add(audit, "Logs are reviewed", "SOC 2 CC7.2 · NIST AU-6", StatusPartial,
 				"Chain verified at startup only. Set audit.verify_interval to re-walk it "+
@@ -206,16 +206,17 @@ func (c *Config) Controls() ControlReport {
 		case got < floor:
 			add(audit, "Log retention", cite, StatusUnmet,
 				fmt.Sprintf("audit.retention is %s; %s asks for at least %s.",
-					got, cite, roughly(floor)))
+					roughly(got), cite, roughly(floor)))
 		case c.Audit.ArchiveCommand == "":
 			add(audit, "Log retention", cite, StatusPartial,
 				fmt.Sprintf("audit.retention of %s clears the floor, but with no "+
 					"archive_command this host is the archive and retention deletes "+
-					"evidence rather than draining a buffer.", got))
+					"evidence rather than draining a buffer.", roughly(got)))
 		default:
 			add(audit, "Log retention", cite, StatusMet,
-				fmt.Sprintf("audit.retention is %s, above the %s floor, and closed "+
-					"segments are archived before pruning.", got, roughly(floor)))
+				fmt.Sprintf("audit.retention is %s, above the %s floor of %s, and "+
+					"closed segments are archived before pruning.",
+					roughly(got), cite, roughly(floor)))
 		}
 	}
 

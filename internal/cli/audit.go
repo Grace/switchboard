@@ -10,6 +10,7 @@ import (
 	"github.com/Grace/switchboard/internal/audit"
 	"github.com/Grace/switchboard/internal/config"
 	"github.com/Grace/switchboard/internal/vault"
+	"github.com/Grace/switchboard/internal/viewer"
 )
 
 const auditUsage = `usage: switchboard audit <verify|show> [flags]
@@ -17,6 +18,7 @@ const auditUsage = `usage: switchboard audit <verify|show> [flags]
   verify   walk the chain and report the first entry that does not hold
   show     print every entry for one completion id
   recover  decrypt sealed values, given the private key
+  view     serve a read-only page of this log on loopback
 
 An audit log is evidence only if an edit to it is detectable. Each entry
 carries the digest of the one before it, and its own digest covers that link,
@@ -42,6 +44,8 @@ func runAudit(_ context.Context, args []string) error {
 	keyPath := fs.String("key", "", "PEM private key, for recover")
 	vaultPath := fs.String("vault", "", "sealed-value store (default: vault.path from config)")
 	token := fs.String("token", "", "value token to recover; omit for all")
+	addr := fs.String("addr", "127.0.0.1:11436", "address for view")
+	allowRemote := fs.Bool("allow-remote", false, "let view bind somewhere other than loopback")
 	if err := parse(fs, rest); err != nil {
 		return err
 	}
@@ -69,6 +73,8 @@ func runAudit(_ context.Context, args []string) error {
 			return fmt.Errorf("show needs -id")
 		}
 		return auditShow(logPath, *id)
+	case "view":
+		return auditView(logPath, *addr, *allowRemote)
 	case "recover":
 		if *keyPath == "" {
 			return fmt.Errorf("recover needs -key: the gateway is never given the " +
@@ -174,4 +180,17 @@ func auditRecover(vaultPath, keyPath, token string) error {
 	}
 	fmt.Fprintf(os.Stderr, "\n%d value(s) recovered. This is the plaintext redaction removed; handle accordingly.\n", len(found))
 	return nil
+}
+
+// auditView serves the log as a page. Read-only, loopback, no state.
+func auditView(logPath, addr string, allowRemote bool) error {
+	srv, ln, err := viewer.Serve(addr, logPath, audit.KeyFromEnv(), allowRemote)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("reading  %s\n", logPath)
+	fmt.Printf("serving  http://%s\n\n", ln.Addr())
+	fmt.Println("Read-only. Nothing here is written back, and the vault is not opened.")
+	fmt.Println("Ctrl-C to stop.")
+	return srv.Serve(ln)
 }

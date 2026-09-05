@@ -12,6 +12,11 @@ verifying everything by hand.
 So the rightmost column below is deliberately unflattering. Nothing here is a
 certification. switchboard is software you run; the controls are yours.
 
+For an assessment of a *deployment* rather than of the software — which
+controls your configuration actually satisfies, and what a declared regime
+requires that no config file can evidence — run `switchboard controls`.
+See [profiles.md](profiles.md).
+
 **Legend.** ✅ implemented · ◐ partial, with the gap named · ❌ not addressed
 
 ---

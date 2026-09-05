@@ -92,10 +92,10 @@ func writeControls(w io.Writer, rep config.ControlReport) {
 	}
 	fmt.Fprint(w, "\n\n")
 
-	// Everything goes through one writer and one flush, so the status and
-	// objective columns line up across sections rather than being re-measured
-	// per section. Lines with no tab are passed through untouched, which is
-	// what makes the section headings work here.
+	// One writer and one flush. A tabwriter line with no tab terminates the
+	// column block, so each section headline starts a fresh block and every
+	// section is measured on its own widths — which is what we want, since one
+	// long citation would otherwise indent every objective in the report.
 	section := ""
 	tw := tabwriter.NewWriter(w, 0, 4, 2, ' ', 0)
 	for _, c := range rep.Controls {

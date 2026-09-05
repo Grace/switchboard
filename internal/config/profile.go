@@ -236,17 +236,29 @@ func (p Profile) validate(c *Config) error {
 	return nil
 }
 
-// roughly renders a duration the way the regulation says it, because "52560h0m0s"
-// is not what anyone wrote down.
+// roughly renders a duration the way a person says it, because "61320h0m0s" is
+// not a number anybody wrote down and a control report is read by people who
+// did not choose it.
+//
+// Rounds down, deliberately: this renders retention against a regulatory floor,
+// and a value that reads longer than it is would be the one dangerous direction
+// to be imprecise in.
 func roughly(d time.Duration) string {
-	switch {
-	case d >= 365*24*time.Hour:
-		y := d / (365 * 24 * time.Hour)
-		return fmt.Sprintf("%d years", y)
-	case d >= 30*24*time.Hour:
-		m := d / (30 * 24 * time.Hour)
-		return fmt.Sprintf("%d months", m)
+	plural := func(n int64, unit string) string {
+		if n == 1 {
+			return fmt.Sprintf("%d %s", n, unit)
+		}
+		return fmt.Sprintf("%d %ss", n, unit)
+	}
+	switch day := 24 * time.Hour; {
+	case d >= 365*day:
+		return plural(int64(d/(365*day)), "year")
+	case d >= 30*day:
+		return plural(int64(d/(30*day)), "month")
+	case d >= day:
+		return plural(int64(d/day), "day")
 	default:
-		return d.String()
+		// "1h0m0s" is the standard library being complete rather than readable.
+		return strings.TrimSuffix(strings.TrimSuffix(d.String(), "0s"), "0m")
 	}
 }
