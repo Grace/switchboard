@@ -136,3 +136,109 @@ func TestRecordsWithoutAModelAreCountedNotListed(t *testing.T) {
 		t.Errorf("it should still count as an entry, got %d", res.Entries)
 	}
 }
+
+func recID(model, id, provider string, day int) audit.Record {
+	r := rec(model, "bedrock", "support", day)
+	r.ModelID, r.ProviderModel = id, provider
+	return r
+}
+
+// The finding a comparison of names cannot make: the name is unchanged, the
+// roster is unchanged, and a different thing answered.
+func TestProviderRepointIsCaughtUnderAnUnchangedName(t *testing.T) {
+	b := New([]string{"claude"})
+	for d := 1; d <= 5; d++ {
+		b.Add(recID("claude", "anthropic.sonnet-v1:0", "sonnet-20240620", d))
+	}
+	for d := 15; d <= 18; d++ {
+		b.Add(recID("claude", "anthropic.sonnet-v1:0", "sonnet-20241022", d))
+	}
+	res := b.Build()
+
+	// The roster comparison is clean, which is the whole point — this finding
+	// has to survive a table that looks fine.
+	if len(res.Unapproved) != 0 {
+		t.Fatalf("roster should be clean, got %v", res.Unapproved)
+	}
+	if len(res.Repoints) != 1 {
+		t.Fatalf("want 1 repoint, got %d: %+v", len(res.Repoints), res.Repoints)
+	}
+	rp := res.Repoints[0]
+	if rp.From != "sonnet-20240620" || rp.To != "sonnet-20241022" {
+		t.Errorf("repoint = %s → %s", rp.From, rp.To)
+	}
+	if rp.At.Day() != 15 {
+		t.Errorf("repoint should be dated to the first entry carrying the new id, got %s", rp.At)
+	}
+	// What the provider told us and what we did are different claims, and an
+	// auditor treats them differently.
+	if !rp.Reported {
+		t.Error("a provider-reported change must be marked as reported")
+	}
+}
+
+// A change this deployment made to its own routing is a record of our own
+// action, not an observation about somebody else's system.
+func TestOwnRoutingChangeIsNotMarkedReported(t *testing.T) {
+	b := New([]string{"claude"})
+	for d := 1; d <= 3; d++ {
+		b.Add(recID("claude", "anthropic.sonnet-v1:0", "", d))
+	}
+	for d := 10; d <= 12; d++ {
+		b.Add(recID("claude", "anthropic.haiku-v1:0", "", d))
+	}
+	res := b.Build()
+	if len(res.Repoints) != 1 {
+		t.Fatalf("want 1 repoint, got %d", len(res.Repoints))
+	}
+	if res.Repoints[0].Reported {
+		t.Error("our own routing change was reported as the provider's")
+	}
+}
+
+// A clean table across a period nobody instrumented is not a pass. Their test
+// procedure turns on exactly this number.
+func TestUnevidencedEntriesAreCounted(t *testing.T) {
+	b := New([]string{"claude"})
+	for d := 1; d <= 7; d++ {
+		b.Add(rec("claude", "bedrock", "support", d)) // no resolved identifier
+	}
+	for d := 8; d <= 12; d++ {
+		b.Add(recID("claude", "anthropic.sonnet-v1:0", "sonnet-20240620", d))
+	}
+	res := b.Build()
+
+	if res.Unevidenced != 7 {
+		t.Errorf("want 7 unevidenced entries, got %d", res.Unevidenced)
+	}
+	if res.Evidenced.Day() != 8 {
+		t.Errorf("evidence should begin at the first entry carrying an id, got %s", res.Evidenced)
+	}
+}
+
+// A log written before these fields existed carries none of them, and that has
+// to read as "cannot answer" rather than "nothing changed".
+func TestNoResolvedIdentifiersAnywhereIsNotAPass(t *testing.T) {
+	b := New([]string{"claude"})
+	for d := 1; d <= 5; d++ {
+		b.Add(rec("claude", "bedrock", "support", d))
+	}
+	res := b.Build()
+	if res.Unevidenced != res.Entries {
+		t.Fatalf("want every entry unevidenced, got %d of %d", res.Unevidenced, res.Entries)
+	}
+	if len(res.Repoints) != 0 {
+		t.Error("silence must not produce repoint findings")
+	}
+}
+
+// One identifier throughout is not a change, however many requests used it.
+func TestStableIdentifierIsNotARepoint(t *testing.T) {
+	b := New([]string{"claude"})
+	for d := 1; d <= 20; d++ {
+		b.Add(recID("claude", "anthropic.sonnet-v1:0", "sonnet-20240620", d))
+	}
+	if rp := b.Build().Repoints; len(rp) != 0 {
+		t.Fatalf("stable identifier produced repoints: %+v", rp)
+	}
+}

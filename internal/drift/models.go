@@ -30,6 +30,29 @@ type ModelUse struct {
 	Last     time.Time `json:"last_seen"`
 	// Approved reports whether the configuration lists this name.
 	Approved bool `json:"approved"`
+
+	// IDs are the distinct provider-side identifiers this gateway sent under
+	// this name, and ProviderIDs are the distinct identifiers providers
+	// reported back. More than one of either means the name did not mean one
+	// thing for the whole window.
+	IDs         []string `json:"ids,omitempty"`
+	ProviderIDs []string `json:"provider_ids,omitempty"`
+}
+
+// Repoint is one caller-facing name that resolved to something new.
+//
+// This is the finding a comparison of names cannot produce. The name is
+// unchanged, the roster is unchanged, and a different thing answered.
+type Repoint struct {
+	Name string    `json:"name"`
+	From string    `json:"from"`
+	To   string    `json:"to"`
+	At   time.Time `json:"at"`
+	// Reported distinguishes a change the provider told us about from one this
+	// deployment made to its own routing. The first is an observation about
+	// somebody else's system; the second is a record of our own change, and an
+	// auditor will treat them differently.
+	Reported bool `json:"reported"`
 }
 
 // Models is the comparison.
@@ -49,6 +72,17 @@ type Models struct {
 	// evidence that every model answering traffic was reviewed.
 	RosterKnown bool `json:"roster_known"`
 
+	// Repoints are names whose resolved identifier changed inside the window.
+	Repoints []Repoint `json:"repoints,omitempty"`
+	// Unevidenced counts entries carrying no resolved identifier at all.
+	//
+	// This is the number their test procedure turns on: a field added in month
+	// seven leaves months one through six unevidenced, and a clean table over
+	// a period that was never instrumented is not a pass. Evidenced reports
+	// the earliest entry that did carry one.
+	Unevidenced int       `json:"unevidenced"`
+	Evidenced   time.Time `json:"evidenced_from,omitempty"`
+
 	// Policies counts the distinct configuration fingerprints in force across
 	// the window.
 	//
@@ -66,18 +100,24 @@ type modelBucket struct {
 	use      ModelUse
 	backends map[string]bool
 	teams    map[string]bool
+	// First sighting of each resolved identifier, which is what dates a
+	// repoint. An auditor's question is always when, not whether.
+	ids      map[string]time.Time
+	provider map[string]time.Time
 }
 
 // Builder accumulates records.
 type Builder struct {
-	approved map[string]bool
-	roster   []string
-	seen     map[string]*modelBucket
-	order    []string
-	policies map[string]bool
-	entries  int
-	first    time.Time
-	last     time.Time
+	approved    map[string]bool
+	roster      []string
+	seen        map[string]*modelBucket
+	order       []string
+	policies    map[string]bool
+	entries     int
+	first       time.Time
+	last        time.Time
+	unevidenced int
+	evidenced   time.Time
 }
 
 // New starts a comparison against the approved roster.
@@ -117,6 +157,8 @@ func (b *Builder) Add(r audit.Record) {
 			use:      ModelUse{Name: r.Model},
 			backends: map[string]bool{},
 			teams:    map[string]bool{},
+			ids:      map[string]time.Time{},
+			provider: map[string]time.Time{},
 		}
 		b.seen[r.Model] = bk
 		b.order = append(b.order, r.Model)
@@ -136,6 +178,27 @@ func (b *Builder) Add(r audit.Record) {
 	if r.Team != "" {
 		bk.teams[r.Team] = true
 	}
+
+	// Whether anything at all evidences what actually served the request. A
+	// clean comparison over a period nobody instrumented is not a pass, so the
+	// entries that could not answer are counted rather than skipped.
+	if r.ModelID == "" && r.ProviderModel == "" {
+		b.unevidenced++
+	} else if !r.Time.IsZero() && (b.evidenced.IsZero() || r.Time.Before(b.evidenced)) {
+		b.evidenced = r.Time
+	}
+	noteFirst(bk.ids, r.ModelID, r.Time)
+	noteFirst(bk.provider, r.ProviderModel, r.Time)
+}
+
+// noteFirst records the earliest sighting of an identifier.
+func noteFirst(m map[string]time.Time, id string, t time.Time) {
+	if id == "" {
+		return
+	}
+	if prev, ok := m[id]; !ok || t.Before(prev) {
+		m[id] = t
+	}
 }
 
 // Build finishes the comparison, busiest model first.
@@ -144,6 +207,8 @@ func (b *Builder) Build() Models {
 		Entries: b.entries, First: b.first, Last: b.last,
 		RosterKnown: len(b.approved) > 0,
 		Policies:    len(b.policies),
+		Unevidenced: b.unevidenced,
+		Evidenced:   b.evidenced,
 	}
 	for _, name := range b.order {
 		bk := b.seen[name]
@@ -157,8 +222,17 @@ func (b *Builder) Build() Models {
 		if out.RosterKnown && !u.Approved {
 			out.Unapproved = append(out.Unapproved, name)
 		}
+		u.IDs = sortedByFirst(bk.ids)
+		u.ProviderIDs = sortedByFirst(bk.provider)
+		// The finding a comparison of names cannot make. One name, more than
+		// one thing behind it, and the date the second one appeared.
+		out.Repoints = append(out.Repoints, repoints(name, bk.ids, false)...)
+		out.Repoints = append(out.Repoints, repoints(name, bk.provider, true)...)
 		out.Seen = append(out.Seen, u)
 	}
+	sort.SliceStable(out.Repoints, func(i, j int) bool {
+		return out.Repoints[i].At.Before(out.Repoints[j].At)
+	})
 	for _, name := range b.roster {
 		if _, ok := b.seen[name]; !ok {
 			out.Unused = append(out.Unused, name)
@@ -178,5 +252,44 @@ func keys(m map[string]bool) []string {
 		out = append(out, k)
 	}
 	sort.Strings(out)
+	return out
+}
+
+// sortedByFirst orders identifiers by when each was first seen, so a reader
+// follows the sequence rather than the alphabet.
+func sortedByFirst(m map[string]time.Time) []string {
+	out := make([]string, 0, len(m))
+	for id := range m {
+		out = append(out, id)
+	}
+	sort.SliceStable(out, func(i, j int) bool {
+		if !m[out[i]].Equal(m[out[j]]) {
+			return m[out[i]].Before(m[out[j]])
+		}
+		return out[i] < out[j]
+	})
+	return out
+}
+
+// repoints turns a name's identifier history into transitions.
+//
+// Each successive identifier is reported as replacing the one before it. That
+// is a statement about order of first appearance and not about causation: two
+// identifiers can overlap during a rollout, and the log cannot distinguish a
+// staged deployment from a replacement. What it can say — and what an auditor
+// needs — is that on this date, under this unchanged name, something answered
+// that had not answered before.
+func repoints(name string, m map[string]time.Time, reported bool) []Repoint {
+	if len(m) < 2 {
+		return nil
+	}
+	order := sortedByFirst(m)
+	out := make([]Repoint, 0, len(order)-1)
+	for i := 1; i < len(order); i++ {
+		out = append(out, Repoint{
+			Name: name, From: order[i-1], To: order[i],
+			At: m[order[i]], Reported: reported,
+		})
+	}
 	return out
 }

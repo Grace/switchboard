@@ -133,7 +133,7 @@ func writeDrift(w io.Writer, res drift.Models, path string) {
 	}
 
 	tw := tabwriter.NewWriter(w, 0, 4, 2, ' ', 0)
-	fmt.Fprintln(tw, "MODEL\tBACKEND\tREQUESTS\tSEEN\tSTATUS")
+	fmt.Fprintln(tw, "MODEL\tRESOLVED\tBACKEND\tREQUESTS\tSEEN\tSTATUS")
 	for _, m := range res.Seen {
 		status := "unknown"
 		switch {
@@ -146,8 +146,17 @@ func writeDrift(w io.Writer, res drift.Models, path string) {
 		default:
 			status = "NOT ON ROSTER"
 		}
-		fmt.Fprintf(tw, "%s\t%s\t%s\t%s → %s\t%s\n",
-			m.Name, strings.Join(m.Backends, ","), count(m.Requests),
+		// The provider's own answer wins the column when there is one: it is
+		// the only value here the gateway did not choose.
+		resolved := "—"
+		switch {
+		case len(m.ProviderIDs) > 0:
+			resolved = strings.Join(m.ProviderIDs, ", ")
+		case len(m.IDs) > 0:
+			resolved = strings.Join(m.IDs, ", ")
+		}
+		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s → %s\t%s\n",
+			m.Name, resolved, strings.Join(m.Backends, ","), count(m.Requests),
 			m.First.Format("2006-01-02"), m.Last.Format("2006-01-02"), status)
 	}
 	tw.Flush()
@@ -188,14 +197,56 @@ func writeDrift(w io.Writer, res drift.Models, path string) {
 		fmt.Fprintln(w, "  roster answered.")
 	}
 
+	// Repoints. The finding a comparison of names cannot make, and the reason
+	// the resolved identifier is recorded at all.
+	if len(res.Repoints) > 0 {
+		fmt.Fprintf(w, "\nOne name, more than one thing behind it:\n\n")
+		for _, rp := range res.Repoints {
+			src := "this gateway's own routing changed"
+			if rp.Reported {
+				src = "the provider reported a different model"
+			}
+			fmt.Fprintf(w, "  %s  %s\n", rp.At.Format("2006-01-02"), rp.Name)
+			for _, line := range wrap(fmt.Sprintf("%s → %s (%s)", rp.From, rp.To, src), 68) {
+				fmt.Fprintf(w, "      %s\n", line)
+			}
+		}
+	}
+
 	fmt.Fprintln(w)
-	// The limit, stated wherever this is rendered. A comparison of names cannot
-	// see a name that changed meaning, and a reader who takes this for a
-	// complete repointing check has been misled by a table that looked clean.
-	msg := fmt.Sprintf("%s in force across this window. The log records the name a "+
-		"caller asked for, not the model id it resolved to, so a provider repointed under an "+
-		"unchanged name looks identical above. The fingerprint covers the roster including its "+
-		"ids, so a repoint moves it — date one with `switchboard agents -changes`.",
+	// Coverage before conclusions. A clean table across a period that was never
+	// instrumented is not a pass, and saying so here is the difference between
+	// a report and a reassurance.
+	switch {
+	case res.Unevidenced == res.Entries:
+		for _, line := range wrap("No entry in this window records what actually served the "+
+			"request — only the name the caller asked for. A provider repointing an alias, or "+
+			"updating a pinned name server-side, would be invisible here. This control is "+
+			"UNKNOWN rather than met: upgrade and the evidence begins accruing from that day, "+
+			"not retroactively.", 74) {
+			fmt.Fprintf(w, "  %s\n", line)
+		}
+	case res.Unevidenced > 0:
+		for _, line := range wrap(fmt.Sprintf("%s of %s carry no resolved identifier. The "+
+			"earliest that does is %s, so anything before that is unevidenced for this control "+
+			"and no change made today recovers it.",
+			count(res.Unevidenced), plural(res.Entries, "entry", "entries"),
+			res.Evidenced.Format("2006-01-02")), 74) {
+			fmt.Fprintf(w, "  %s\n", line)
+		}
+	default:
+		for _, line := range wrap("Every entry records what served it, so the comparison above "+
+			"covers the whole window.", 74) {
+			fmt.Fprintf(w, "  %s\n", line)
+		}
+	}
+
+	fmt.Fprintln(w)
+	// What remains outside even a resolved identifier.
+	msg := fmt.Sprintf("%s in force across this window. A resolved identifier is what the "+
+		"provider says served the request, which is an attestation and not a measurement — a "+
+		"backend change under a stable name reports nothing. Only a behavioural canary observes "+
+		"that directly.",
 		plural(res.Policies, "configuration fingerprint was", "configuration fingerprints were"))
 	for _, line := range wrap(msg, 74) {
 		fmt.Fprintf(w, "  %s\n", line)

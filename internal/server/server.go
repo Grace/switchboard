@@ -620,6 +620,7 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	s.observe(r.Context(), model, backend.Name(), okOrRefused(toolErr), result.Usage)
 	rec := audit.Record{
 		ID: id, Model: model, Backend: backend.Name(),
+		ModelID: result.ModelID, ProviderModel: result.ProviderModel,
 		Prompt: promptText(chatReq), Completion: result.Text,
 		PromptTokens:     result.Usage.InputTokens,
 		CompletionTokens: result.Usage.OutputTokens,

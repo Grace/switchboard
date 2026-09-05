@@ -154,7 +154,11 @@ func (b *Backend) Chat(ctx context.Context, req *switchboard.ChatRequest, emit f
 	defer stream.Close()
 
 	var text strings.Builder
-	result := &switchboard.Result{}
+	// The id we sent. ConverseStream does not echo back what served the
+	// request, so ProviderModel stays empty rather than being filled with the
+	// value we supplied — that would turn our own configuration into an
+	// attestation from AWS.
+	result := &switchboard.Result{ModelID: spec.ModelID}
 
 	for event := range stream.Events() {
 		switch e := event.(type) {

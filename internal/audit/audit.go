@@ -38,6 +38,20 @@ type Record struct {
 	Team    string `json:"team,omitempty"`
 	Subject string `json:"subject,omitempty"`
 	Model   string `json:"model"`
+	// ModelID is the provider-side identifier this gateway sent, and
+	// ProviderModel is what the provider reported as having served the
+	// request. Both omitempty, so a log written before they existed still
+	// verifies: absent and empty are the same thing on the wire.
+	//
+	// Model alone cannot evidence that a model version changed. It is the name
+	// the caller asked for, so a provider repointing an alias — or updating a
+	// pinned name server-side — leaves it identical while the thing that
+	// answered is different. ModelID makes this deployment's own routing
+	// visible without needing the configuration that produced it;
+	// ProviderModel is the only field here the gateway did not choose, and it
+	// is present only where a provider reports one.
+	ModelID       string `json:"model_id,omitempty"`
+	ProviderModel string `json:"provider_model,omitempty"`
 	// Policy is the fingerprint of the configuration in force. Without it the
 	// log says what happened but not what the rules were, and "was this allowed
 	// under the policy at the time" is unanswerable.

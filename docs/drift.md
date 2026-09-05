@@ -30,33 +30,67 @@ The window on the finding is the part that makes it actionable. An auditor's
 next question after "what is that" is always "since when", and the row answers
 it without anyone going back through the log.
 
-## What it cannot see
+## One name, more than one thing behind it
 
-**The log records the name a caller asked for, not the model id it resolved to.**
-A provider repointed underneath an unchanged name — `claude` pointing at a
-different `model_id` than it did last quarter — looks identical in the table
-above.
+A comparison of *names* is blind to the change that matters most: a provider
+repointing an alias, or updating a pinned name server-side. The name is
+unchanged, your roster is unchanged, and something different answered.
 
-That gap is closed by a different field. The policy fingerprint covers the model
-roster *including each entry's id*, so a repoint moves the fingerprint even
-though the name did not change. So the footer counts the distinct fingerprints
-in force across the window:
+So the record carries three model fields, and keeping them apart is the point:
+
+| field | question it answers | who chose it |
+|---|---|---|
+| `model` | what the caller asked for | the caller |
+| `model_id` | what this gateway sent to the provider | you |
+| `provider_model` | what the provider says served it | **the provider** |
+
+The third is the only value in the record the gateway did not choose, which is
+why it is the one that can evidence a provider-side change. When a name resolves
+to more than one identifier across the window, that is reported with the date
+the second one appeared:
 
 ```
-  2 configuration fingerprints were in force across this window. The log
-  records the name a caller asked for, not the model id it resolved to, so a
-  provider repointed under an unchanged name looks identical above. The
-  fingerprint covers the roster including its ids, so a repoint moves it —
-  date one with `switchboard agents -changes`.
+One name, more than one thing behind it:
+
+  2026-09-15  claude
+      claude-3-5-sonnet-20240620 → claude-3-5-sonnet-20241022 (the
+      provider reported a different model)
 ```
 
-One fingerprint across the whole period means no roster change happened, and the
-table is the complete answer. More than one means look, and
-`switchboard agents -changes` gives the date.
+That finding survives a clean roster table, which is the whole reason it exists.
 
-What neither can tell you is *what* changed, only when. The log carries
-fingerprints, not the configurations behind them; recovering the old roster
-means having kept the old config.
+A change to your *own* routing is reported too, and marked differently — that is
+a record of something you did, not an observation about somebody else's system,
+and an auditor treats the two differently.
+
+## Coverage comes before conclusions
+
+A clean comparison across a period that was never instrumented is not a pass. So
+the entries that could not answer are counted:
+
+```
+  7 of 20 entries carry no resolved identifier. The earliest that does is
+  2026-09-08, so anything before that is unevidenced for this control and no
+  change made today recovers it.
+```
+
+If no entry carries one, the control reads **Unknown**, not met — and upgrading
+starts the evidence accruing from that day, never retroactively.
+
+## What even a resolved identifier cannot tell you
+
+`provider_model` is what the provider *says* served the request. That is an
+attestation, not a measurement. A backend change under a stable snapshot name
+reports nothing at all, and no field in any log will show it.
+
+Only a behavioural canary — a fixed prompt set on a schedule, outputs hashed,
+drift alerted — observes that directly. Switchboard does not do this, and the
+footer says so rather than letting a clean report imply coverage it does not
+have.
+
+The policy fingerprint is a weaker, separate signal: it covers your roster
+including each entry's ids, so it moves when *you* repoint a name. It does not
+move when the provider does.
 
 ## An empty roster is not an approval
 

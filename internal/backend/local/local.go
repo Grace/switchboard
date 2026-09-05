@@ -272,6 +272,13 @@ func readSSE(r io.Reader, emit func(switchboard.Chunk) error) (*switchboard.Resu
 			// tokens already streamed.
 			continue
 		}
+		// What the server says it is serving. llama-server reports the loaded
+		// model on every frame; taking the first is enough, and taking it from
+		// the response rather than from our own configuration is the whole
+		// point — it is the only value here we did not choose.
+		if frame.Model != "" && result.ProviderModel == "" {
+			result.ProviderModel = frame.Model
+		}
 		if frame.Usage != nil {
 			// No cache split: llama-server's prompt cache is a local latency
 			// optimisation with no separate price, so there is nothing to

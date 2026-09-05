@@ -111,6 +111,23 @@ type Result struct {
 	StopReason string
 	Usage      Usage
 	ToolCalls  []ToolCall
+
+	// ModelID is the provider-side identifier this gateway sent, as distinct
+	// from the name the caller asked for. Recording it makes the routing
+	// decision visible in the log itself rather than only in whatever
+	// configuration happened to be on disk at the time.
+	ModelID string
+	// ProviderModel is the identifier the provider reported as having served
+	// the request, where it reports one at all.
+	//
+	// These are two different claims and are kept apart deliberately. ModelID
+	// is what we did; ProviderModel is what the other side says it did. An
+	// alias resolving to a dated snapshot, or a provider updating a pinned
+	// name server-side, changes the second and leaves the first untouched —
+	// and that is the only shape of change a comparison of requested names is
+	// blind to by construction. Collapsing the two would report an attestation
+	// as an observation.
+	ProviderModel string
 }
 
 // Model is one routable model as this process sees it.
