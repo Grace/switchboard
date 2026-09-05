@@ -145,7 +145,7 @@ var regimes = map[Profile]regime{
 	Profile800171: {
 		Title:                "NIST SP 800-171 Rev 2 (CUI) / CMMC Level 2",
 		RetentionFloor:       federalMinimum,
-		RetentionCite:        "800-171 3.3.1 (organization-defined; 1 year is switchboard's default)",
+		RetentionCite:        "NIST 800-171 3.3.1",
 		RetentionIsParameter: true,
 		RequiredRules:        []string{"us_ssn", "email"},
 		RequirePerson:        true,
@@ -171,7 +171,7 @@ var regimes = map[Profile]regime{
 	ProfileFedRAMP: {
 		Title:                "FedRAMP Moderate (NIST 800-53 Rev 5)",
 		RetentionFloor:       federalMinimum,
-		RetentionCite:        "AU-11 (organization-defined; FedRAMP baseline is at least one year)",
+		RetentionCite:        "NIST 800-53 AU-11",
 		RetentionIsParameter: true,
 		RequiredRules:        []string{"us_ssn", "email"},
 		RequirePerson:        true,
@@ -287,6 +287,15 @@ func (p Profile) validate(c *Config) error {
 			p, r.PersonCite)
 	}
 
+	// Loopback is exempt everywhere else in switchboard because a plaintext
+	// bind that cannot leave the host is a reasonable default. Under these
+	// regimes it is not: SC-8 and 3.13.8 are about the channel, and an
+	// assessor reads a config, not a routing table.
+	if r.RequireTLS && c.TLS.CertFile == "" {
+		return fmt.Errorf("profile %q requires tls.cert_file and tls.key_file: "+
+			"%s treats transmission confidentiality as unconditional, loopback included", p, r.Title)
+	}
+
 	// FIPS is a property of the binary rather than of the file, which is
 	// precisely why it belongs here: a config that is correct in every other
 	// respect, running on a build with non-validated cryptography, is the
@@ -295,15 +304,6 @@ func (p Profile) validate(c *Config) error {
 		return fmt.Errorf("profile %q requires FIPS 140-3 mode, and this binary is "+
 			"not running under the Go Cryptographic Module. Build with GOFIPS140=v1.0.0 "+
 			"or run with GODEBUG=fips140=on (see docs/profiles.md)", p)
-	}
-
-	// Loopback is exempt everywhere else in switchboard because a plaintext
-	// bind that cannot leave the host is a reasonable default. Under these
-	// regimes it is not: SC-8 and 3.13.8 are about the channel, and an
-	// assessor reads a config, not a routing table.
-	if r.RequireTLS && c.TLS.CertFile == "" {
-		return fmt.Errorf("profile %q requires tls.cert_file and tls.key_file: "+
-			"%s treats transmission confidentiality as unconditional, loopback included", p, r.Title)
 	}
 
 	// Required rules bind only when content is actually being written down.

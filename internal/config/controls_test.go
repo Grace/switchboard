@@ -1,6 +1,7 @@
 package config
 
 import (
+	"crypto/fips140"
 	"strings"
 	"testing"
 	"time"
@@ -25,8 +26,13 @@ func TestControlsReportsAnEmptyConfigHonestly(t *testing.T) {
 	if !rep.Unmet() {
 		t.Error("a config with nothing turned on should have unmet controls")
 	}
-	if rep.Counts()[StatusMet] != 0 {
-		t.Errorf("nothing should be met, got %d", rep.Counts()[StatusMet])
+	// Nothing the config controls should be met. FIPS is excluded because it is
+	// a property of the process, not of the file — it is met under
+	// GODEBUG=fips140=on however empty the config is.
+	for _, c := range rep.Controls {
+		if c.Status == StatusMet && !strings.Contains(c.Objective, "FIPS") {
+			t.Errorf("empty config should not meet %q: %s", c.Objective, c.Evidence)
+		}
 	}
 	if len(rep.Yours) != 0 {
 		t.Error("no profile means no regime obligations to list")
@@ -44,7 +50,7 @@ func TestControlsReportsAnEmptyConfigHonestly(t *testing.T) {
 }
 
 func TestControlsProfileTightensPersonIdentity(t *testing.T) {
-	c := compliant()
+	c := compliant(t)
 	c.OIDC = OIDC{}
 	c.Teams = []Team{{Name: "platform", Keys: []string{"k"}}}
 
@@ -63,7 +69,7 @@ func TestControlsProfileTightensPersonIdentity(t *testing.T) {
 }
 
 func TestControlsRetentionRowFollowsTheProfileFloor(t *testing.T) {
-	c := compliant()
+	c := compliant(t)
 	c.Audit.Retention = Duration(3 * 365 * 24 * time.Hour)
 
 	c.Profile = ProfileEUAIAct
@@ -84,7 +90,7 @@ func TestControlsRetentionRowFollowsTheProfileFloor(t *testing.T) {
 func TestControlsRetentionWithoutAnArchiveIsNotMet(t *testing.T) {
 	// Keeping everything on one host is a promise the disk cannot keep, and
 	// reporting it as met would be the flattering answer.
-	c := compliant()
+	c := compliant(t)
 	c.Audit.Retention = 0
 	c.Audit.ArchiveCommand = ""
 	row := find(t, c.Controls(), "Log retention")
@@ -96,7 +102,7 @@ func TestControlsRetentionWithoutAnArchiveIsNotMet(t *testing.T) {
 func TestControlsMetadataOnlyBeatsRedactedContent(t *testing.T) {
 	// Not writing content at all is a stronger position than redacting it, and
 	// the report should say so rather than rewarding the bigger feature.
-	c := compliant()
+	c := compliant(t)
 	c.Redaction = Redaction{Rules: []string{"us_ssn"}}
 
 	c.Audit.LogContent = false
@@ -117,7 +123,7 @@ func TestControlsMetadataOnlyBeatsRedactedContent(t *testing.T) {
 func TestControlsTamperEvidenceNeverClaimsMore(t *testing.T) {
 	// This row must never read as met: tail truncation stays undetectable from
 	// the file alone however the gateway is configured.
-	c := compliant()
+	c := compliant(t)
 	row := find(t, c.Controls(), "protected from modification")
 	if row.Status != StatusPartial {
 		t.Fatalf("tamper evidence is always partial, got %q", row.Status)
@@ -129,7 +135,7 @@ func TestControlsTamperEvidenceNeverClaimsMore(t *testing.T) {
 
 func TestControlsListsRegimeObligationsItCannotCheck(t *testing.T) {
 	for _, p := range []Profile{ProfileHIPAA, ProfileFINRA, ProfileEUAIAct} {
-		c := compliant()
+		c := compliant(t)
 		c.Profile = p
 		rep := c.Controls()
 		if len(rep.Yours) == 0 {
@@ -143,7 +149,7 @@ func TestControlsListsRegimeObligationsItCannotCheck(t *testing.T) {
 
 func TestControlsFullyConfiguredHasNoUnmet(t *testing.T) {
 	// The point of the command is that a good config can actually pass it.
-	c := compliant()
+	c := compliant(t)
 	c.Profile = ProfileHIPAA
 	c.Attribution = Attribution{Enabled: true, RoleARN: "arn:aws:iam::1:role/r", RequireCaller: true}
 	c.Redaction = Redaction{Rules: []string{"us_ssn", "email", "phone_us"}}
@@ -160,5 +166,64 @@ func TestControlsFullyConfiguredHasNoUnmet(t *testing.T) {
 	}
 	if rep.Unmet() {
 		t.Error("Unmet() should be false")
+	}
+}
+
+func TestControlsFIPSRow(t *testing.T) {
+	c := compliant(t)
+
+	// No regime asking for it: reported, not counted against you.
+	row := find(t, c.Controls(), "FIPS-validated")
+	if fips140.Enabled() {
+		if row.Status != StatusMet {
+			t.Errorf("FIPS mode is on, want met, got %q", row.Status)
+		}
+	} else if row.Status != StatusNotAddressed {
+		t.Errorf("no regime asks for FIPS, want not-addressed, got %q", row.Status)
+	}
+
+	// A regime that does ask turns the same fact into a finding.
+	c.Profile = ProfileFedRAMP
+	row = find(t, c.Controls(), "FIPS-validated")
+	want := StatusUnmet
+	if fips140.Enabled() {
+		want = StatusMet
+	}
+	if row.Status != want {
+		t.Errorf("under fedramp want %q, got %q", want, row.Status)
+	}
+	if !fips140.Enabled() && !strings.Contains(row.Evidence, "GOFIPS140") {
+		t.Errorf("evidence should name the remedy, got %q", row.Evidence)
+	}
+}
+
+func TestControlsGovernmentTLSIsUnconditional(t *testing.T) {
+	c := compliant(t)
+	c.TLS = TLS{}
+
+	c.Profile = ProfileHIPAA
+	if got := find(t, c.Controls(), "Encryption in transit").Status; got != StatusPartial {
+		t.Errorf("hipaa tolerates a loopback plaintext bind, got %q", got)
+	}
+
+	c.Profile = Profile800171
+	if got := find(t, c.Controls(), "Encryption in transit").Status; got != StatusUnmet {
+		t.Errorf("800-171 does not, want unmet, got %q", got)
+	}
+}
+
+func TestControlsSaysWhenARetentionFloorIsNotStatutory(t *testing.T) {
+	// The federal regimes leave the period organization-defined. Presenting
+	// switchboard's default as a regulatory number would be exactly the kind of
+	// overclaim this report exists to avoid.
+	c := compliant(t)
+	c.Profile = ProfileFedRAMP
+	if ev := find(t, c.Controls(), "Log retention").Evidence; !strings.Contains(ev, "not a statutory number") {
+		t.Errorf("federal retention should be marked as a default, got %q", ev)
+	}
+
+	c.Profile = ProfileHIPAA
+	if ev := find(t, c.Controls(), "Log retention").Evidence; strings.Contains(ev, "not a statutory number") {
+		t.Errorf("HIPAA's floor is statutory and should not carry the caveat, got %q", ev)
 	}
 }

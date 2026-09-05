@@ -1,6 +1,9 @@
 package config
 
-import "fmt"
+import (
+	"crypto/fips140"
+	"fmt"
+)
 
 // Control assessment against the running configuration.
 //
@@ -213,10 +216,16 @@ func (c *Config) Controls() ControlReport {
 					"archive_command this host is the archive and retention deletes "+
 					"evidence rather than draining a buffer.", roughly(got)))
 		default:
+			note := ""
+			if hasRegime && reg.RetentionIsParameter {
+				note = " That floor is switchboard's default, not a statutory number: " +
+					"this regime leaves the period organization-defined, so confirm " +
+					"it against your own records schedule."
+			}
 			add(audit, "Log retention", cite, StatusMet,
-				fmt.Sprintf("audit.retention is %s, above the %s floor of %s, and "+
-					"closed segments are archived before pruning.",
-					roughly(got), cite, roughly(floor)))
+				fmt.Sprintf("audit.retention is %s, above the %s floor, and closed "+
+					"segments are archived before pruning.%s",
+					roughly(got), roughly(floor), note))
 		}
 	}
 
@@ -251,11 +260,34 @@ func (c *Config) Controls() ControlReport {
 	case c.TLS.CertFile != "":
 		add(data, "Encryption in transit", "SOC 2 CC6.7 · HIPAA §164.312(e)(1) · NIST SC-8",
 			StatusMet, "Listener serves TLS 1.2+. No client certificate is required.")
+	case hasRegime && reg.RequireTLS:
+		add(data, "Encryption in transit", "NIST SC-8 · 800-171 3.13.8", StatusUnmet,
+			fmt.Sprintf("No tls.cert_file, so %s is plaintext. This regime treats "+
+				"transmission confidentiality as unconditional, loopback included.", c.Listen))
 	default:
 		add(data, "Encryption in transit", "SOC 2 CC6.7 · HIPAA §164.312(e)(1) · NIST SC-8",
 			StatusPartial, fmt.Sprintf("No tls.cert_file, so %s is plaintext. Provider "+
 				"calls still use the SDK's TLS, and a non-loopback plaintext bind is "+
 				"refused at load.", c.Listen))
+	}
+
+	// Validated cryptography is a property of this binary, not of the file, so
+	// it is the one row here that would still be true if the config were empty
+	// — and the one most likely to be assumed rather than checked.
+	switch {
+	case fips140.Enabled():
+		add(data, "Cryptography is FIPS-validated", "NIST SC-13 · 800-171 3.13.11 · FIPS 140-3",
+			StatusMet, "Running under the Go Cryptographic Module (CMVP certificate #5247). "+
+				"GODEBUG=fips140=only additionally makes non-approved algorithms fail rather "+
+				"than fall back.")
+	case hasRegime && reg.RequireFIPS:
+		add(data, "Cryptography is FIPS-validated", "NIST SC-13 · 800-171 3.13.11 · FIPS 140-3",
+			StatusUnmet, "This binary is not in FIPS mode. Build with GOFIPS140=v1.0.0 or run "+
+				"with GODEBUG=fips140=on.")
+	default:
+		add(data, "Cryptography is FIPS-validated", "NIST SC-13 · FIPS 140-3",
+			StatusNotAddressed, "Not in FIPS mode, and this regime does not ask for it. "+
+				"GODEBUG=fips140=on enables it if a customer does.")
 	}
 
 	if c.Vault.Enabled {

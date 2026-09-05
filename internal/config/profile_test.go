@@ -1,6 +1,7 @@
 package config
 
 import (
+	"crypto/fips140"
 	"os"
 	"strings"
 	"testing"
@@ -9,9 +10,21 @@ import (
 
 // compliant is a config that satisfies every profile, so each test can spoil
 // exactly one thing and attribute the failure to that thing.
-func compliant() *Config {
+//
+// The one thing it cannot supply is FIPS mode, which is a property of the
+// process rather than of the config: see requiresFIPS.
+func compliant(t *testing.T) *Config {
+	t.Helper()
+	dir := t.TempDir()
+	crt, key := dir+"/tls.crt", dir+"/tls.key"
+	for _, f := range []string{crt, key} {
+		if err := os.WriteFile(f, nil, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
 	return &Config{
 		Listen: "127.0.0.1:11435",
+		TLS:    TLS{CertFile: crt, KeyFile: key},
 		OIDC:   OIDC{Enabled: true, Issuer: "https://idp.example", Audience: "switchboard"},
 		Teams:  []Team{{Name: "platform"}},
 		Audit: Audit{
@@ -26,7 +39,7 @@ func compliant() *Config {
 }
 
 func TestProfileUnknownIsRejected(t *testing.T) {
-	c := compliant()
+	c := compliant(t)
 	c.Profile = "sox"
 	err := c.Validate()
 	if err == nil || !strings.Contains(err.Error(), "not one of") {
@@ -35,7 +48,7 @@ func TestProfileUnknownIsRejected(t *testing.T) {
 }
 
 func TestProfileNoneEnforcesNothing(t *testing.T) {
-	c := compliant()
+	c := compliant(t)
 	c.Audit.Retention = Duration(time.Hour) // far below every floor
 	c.Audit.Required = false
 	c.OIDC.Enabled = false
@@ -45,19 +58,68 @@ func TestProfileNoneEnforcesNothing(t *testing.T) {
 }
 
 func TestProfileAccepted(t *testing.T) {
-	for _, p := range ProfileNames() {
-		c := compliant()
-		c.Profile = Profile(p)
+	for _, name := range ProfileNames() {
+		p := Profile(name)
+		if requiresFIPS(p) && !fips140.Enabled() {
+			// Not a gap in coverage: TestProfileRequiresFIPS pins the other
+			// branch, and CI runs this package a second time under
+			// GODEBUG=fips140=on to reach this one.
+			t.Logf("skipping %q: needs GODEBUG=fips140=on", p)
+			continue
+		}
+		c := compliant(t)
+		c.Profile = p
 		if err := c.Validate(); err != nil {
 			t.Errorf("profile %q rejected a compliant config: %v", p, err)
 		}
 	}
 }
 
+func requiresFIPS(p Profile) bool {
+	r, ok := p.Regime()
+	return ok && r.RequireFIPS
+}
+
+func TestProfileRequiresFIPS(t *testing.T) {
+	c := compliant(t)
+	c.Profile = ProfileFedRAMP
+	err := c.Validate()
+	if fips140.Enabled() {
+		if err != nil {
+			t.Fatalf("FIPS mode is on, so this should pass: %v", err)
+		}
+		return
+	}
+	if err == nil || !strings.Contains(err.Error(), "FIPS 140-3") {
+		t.Fatalf("want a FIPS requirement, got %v", err)
+	}
+	// The error has to say how to fix it: nobody guesses GOFIPS140.
+	if !strings.Contains(err.Error(), "GODEBUG=fips140=on") {
+		t.Errorf("error should name the remedy, got %v", err)
+	}
+}
+
+func TestProfileRequiresTLSEvenOnLoopback(t *testing.T) {
+	// Loopback plaintext is fine everywhere else in switchboard. Under these
+	// regimes it is not, and that difference is the point of the assertion.
+	c := compliant(t)
+	c.TLS = TLS{}
+	c.Profile = Profile800171
+	err := c.Validate()
+	if err == nil || !strings.Contains(err.Error(), "tls.cert_file") {
+		t.Fatalf("want a TLS requirement, got %v", err)
+	}
+
+	c.Profile = ProfileHIPAA
+	if err := c.Validate(); err != nil {
+		t.Fatalf("hipaa does not assert TLS, so this should pass: %v", err)
+	}
+}
+
 func TestProfileRetentionFloor(t *testing.T) {
 	// Three years clears the EU AI Act's six months and misses the six-year
 	// floors, which is the whole reason the profiles are distinguishable.
-	c := compliant()
+	c := compliant(t)
 	c.Audit.Retention = Duration(3 * 365 * 24 * time.Hour)
 
 	c.Profile = ProfileEUAIAct
@@ -80,7 +142,7 @@ func TestProfileRetentionFloor(t *testing.T) {
 func TestProfileZeroRetentionSatisfiesAnyFloor(t *testing.T) {
 	// Zero means keep everything. Reading it as "shorter than the floor" would
 	// reject the most conservative setting there is.
-	c := compliant()
+	c := compliant(t)
 	c.Profile = ProfileHIPAA
 	c.Audit.Retention = 0
 	if err := c.Validate(); err != nil {
@@ -89,7 +151,7 @@ func TestProfileZeroRetentionSatisfiesAnyFloor(t *testing.T) {
 }
 
 func TestProfileZeroRetentionStillNeedsAnArchive(t *testing.T) {
-	c := compliant()
+	c := compliant(t)
 	c.Profile = ProfileHIPAA
 	c.Audit.Retention = 0
 	c.Audit.ArchiveCommand = ""
@@ -101,7 +163,7 @@ func TestProfileZeroRetentionStillNeedsAnArchive(t *testing.T) {
 
 func TestProfileRequiresAuditAndItsGuards(t *testing.T) {
 	t.Run("audit off", func(t *testing.T) {
-		c := compliant()
+		c := compliant(t)
 		c.Profile = ProfileFINRA
 		c.Audit = Audit{}
 		err := c.Validate()
@@ -110,7 +172,7 @@ func TestProfileRequiresAuditAndItsGuards(t *testing.T) {
 		}
 	})
 	t.Run("audit not required", func(t *testing.T) {
-		c := compliant()
+		c := compliant(t)
 		c.Profile = ProfileFINRA
 		c.Audit.Required = false
 		err := c.Validate()
@@ -123,7 +185,7 @@ func TestProfileRequiresAuditAndItsGuards(t *testing.T) {
 func TestProfilePersonIdentity(t *testing.T) {
 	// HIPAA §164.312(d) wants a person; the EU AI Act profile does not, and
 	// asserting it there would be inventing an obligation.
-	c := compliant()
+	c := compliant(t)
 	c.OIDC = OIDC{}
 
 	c.Profile = ProfileHIPAA
@@ -139,7 +201,7 @@ func TestProfilePersonIdentity(t *testing.T) {
 }
 
 func TestProfileRequiredRulesBindOnlyWhenContentIsLogged(t *testing.T) {
-	c := compliant()
+	c := compliant(t)
 	c.Profile = ProfileHIPAA
 
 	// Metadata-only: there is no content to redact, so demanding rules would
@@ -198,8 +260,8 @@ func TestLoadForReportSkipsOnlyTheProfile(t *testing.T) {
 func TestProfileIsInThePolicyFingerprint(t *testing.T) {
 	// Changing the regime changes what the gateway refuses, which makes it a
 	// policy change and puts it on every audit entry.
-	a := compliant()
-	b := compliant()
+	a := compliant(t)
+	b := compliant(t)
 	b.Profile = ProfileHIPAA
 	if a.PolicyFingerprint() == b.PolicyFingerprint() {
 		t.Fatal("declaring a profile should move the policy fingerprint")
