@@ -36,7 +36,7 @@ certification. switchboard is software you run; the controls are yours.
 | Records are protected from modification | SOC 2 CC7.2 · ISO 27001 A.8.15 · NIST AU-9 | ◐ | Entries are hash-chained across rotated segments, so alteration, deletion, reordering *and removal of a whole segment* are detectable via `switchboard audit verify`, which exits non-zero. With `SWITCHBOARD_AUDIT_KEY` an edit requires the key. **Tail truncation is undetectable from the file alone, and a key holder can rewrite history.** Anchor the printed head externally, or use write-once storage. |
 | Individual decisions can be reconstructed | EU AI Act Art. 12 · NIST AU-3 | ✅ | `switchboard audit show -id <id>` returns the model, team, token counts, stop reason, redactions, and the redacted content when content logging is on. |
 | Log retention | EU AI Act Art. 26 · SEC 17a-4 · FINRA 4511 · SOX §802 · NIST AU-11 | ✅ | Rotation into timestamped segments, an archive hook shipping each closed segment somewhere durable, and retention that prunes **only archived** segments — so local disk is a buffer and long retention lives in the archive. Never prunes the active file. Startup warns when retention is under six months or when no archive is configured. |
-| Logs are reviewed | SOC 2 CC7.2 · NIST AU-6 | ◐ | `audit verify` is designed for a scheduled job. Nothing alerts on its own. |
+| Logs are reviewed | SOC 2 CC7.2 · NIST AU-6 | ✅ | The chain is verified at startup — the window when the process is down being exactly when a file would be edited — and on `audit.verify_interval` thereafter. A break surfaces through `/healthz`, and with `audit.required` it stops the process rather than being appended over. |
 
 ## Data protection
 

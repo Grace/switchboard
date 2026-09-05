@@ -238,7 +238,35 @@ BROKEN  ~/.switchboard/audit.jsonl (signed)
 ```
 
 It exits non-zero when the chain does not hold, so it belongs in a nightly job
-rather than in someone's memory.
+rather than in someone's memory — and it no longer has to be, because the log
+checks itself.
+
+### Checking itself
+
+**The chain is walked at startup, before anything is served.** That is the more
+important of the two checks: the window when the process is not running is
+exactly when a file would be edited, and it is the only moment where "intact
+when we stopped, not now" can be observed at all.
+
+```
+$ switchboard serve
+switchboard: audit chain broken at line 4 (seq 4): contents do not match the
+  recorded digest — this entry was altered — 3 entries verify before it
+
+refusing to start: audit.required is set, and appending to a chain that does not
+verify would bury the break
+```
+
+With `audit.required`, a broken chain stops the process — appending to a chain
+that does not verify buries the break under new entries and makes the tampering
+harder to locate later. Without it, the same finding is a loud warning and the
+gateway serves.
+
+`audit.verify_interval` re-walks it on a timer, and a break found there is
+reported and surfaces through `/healthz` like any other degradation. Reading
+every segment is real I/O on a large log, which is an argument for an hour
+rather than a minute — and another argument for archiving segments off the box
+so the local buffer stays small.
 
 ## Signing
 
