@@ -25,6 +25,28 @@ ambiguity about what the tool did in someone else's account: it read files.
 
 ## AWS Bedrock
 
+`scripts/aws-export.sh` runs all of this for you and puts the result where
+`-aws` expects it:
+
+```sh
+./scripts/aws-export.sh ./bedrock-export
+switchboard controls -aws ./bedrock-export
+```
+
+Every call it makes is a GET; it creates and changes nothing. It also does the
+one step the recipe below leaves to you — the log bucket is named inside the
+logging configuration, so it takes the name from there rather than asking — and
+it fetches each guardrail individually, because the list form carries only
+summaries and the PII actions that decide the redaction rows come back only
+from `get-guardrail`.
+
+Where a call fails it writes a note saying the answer is **unknown** rather than
+absent, and names the IAM permission to re-run with. That distinction is the
+same one the report is built on: a control nobody could ask about is not a
+control that is switched off.
+
+## By hand
+
 Four commands. Put the output in a directory and point `-aws` at it — files are
 recognised by shape, not by name, and anything unrecognised is named in the
 report rather than silently skipped.
