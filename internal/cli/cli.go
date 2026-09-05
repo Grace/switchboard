@@ -49,6 +49,7 @@ commands:
   init       write a starter config file
   redact     check redaction rules against text on stdin
   audit      verify the audit chain, or reconstruct one decision
+  agents     list the programs calling this gateway, as the traffic reveals them
   controls   assess this config against the control objectives a review asks about
   evidence   package a period of the log for someone who does not trust you
   version    print the version
@@ -81,6 +82,8 @@ func Main(ctx context.Context, args []string) int {
 		err = runRedact(ctx, args[1:])
 	case "audit":
 		err = runAudit(ctx, args[1:])
+	case "agents":
+		err = runAgents(ctx, args[1:])
 	case "controls":
 		err = runControls(ctx, args[1:])
 	case "evidence":
