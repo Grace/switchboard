@@ -11,6 +11,7 @@ import (
 
 	"github.com/Grace/switchboard/internal/audit"
 	"github.com/Grace/switchboard/internal/config"
+	"github.com/Grace/switchboard/internal/policy"
 	"github.com/Grace/switchboard/internal/server"
 	"github.com/Grace/switchboard/internal/telemetry"
 	"github.com/Grace/switchboard/internal/vault"
@@ -125,6 +126,18 @@ func runServe(ctx context.Context, args []string) error {
 			return fmt.Errorf("audit log: %w", err)
 		}
 		lg = lg.WithPolicy(cfg.PolicyFingerprint())
+		// Archive the configuration the entries are about to cite. A failure
+		// here is a warning and not a refusal: serving without an archived
+		// policy loses the ability to explain a decision later, and refusing to
+		// serve loses the decision itself.
+		policyDir := policy.DirFor(config.ExpandPath(cfg.Audit.Path))
+		if fp, err := policy.Record(policyDir, cfg); err != nil {
+			logger.Printf("warning: could not archive the policy in force (%v). Entries will "+
+				"cite a fingerprint with no document behind it, and what the rules were at "+
+				"the time will not be recoverable", err)
+		} else {
+			logger.Printf("policy %s archived in %s", fp, policyDir)
+		}
 		// Redaction counts reach the aggregate view without anything reading
 		// the log: the count travels, the value never does.
 		lg = lg.WithObserver(func(counts map[string]int) { meter.Redacted(ctx, counts) })

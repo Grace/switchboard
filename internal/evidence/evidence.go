@@ -33,6 +33,7 @@ import (
 
 	"github.com/Grace/switchboard/internal/assess"
 	"github.com/Grace/switchboard/internal/audit"
+	"github.com/Grace/switchboard/internal/policy"
 	"github.com/Grace/switchboard/internal/viewer"
 )
 
@@ -117,7 +118,13 @@ type Manifest struct {
 	Chain    Chain    `json:"chain"`
 	Extract  Extract  `json:"extract"`
 	Policies []string `json:"policies"`
-	Controls struct {
+	// PoliciesArchived are the fingerprints whose configuration is included
+	// here; PoliciesMissing are the ones cited by entries and never captured.
+	// The second list is the useful one: it names the stretch of this period
+	// whose rules cannot be recovered, and no change made later recovers them.
+	PoliciesArchived []string `json:"policies_archived,omitempty"`
+	PoliciesMissing  []string `json:"policies_missing,omitempty"`
+	Controls         struct {
 		Profile string         `json:"profile,omitempty"`
 		Regime  string         `json:"regime,omitempty"`
 		Counts  map[string]int `json:"counts"`
@@ -147,7 +154,14 @@ const (
 	fileControls = "controls.json"
 	fileManifest = "manifest.json"
 	fileVerify   = "VERIFY.md"
+	dirPolicies  = "policies"
 )
+
+// member is one file in the package, and its line in the manifest.
+type member struct {
+	name, what string
+	data       []byte
+}
 
 // Build assembles the package.
 func Build(o Options) (*Result, error) {
@@ -243,6 +257,17 @@ func Build(o Options) (*Result, error) {
 		m.Policies = append(m.Policies, p)
 	}
 	sort.Strings(m.Policies)
+	// The documents behind those fingerprints, where they were archived. A
+	// manifest naming a policy the recipient cannot read is a citation to a
+	// source they do not have — and this package exists precisely so the
+	// recipient does not have to come back and ask.
+	//
+	// Each is copied byte for byte and lands in the manifest like any other
+	// member, so its digest is covered by the package digest. It also still
+	// hashes to its own filename, which means a reader can tie a policy to the
+	// entries citing it without trusting this package at all.
+	cov := policy.Check(policy.DirFor(o.LogPath), m.Policies)
+	m.PoliciesArchived, m.PoliciesMissing = cov.Archived, cov.Missing
 	m.Note = "The digest of this file covers the package. Record it somewhere this " +
 		"package is not; see " + fileVerify + "."
 
@@ -250,15 +275,40 @@ func Build(o Options) (*Result, error) {
 
 	// Write the members, then the manifest over their digests, so the manifest
 	// always describes what is actually on disk.
-	for _, f := range []struct {
-		name, what string
-		data       []byte
-	}{
+	var members []member
+	for _, f := range []member{
 		{fileEntries, "the audit entries for this period, byte for byte as they were written", entries.Bytes()},
 		{fileReport, "a self-contained page of the same period, for reading", report.Bytes()},
 		{fileControls, "the control assessment of the configuration in force", controls},
 		{fileVerify, "how to check all of this without running switchboard", []byte(verify)},
 	} {
+		members = append(members, f)
+	}
+	// The archived configurations, one file each under policies/, byte for byte
+	// as stored. They keep their fingerprint filenames on purpose: each still
+	// hashes to its own name, so a recipient can bind a policy to the entries
+	// citing it without trusting this package or its author.
+	policyDir := policy.DirFor(o.LogPath)
+	for _, fp := range cov.Archived {
+		doc, err := policy.Load(policyDir, fp)
+		if err != nil {
+			// Readable a moment ago during Check and not now. Report it rather
+			// than shipping a manifest that promises a file which is not there.
+			return nil, fmt.Errorf("policy %s: %w", fp, err)
+		}
+		members = append(members, member{
+			name: filepath.Join(dirPolicies, fp+".json"),
+			what: "the configuration in force for the entries citing " + fp,
+			data: doc,
+		})
+	}
+	if len(cov.Archived) > 0 {
+		if err := os.MkdirAll(filepath.Join(o.Out, dirPolicies), 0o700); err != nil {
+			return nil, err
+		}
+	}
+
+	for _, f := range members {
 		if err := os.WriteFile(filepath.Join(o.Out, f.name), f.data, 0o600); err != nil {
 			return nil, err
 		}

@@ -3,12 +3,14 @@ package cli
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"os"
 
 	"github.com/Grace/switchboard/internal/audit"
 	"github.com/Grace/switchboard/internal/config"
+	"github.com/Grace/switchboard/internal/policy"
 	"github.com/Grace/switchboard/internal/vault"
 	"github.com/Grace/switchboard/internal/viewer"
 )
@@ -16,6 +18,7 @@ import (
 const auditUsage = `usage: switchboard audit <verify|show> [flags]
 
   verify   walk the chain and report the first entry that does not hold
+  policy   print the configuration an entry was served under, or list what is archived
   show     print every entry for one completion id
   recover  decrypt sealed values, given the private key
   view     serve a read-only page of this log on loopback, or -out it to a file
@@ -74,6 +77,8 @@ func runAudit(_ context.Context, args []string) error {
 			return fmt.Errorf("show needs -id")
 		}
 		return auditShow(logPath, *id)
+	case "policy":
+		return auditPolicy(logPath, *id)
 	case "view":
 		// The rate card comes from the same file as everything else, so the
 		// page's money is the deployment's own declared rates rather than a
@@ -239,4 +244,96 @@ func auditView(logPath, addr string, prices viewer.Prices, allowRemote bool, out
 	fmt.Println("Read-only. Nothing here is written back, and the vault is not opened.")
 	fmt.Println("Ctrl-C to stop.")
 	return srv.Serve(ln)
+}
+
+// auditPolicy resolves the fingerprint an entry cites to the configuration
+// behind it.
+//
+// A digest on every entry says the rules changed and cannot say what they were.
+// This is the other half: with no argument it reports which of the policies the
+// log cites are recoverable, and with one it prints that policy.
+//
+// The check that the document hashes to its own name is not decoration. Without
+// it the archive is a folder somebody could edit afterwards, and an archived
+// policy would evidence nothing beyond the good intentions of whoever kept it.
+func auditPolicy(logPath, fingerprint string) error {
+	dir := policy.DirFor(logPath)
+
+	if fingerprint != "" {
+		doc, err := policy.Load(dir, fingerprint)
+		if errors.Is(err, policy.ErrNotArchived) {
+			return fmt.Errorf("policy %s is cited by the log and not archived in %s. "+
+				"Entries from that period name rules that were never captured, and no "+
+				"change made now recovers them", fingerprint, dir)
+		}
+		if err != nil {
+			return err
+		}
+		// Verified as stored, then indented for reading. Formatting after the
+		// check cannot affect whether it passed.
+		var v any
+		if err := json.Unmarshal(doc, &v); err != nil {
+			os.Stdout.Write(doc)
+			return nil
+		}
+		pretty, err := json.MarshalIndent(v, "", "  ")
+		if err != nil {
+			os.Stdout.Write(doc)
+			return nil
+		}
+		fmt.Printf("%s\n", pretty)
+		return nil
+	}
+
+	// No fingerprint: report coverage. Which periods of this log can have their
+	// rules recovered, and which cannot.
+	seen := map[string]bool{}
+	var order []string
+	if err := audit.Walk(logPath, func(r audit.Record) error {
+		if r.Policy != "" && !seen[r.Policy] {
+			seen[r.Policy] = true
+			order = append(order, r.Policy)
+		}
+		return nil
+	}); err != nil {
+		return err
+	}
+	if len(order) == 0 {
+		fmt.Printf("No entry in %s cites a policy fingerprint.\n", logPath)
+		return nil
+	}
+	cov := policy.Check(dir, order)
+	fmt.Printf("%s cited by %s\n\n", plural(len(order), "policy", "policies"), logPath)
+	for _, fp := range order {
+		mark, note := "OK", "archived"
+		if !contains(cov.Archived, fp) {
+			mark, note = "!!", "NOT archived — the rules for these entries cannot be recovered"
+		}
+		fmt.Printf("  %s %s  %s\n", mark, fp, note)
+	}
+	fmt.Println()
+	if len(cov.Missing) > 0 {
+		for _, line := range wrap(fmt.Sprintf("%s cited and not archived. Those entries name "+
+			"rules nobody kept, so a decision from that period cannot be read against the "+
+			"configuration that produced it. Archiving begins when the server next starts "+
+			"and is not retroactive.", plural(len(cov.Missing), "policy is", "policies are")), 74) {
+			fmt.Printf("  %s\n", line)
+		}
+		return nil
+	}
+	for _, line := range wrap("Every policy this log cites is archived, and each stored "+
+		"document hashes to the fingerprint naming it — so the entries and the rules they "+
+		"were served under can be checked against each other by anyone holding both.", 74) {
+		fmt.Printf("  %s\n", line)
+	}
+	return nil
+}
+
+func contains(all []string, s string) bool {
+	for _, v := range all {
+		if v == s {
+			return true
+		}
+	}
+	return false
 }

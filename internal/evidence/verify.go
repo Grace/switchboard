@@ -128,6 +128,45 @@ func verifyDoc(o Options, m Manifest) string {
 	w("between trusting the producer and trusting a public build.")
 	w("")
 
+	if len(m.PoliciesArchived) > 0 || len(m.PoliciesMissing) > 0 {
+		w("## 5a. The rules each entry was served under")
+		w("")
+		w("Every entry names a policy fingerprint. That says *which* rules were in force,")
+		w("and on its own it cannot say what they were — a digest citing a document")
+		w("nobody kept is a reference to a missing source.")
+		w("")
+		if len(m.PoliciesArchived) > 0 {
+			w("`policies/` holds the configuration behind %s cited here, byte for byte.",
+				plural(len(m.PoliciesArchived), "the fingerprint", "each of the fingerprints"))
+			w("")
+			w("Each file is named by its own digest, so you can check it the same way you")
+			w("checked everything else — and this one binds to the entries rather than to")
+			w("this package:")
+			w("")
+			w("```sh")
+			for _, fp := range m.PoliciesArchived {
+				w("shasum -a 256 policies/%s.json   # first 12 hex digits are %s", fp, fp)
+			}
+			w("```")
+			w("")
+			w("That is what makes an archived policy evidence rather than an assertion. The")
+			w("entries cite a name; the file answers to that name; neither depends on")
+			w("trusting whoever assembled this directory.")
+			w("")
+		}
+		if len(m.PoliciesMissing) > 0 {
+			w("**Not every policy here is recoverable.** %s cited by these entries",
+				plural(len(m.PoliciesMissing), "One fingerprint is", "Several fingerprints are"))
+			w("and was never archived: %s.", join(m.PoliciesMissing))
+			w("")
+			w("Entries citing those were served under rules nobody captured. That is a real")
+			w("gap in this package, it has a knowable start, and nothing done now recovers")
+			w("it — archiving begins when it is switched on and is not retroactive. It is")
+			w("stated here rather than left for you to notice.")
+			w("")
+		}
+	}
+
 	if m.Extract.Traced > 0 {
 		w("## 6. Where the rest of the story is")
 		w("")
@@ -202,4 +241,27 @@ func regimeOr(regime, profile string) string {
 		return regime
 	}
 	return profile
+}
+
+// plural picks a phrase by count, so the document reads as prose rather than
+// as a template somebody forgot to finish.
+func plural(n int, one, many string) string {
+	if n == 1 {
+		return one
+	}
+	return many
+}
+
+// join lists names the way a sentence would.
+func join(all []string) string {
+	switch len(all) {
+	case 0:
+		return ""
+	case 1:
+		return all[0]
+	case 2:
+		return all[0] + " and " + all[1]
+	default:
+		return strings.Join(all[:len(all)-1], ", ") + " and " + all[len(all)-1]
+	}
 }

@@ -34,6 +34,32 @@ extracted entries the way `VERIFY.md` tells a recipient to — textual
 substitution of the `mac` field, then HMAC — so the shipped instructions are
 covered by the suite rather than merely written down.
 
+## The rules behind each entry
+
+Every entry names a policy fingerprint. On its own that says *which* rules were
+in force and cannot say what they were — a digest citing a document nobody kept
+is a reference to a missing source.
+
+`switchboard serve` archives the configuration under its own fingerprint in a
+`policies/` directory beside the log, and an evidence package copies in the ones
+its entries cite. Each file is named by its own digest:
+
+```sh
+shasum -a 256 policies/4f4c581392f8.json   # first 12 hex digits are the filename
+```
+
+That check binds a policy to the **entries** rather than to the package, so a
+recipient can tie the two together without trusting whoever assembled the
+directory. Nothing in the archive is a secret: team keys are reduced to a count,
+the vault to a boolean, and log paths are omitted, which is why the document can
+be handed over as it stands.
+
+`switchboard audit policy` reports which of the policies a log cites are
+recoverable, and `-id <fingerprint>` prints one. Where a fingerprint was never
+archived, both the command and VERIFY.md say so plainly: those entries name
+rules nobody captured, the gap has a knowable start, and archiving is not
+retroactive.
+
 ## The period is half-open
 
 `-period 2026-Q3` is 2026-07-01 **up to but not including** 2026-10-01.
