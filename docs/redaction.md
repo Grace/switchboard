@@ -263,6 +263,52 @@ returns which model answered, on whose behalf, the token counts, the stop
 reason, what was redacted on the way in, and — when content logging is on — the
 redacted prompt and completion.
 
+## Rotation and retention
+
+A log that grows forever gets rotated by someone eventually, and the ordinary
+tool for that truncates or renames underneath a running process. That severs the
+chain silently: verification starts failing weeks later, for a reason nobody
+connects to the cron job that caused it. So switchboard owns rotation rather
+than leaving it to `logrotate`.
+
+```json
+{
+  "audit": {
+    "enabled": true,
+    "path": "~/.switchboard/audit.jsonl",
+    "max_bytes": 268435456,
+    "retention": "4380h"
+  }
+}
+```
+
+A closed segment becomes `audit-20260904T212600.123456789Z.jsonl`. Names are
+fixed-width and nanosecond-precision, so sorting them lexically sorts them
+chronologically, which is what makes reading them back in order correct rather
+than lucky.
+
+**A segment continues the chain; it does not start a new one.** The first entry
+of a new segment carries the sequence and digest following the last entry of the
+previous, so `audit verify` walks every segment as one history:
+
+```
+ok  ~/.switchboard/audit.jsonl (signed)
+  184203 entries across 12 segments, chain intact
+```
+
+Which means **deleting a whole segment is detected**. That matters because
+removing a file is the tidy version of deleting history, and it is exactly what
+a retention script or a nervous administrator would reach for.
+
+`retention` deletes closed segments older than the period. The active file is
+never pruned. Zero — the default — keeps everything, because deleting evidence
+should be something you asked for rather than something that happens.
+
+EU AI Act Article 26 asks deployers of high-risk systems to keep logs for at
+least six months, and other regimes ask for longer. switchboard cannot know
+which applies to you, so it warns at startup when `retention` is shorter than
+six months rather than refusing to run.
+
 ## Two limits, stated rather than discovered
 
 **Tail truncation is undetectable from the file alone.** An intact prefix is an

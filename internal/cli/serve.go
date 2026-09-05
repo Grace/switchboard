@@ -80,7 +80,17 @@ func runServe(ctx context.Context, args []string) error {
 		if err != nil {
 			return fmt.Errorf("audit log: %w", err)
 		}
+		lg = lg.WithRotation(audit.Rotation{
+			MaxBytes:  cfg.Audit.MaxBytes,
+			Retention: time.Duration(cfg.Audit.Retention),
+		})
 		defer lg.Close()
+
+		if r := time.Duration(cfg.Audit.Retention); r > 0 && r < config.Art26Minimum {
+			logger.Printf("warning: audit.retention is %s. EU AI Act Article 26 asks "+
+				"deployers of high-risk systems to keep logs at least six months; "+
+				"check what applies to you before shortening it further", r)
+		}
 
 		if cfg.Vault.Enabled {
 			pub, err := vault.LoadPublicKey(config.ExpandPath(cfg.Vault.PublicKey))

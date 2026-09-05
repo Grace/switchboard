@@ -2,6 +2,7 @@ package config
 
 import (
 	"fmt"
+	"time"
 
 	"github.com/Grace/switchboard/internal/redact"
 )
@@ -29,7 +30,20 @@ type Audit struct {
 	// LogContent stores redacted prompts and completions alongside the
 	// metadata. It requires redaction rules: see Validate.
 	LogContent bool `json:"log_content,omitempty"`
+	// MaxBytes closes a segment once the active file reaches this size. Zero
+	// means one file that grows forever — see rotate.go for why that is worse
+	// than it sounds.
+	MaxBytes int64 `json:"max_bytes,omitempty"`
+	// Retention deletes closed segments older than this. Zero keeps everything,
+	// which is the safe default: deleting evidence should be something you
+	// asked for.
+	Retention Duration `json:"retention,omitempty"`
 }
+
+// Art26Minimum is the retention floor the EU AI Act sets for deployers of
+// high-risk systems. switchboard cannot know which regime applies to you, so it
+// warns rather than enforces.
+const Art26Minimum = 6 * 30 * 24 * time.Hour
 
 // Empty reports whether any redaction is configured at all.
 func (r Redaction) Empty() bool { return len(r.Rules) == 0 && len(r.Custom) == 0 }
@@ -61,6 +75,13 @@ func (c *Config) validateIO() error {
 	}
 	if c.Audit.Path == "" {
 		return fmt.Errorf("audit.enabled requires audit.path")
+	}
+	if c.Audit.MaxBytes < 0 || c.Audit.Retention < 0 {
+		return fmt.Errorf("audit.max_bytes and audit.retention must not be negative")
+	}
+	if c.Audit.Retention > 0 && c.Audit.MaxBytes == 0 {
+		return fmt.Errorf("audit.retention is set but audit.max_bytes is not: " +
+			"retention deletes closed segments, and without rotation there are none")
 	}
 	// The rule worth being loud about: content logging is the moment prompts
 	// stop being transient and acquire a retention policy. Doing that with no

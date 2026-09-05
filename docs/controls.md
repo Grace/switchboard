@@ -32,9 +32,9 @@ certification. switchboard is software you run; the controls are yours.
 |---|---|---|---|
 | Security-relevant events are recorded | SOC 2 CC7.2 · ISO 27001 A.8.15 · HIPAA §164.312(b) · NIST AU-2 | ✅ | One JSONL entry per completion: time, id, team, model, backend, token counts, stop reason, redaction counts, and errors. Backend failures are recorded too. |
 | Records identify the actor | SOC 2 CC7.2 · NIST AU-3 | ✅ | Team and, when the caller presented a token, the subject — a person rather than a shared credential. Team only when a static key was used. |
-| Records are protected from modification | SOC 2 CC7.2 · ISO 27001 A.8.15 · NIST AU-9 | ◐ | Entries are hash-chained; alteration, deletion and reordering are detectable via `switchboard audit verify`, which exits non-zero. With `SWITCHBOARD_AUDIT_KEY` an edit requires the key. **Tail truncation is undetectable from the file alone, and a key holder can rewrite history.** Anchor the printed head externally, or use write-once storage. |
+| Records are protected from modification | SOC 2 CC7.2 · ISO 27001 A.8.15 · NIST AU-9 | ◐ | Entries are hash-chained across rotated segments, so alteration, deletion, reordering *and removal of a whole segment* are detectable via `switchboard audit verify`, which exits non-zero. With `SWITCHBOARD_AUDIT_KEY` an edit requires the key. **Tail truncation is undetectable from the file alone, and a key holder can rewrite history.** Anchor the printed head externally, or use write-once storage. |
 | Individual decisions can be reconstructed | EU AI Act Art. 12 · NIST AU-3 | ✅ | `switchboard audit show -id <id>` returns the model, team, token counts, stop reason, redactions, and the redacted content when content logging is on. |
-| Log retention | EU AI Act Art. 26 (≥6 months) · NIST AU-11 | ❌ | switchboard appends; it does not rotate, expire, or enforce retention. Retention is your log pipeline's job. |
+| Log retention | EU AI Act Art. 26 (≥6 months) · NIST AU-11 | ✅ | Size-based rotation into timestamped segments, with a configurable retention period that prunes closed segments and never the active one. Startup warns when the configured period is under six months. Off by default: deleting evidence should be requested, not incidental. |
 | Logs are reviewed | SOC 2 CC7.2 · NIST AU-6 | ◐ | `audit verify` is designed for a scheduled job. Nothing alerts on its own. |
 
 ## Data protection
@@ -95,8 +95,7 @@ verification is a narrow in-house implementation rather than a JOSE dependency;
 [sso.md](sso.md) explains that choice and the adversarial tests that pin it, and
 swapping it for a vetted library is one file if your review requires that.
 
-It does no content filtering and no retention management, and does not pretend
-to. The absence of content filtering is a position rather than a gap: see the
+It does no content filtering, and does not pretend to. The absence of content filtering is a position rather than a gap: see the
 ATLAS row below.
 
 Questions: **hello@gracefulco.de**

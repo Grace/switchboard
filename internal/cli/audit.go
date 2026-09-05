@@ -93,7 +93,7 @@ func runAudit(_ context.Context, args []string) error {
 }
 
 func auditVerify(path string) error {
-	rep, err := audit.Verify(path, audit.KeyFromEnv())
+	rep, err := audit.VerifyAll(path, audit.KeyFromEnv())
 	if err != nil {
 		return err
 	}
@@ -113,7 +113,11 @@ func auditVerify(path string) error {
 	}
 
 	fmt.Printf("ok  %s (%s)\n", path, how)
-	fmt.Printf("  %d entries, chain intact\n", rep.Entries)
+	seg := ""
+	if rep.Segments > 1 {
+		seg = fmt.Sprintf(" across %d segments", rep.Segments)
+	}
+	fmt.Printf("  %d entries%s, chain intact\n", rep.Entries, seg)
 	if rep.Head != "" {
 		fmt.Printf("  head %s\n", rep.Head)
 		fmt.Println("\n  Record the head somewhere this log is not. An intact prefix is")

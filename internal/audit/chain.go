@@ -96,10 +96,11 @@ func (b *Break) Error() string {
 
 // Report is the outcome of verifying a log.
 type Report struct {
-	Entries int
-	Keyed   bool
-	Head    string
-	Break   *Break
+	Entries  int
+	Segments int
+	Keyed    bool
+	Head     string
+	Break    *Break
 }
 
 // Verify walks a log and reports the first inconsistency.
@@ -176,7 +177,29 @@ func verify(r io.Reader, key []byte) (*Report, error) {
 
 // tailState recovers the sequence and MAC to continue from, so a restart
 // appends to the existing chain instead of starting a new one beside it.
+//
+// It reads across segments, newest last, because rotation happens after a write
+// and can therefore leave the active file empty. A restart at that moment would
+// otherwise find nothing, begin again at sequence 1, and produce a log that
+// verifies as tampered with for no reason anyone could trace.
 func tailState(path string) (seq uint64, prev string, err error) {
+	segs, err := Segments(path)
+	if err != nil || len(segs) == 0 {
+		return 0, "", err
+	}
+	for _, s := range segs {
+		sq, pv, err := tailOfFile(s)
+		if err != nil {
+			return 0, "", err
+		}
+		if sq > seq {
+			seq, prev = sq, pv
+		}
+	}
+	return seq, prev, nil
+}
+
+func tailOfFile(path string) (seq uint64, prev string, err error) {
 	f, err := os.Open(path)
 	if os.IsNotExist(err) {
 		return 0, "", nil

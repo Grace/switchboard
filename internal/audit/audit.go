@@ -69,6 +69,20 @@ type Log struct {
 	signer signer
 	seq    uint64
 	prev   string
+
+	// Rotation state. path is empty for a Log writing somewhere that is not a
+	// file, in which case rotation is a no-op.
+	path      string
+	bytes     int64
+	maxBytes  int64
+	retention time.Duration
+}
+
+// Rotation configures when a segment is closed and how long closed segments
+// are kept. Zero values disable each independently.
+type Rotation struct {
+	MaxBytes  int64
+	Retention time.Duration
 }
 
 // Open opens or creates the log at path.
@@ -94,8 +108,23 @@ func Open(path string, red *redact.Redactor, content bool) (*Log, error) {
 	l := newLog(f, red, content)
 	l.signer = newSigner(keyFromEnv())
 	l.seq, l.prev = seq, prev
+	l.path = path
+	if info, err := f.Stat(); err == nil {
+		l.bytes = info.Size()
+	}
 	return l, nil
 }
+
+// WithRotation closes a segment once it exceeds MaxBytes and deletes segments
+// older than Retention. See rotate.go for why owning this matters.
+func (l *Log) WithRotation(r Rotation) *Log {
+	if l != nil {
+		l.maxBytes, l.retention = r.MaxBytes, r.Retention
+	}
+	return l
+}
+
+func newEncoder(w io.Writer) *json.Encoder { return json.NewEncoder(w) }
 
 func newLog(w io.WriteCloser, red *redact.Redactor, content bool) *Log {
 	return &Log{w: w, enc: json.NewEncoder(w), red: red, content: content}
@@ -169,11 +198,25 @@ func (l *Log) Write(r Record) error {
 		l.seq--
 		return err
 	}
-	if err := l.enc.Encode(signed); err != nil {
+	line, err := json.Marshal(signed)
+	if err != nil {
+		l.seq--
+		return err
+	}
+	line = append(line, '\n')
+	if _, err := l.w.Write(line); err != nil {
 		l.seq--
 		return err
 	}
 	l.prev = signed.MAC
+	l.bytes += int64(len(line))
+
+	// Rotate after writing, so an entry is never split across segments.
+	if l.maxBytes > 0 && l.bytes >= l.maxBytes {
+		if err := l.rotate(); err != nil {
+			return fmt.Errorf("rotating the audit log: %w", err)
+		}
+	}
 	return nil
 }
 
