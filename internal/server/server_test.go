@@ -19,6 +19,7 @@ import (
 
 	"github.com/Grace/switchboard/internal/audit"
 	"github.com/Grace/switchboard/internal/config"
+	"github.com/Grace/switchboard/internal/envelope"
 	"github.com/Grace/switchboard/internal/limit"
 	"github.com/Grace/switchboard/internal/oidc"
 	"github.com/Grace/switchboard/internal/redact"
@@ -1069,5 +1070,114 @@ func TestNoTraceContextIsFine(t *testing.T) {
 	json.Unmarshal(bytes.TrimSpace(raw), &rec)
 	if rec.TraceID != "" {
 		t.Errorf("trace_id = %q with no tracer configured", rec.TraceID)
+	}
+}
+
+// A refused call must be recorded before it is refused. The record of an
+// attempted escalation is the point; losing it to a failed request would be the
+// worst possible ordering.
+func TestARefusedToolCallIsRecordedThenRefused(t *testing.T) {
+	logPath := filepath.Join(t.TempDir(), "audit.jsonl")
+	t.Setenv("SWITCHBOARD_AUDIT_KEY", "k")
+	lg, err := audit.Open(logPath, nil, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	backend := &fakeBackend{
+		chunks: []string{""},
+		toolDeltas: []switchboard.ToolCallDelta{
+			{Index: 0, ID: "c1", Name: "lookup_account", Arguments: `{"id":1}`},
+			{Index: 1, ID: "c2", Name: "wire_funds", Arguments: `{"amount":9999}`},
+		},
+	}
+	manifests := map[string]envelope.Manifest{
+		"lookup_account": {Tool: "lookup_account", Scopes: []string{"customer_pii"}},
+		"wire_funds":     {Tool: "wire_funds", Scopes: []string{"ledger"}},
+	}
+	grant := func(string) envelope.Grant {
+		return envelope.Grant{Tools: []string{"lookup_account"}, Scopes: []string{"customer_pii"}}
+	}
+
+	reg := switchboard.NewRegistry()
+	reg.Register(backend, []string{"test-model"})
+	reg.SetDefault("test-model")
+	s := New(reg, log.New(io.Discard, "", 0)).
+		WithAudit(lg, false).
+		WithTools(manifests, grant)
+	srv := httptest.NewServer(s.Handler())
+	t.Cleanup(srv.Close)
+
+	resp := post(t, srv.URL+"/v1/chat/completions", `{"model":"test-model",
+	  "messages":[{"role":"user","content":"hi"}],
+	  "tools":[{"type":"function","function":{"name":"lookup_account","parameters":{}}},
+	           {"type":"function","function":{"name":"wire_funds","parameters":{}}}]}`)
+
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("status = %s, want 403; body %s", resp.Status, body)
+	}
+	for _, want := range []string{"tool_not_permitted", "wire_funds"} {
+		if !strings.Contains(string(body), want) {
+			t.Errorf("refusal body missing %q: %s", want, body)
+		}
+	}
+	if strings.Contains(string(body), `"tool_calls"`) {
+		t.Errorf("a refused response still carried tool calls: %s", body)
+	}
+
+	lg.Close()
+	raw, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	line := strings.TrimSpace(string(raw))
+	if line == "" {
+		t.Fatal("nothing was recorded for a refused call — that is the entry that matters")
+	}
+	var got audit.Record
+	if err := json.Unmarshal([]byte(line), &got); err != nil {
+		t.Fatal(err)
+	}
+	if len(got.ToolCalls) != 2 {
+		t.Fatalf("recorded %d calls, want the allowed one and the refused one: %+v",
+			len(got.ToolCalls), got.ToolCalls)
+	}
+	byName := map[string]audit.ToolCall{}
+	for _, c := range got.ToolCalls {
+		byName[c.Name] = c
+	}
+	if byName["lookup_account"].Refused {
+		t.Error("a permitted call was marked refused")
+	}
+	if !byName["wire_funds"].Refused {
+		t.Error("the refused call was not marked in the record")
+	}
+	if !strings.Contains(byName["wire_funds"].Reason, "grant") {
+		t.Errorf("reason = %q", byName["wire_funds"].Reason)
+	}
+	if !strings.Contains(got.Error, "wire_funds") {
+		t.Errorf("the entry should say what was refused: %q", got.Error)
+	}
+	if len(got.ToolsOffered) != 2 {
+		t.Errorf("tools offered = %v, want both recorded", got.ToolsOffered)
+	}
+}
+
+// With nothing declared, calls are recorded and not judged — the honest state
+// of a deployment that has not configured this yet, and a better default than
+// refusing every call on first start.
+func TestWithoutDeclarationsCallsAreRecordedNotJudged(t *testing.T) {
+	backend := &fakeBackend{
+		chunks:     []string{""},
+		toolDeltas: []switchboard.ToolCallDelta{{Index: 0, ID: "c1", Name: "anything"}},
+	}
+	srv := newTestServer(t, backend)
+	resp := post(t, srv.URL+"/v1/chat/completions", `{"model":"test-model",
+	  "messages":[{"role":"user","content":"hi"}],
+	  "tools":[{"type":"function","function":{"name":"anything","parameters":{}}}]}`)
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status = %s, want 200 with enforcement off: %s", resp.Status, body)
 	}
 }

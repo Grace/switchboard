@@ -233,6 +233,16 @@ func finish(d assess.Deployment, e *Endpoint) assess.Deployment {
 	d.Runtime.FIPS = assess.Unknown
 	d.Runtime.FIPSHint = "Databricks runtime property; confirm with the workspace's compliance security profile."
 
+	// Model agency. An endpoint export describes a route to a model, not the
+	// agent code on the other side of it, so both agency rows stay Unknown —
+	// answering No here would be the invented finding this package exists to
+	// avoid.
+	d.Caveats = append(d.Caveats,
+		"This export describes a serving endpoint, not the agent behind it. Whether the "+
+			"served model can call tools, what bounds those calls and whether the calls "+
+			"are recorded are properties of the served entity and its application code, "+
+			"and none of them are visible in an endpoint export.")
+
 	if e.Config != nil {
 		d.Auth.CloudProvider = assess.Bool(len(e.Config.ServedEntities) > 0)
 	} else {

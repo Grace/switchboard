@@ -323,6 +323,57 @@ func Assess(d Deployment) ControlReport {
 				"filtered.", d.Source))
 	}
 
+	// ---- Model agency ----
+	const agency = "Model agency"
+	toolRefs := refs("NIST 800-53", "AC-6", "SOC 2", "CC6.3", "ISO 27001", "A.8.2")
+	const authObj = "Tool calls are authorised before they take effect"
+	switch {
+	case d.Agency.ToolsOffered == No:
+		add(agency, authObj, toolRefs, StatusNotAddressed,
+			"No caller can put a tool in front of a model here, so there is no action "+
+				"to authorise. This row becomes a gap the day that changes.")
+	case d.Agency.Authorised == Yes:
+		ev := "A tool call is checked against the caller's grant before it takes effect."
+		if d.Agency.AuthorisedDetail != "" {
+			ev = d.Agency.AuthorisedDetail
+		}
+		// The limit is stated in the evidence rather than in a footnote,
+		// because a reviewer reads the row and stops. Overstating this one is
+		// worse than having no row: it is the row that says an action was
+		// prevented.
+		add(agency, authObj, toolRefs, StatusMet, ev+" On a streaming response the "+
+			"completing frame is withheld and the refusal recorded, which stops a client "+
+			"that waits for the finish reason and does not stop one that acts on partial "+
+			"deltas. Where this must be a control rather than a signal, do not offer tools "+
+			"on streaming requests.")
+	case d.Agency.Authorised == No:
+		add(agency, authObj, toolRefs, StatusUnmet,
+			"Tools can be offered and any call the model is talked into making is passed "+
+				"through. The record will show what happened; nothing stopped it.")
+	default:
+		unknown(agency, authObj, toolRefs,
+			"a tool call is checked against a grant before it takes effect")
+	}
+
+	const callObj = "Tool calls and refusals are recorded"
+	callRefs := refs("NIST 800-53", "AU-3", "SOC 2", "CC7.2", "EU AI Act", "Art. 12")
+	switch {
+	case d.Agency.ToolsOffered == No:
+		// Deliberately not repeated as a second not-addressed row. One line
+		// about a deployment with no tools is a fact; two is padding.
+	case d.Agency.CallsRecorded == Yes:
+		add(agency, callObj, callRefs, StatusMet,
+			"Every tool the model asked for is named in the entry for its request, in "+
+				"order, with each refusal and its reason. The refusal is written before "+
+				"the request fails, so a stopped call cannot be lost with it.")
+	case d.Agency.CallsRecorded == No:
+		add(agency, callObj, callRefs, StatusUnmet,
+			"Nothing records which tools the model asked to call, so a call that should "+
+				"not have happened leaves no trace to find it by.")
+	default:
+		unknown(agency, callObj, callRefs, "tool calls are recorded")
+	}
+
 	// ---- Availability ----
 	const avail = "Availability and operations"
 	limitRefs := refs("SOC 2", "A1.1", "NIST 800-53", "SC-5", "MITRE ATLAS", "AML.M0004")

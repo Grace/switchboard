@@ -63,7 +63,34 @@ type Deployment struct {
 	Assurance Assurance `json:"assurance"`
 	Audit     Audit     `json:"audit"`
 	Data      Data      `json:"data"`
+	Agency    Agency    `json:"agency"`
 	Runtime   Runtime   `json:"runtime"`
+}
+
+// Agency is what the model may be made to do, as distinct from what the caller
+// may ask for.
+//
+// Every other section here describes a request: who sent it, what it carried,
+// whether it was written down. This one describes a consequence. A model that
+// has been talked into calling a tool it was never granted is the failure a
+// completion log is worst at showing after the fact, because the harm is not in
+// the text — it is in the action the text caused, and by the time anyone reads
+// the entry the action has happened.
+type Agency struct {
+	// ToolsOffered is whether callers can put tools in front of a model here at
+	// all. Where they cannot, the objectives below are not gaps in the
+	// deployment, and scoring them as gaps would invent a finding.
+	ToolsOffered Support `json:"tools_offered"`
+	// Authorised means a tool call is checked against a grant before it takes
+	// effect, rather than being recorded after it already has.
+	Authorised Support `json:"authorised"`
+	// AuthorisedDetail names what is declared and who holds grants, so the row
+	// is evidence rather than a claim.
+	AuthorisedDetail string `json:"authorised_detail,omitempty"`
+	// CallsRecorded means each call the model asked for — and each refusal —
+	// lands in the record. A refusal is the more valuable of the two: it is
+	// either an attack that was stopped or a permission somebody needs.
+	CallsRecorded Support `json:"calls_recorded"`
 }
 
 // Assurance is evidence a gateway does not produce and a compliance programme

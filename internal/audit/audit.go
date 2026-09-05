@@ -102,6 +102,16 @@ type ToolCall struct {
 	Name      string `json:"name"`
 	ID        string `json:"id,omitempty"`
 	Arguments string `json:"arguments,omitempty"`
+	// Refused marks a call the gateway would not pass back to the application,
+	// and Reason says why.
+	//
+	// A refused call is the most valuable entry this log can hold. It is the
+	// moment a model asked for something it was not permitted, which is either
+	// an attack that was stopped or a permission somebody needs and does not
+	// have — and both are findings. Recording only the calls that succeeded
+	// would leave the record silent about exactly the events it exists for.
+	Refused bool   `json:"refused,omitempty"`
+	Reason  string `json:"refusal_reason,omitempty"`
 }
 
 // Log is an append-only, hash-chained JSONL audit log.

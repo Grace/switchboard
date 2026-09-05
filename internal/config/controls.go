@@ -71,6 +71,14 @@ func (c *Config) Deployment() assess.Deployment {
 			// than asserted: see the injection-study harness.
 			ContentPolicy: assess.No,
 		},
+		Agency: assess.Agency{
+			// switchboard forwards whatever tools a caller puts in the request,
+			// so the capability is always present even when nothing bounds it.
+			ToolsOffered:     assess.Yes,
+			Authorised:       assess.Bool(c.Tools.Enabled),
+			AuthorisedDetail: c.Tools.describe(),
+			CallsRecorded:    assess.Bool(c.Audit.Enabled),
+		},
 		Runtime: assess.Runtime{
 			FIPS:     assess.Bool(fips140.Enabled()),
 			FIPSHint: "Build with GOFIPS140=v1.0.0 or run with GODEBUG=fips140=on.",

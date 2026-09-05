@@ -158,6 +158,15 @@ func TestControlsFullyConfiguredHasNoUnmet(t *testing.T) {
 	c.Limits = Limits{Enabled: true}
 	c.Audit.VerifyInterval = Duration(time.Hour)
 	c.Vault = Vault{Enabled: true, Path: "/tmp/v", PublicKey: "/tmp/pub.pem"}
+	// A deployment that forwards tools and bounds none of them has a real gap,
+	// so a config is not fully configured until it has declared them. Adding
+	// this here rather than exempting the row is the point: the row is supposed
+	// to make somebody do this.
+	c.Tools = Tools{
+		Enabled: true,
+		Declare: map[string]ToolDecl{"lookup": {Bundle: "support"}},
+		Grants:  map[string]ToolGrant{"clinic": {Tools: []string{"lookup"}}},
+	}
 
 	rep := c.Controls()
 	for _, ctl := range rep.Controls {
@@ -240,4 +249,69 @@ func TestControlsSkipsProviderRowWithNoProvider(t *testing.T) {
 	if got := find(t, c.Controls(), "Least privilege").Status; got != StatusPartial {
 		t.Errorf("bedrock configured without attribution, want partial, got %q", got)
 	}
+}
+
+// The evidence line has to describe this deployment, not tool use in general.
+// A generic sentence in an evidence column is the failure mode this whole
+// command exists to avoid: it reads as a finding and asserts nothing.
+func TestToolEvidenceDescribesThisDeployment(t *testing.T) {
+	c := Default()
+	c.Audit.Enabled = true
+	c.Audit.Path = "/tmp/audit.jsonl"
+	c.Tools = Tools{
+		Enabled: true,
+		Declare: map[string]ToolDecl{
+			"search_tickets": {Bundle: "support", Scopes: []string{"tickets"}},
+			"read_account":   {Bundle: "support", Scopes: []string{"accounts"}},
+			"send_email":     {Bundle: "comms", Scopes: []string{"tickets"}, Egress: true},
+		},
+		Grants: map[string]ToolGrant{
+			"support": {Tools: []string{"search_tickets", "read_account"}, Scopes: []string{"tickets"}},
+		},
+	}
+	if err := c.Tools.validate(); err != nil {
+		t.Fatalf("fixture does not validate: %v", err)
+	}
+
+	rep := c.Controls()
+	var ev string
+	for _, ctl := range rep.Controls {
+		if strings.Contains(ctl.Objective, "authorised before they take effect") {
+			if ctl.Status != StatusMet {
+				t.Fatalf("enforcement is on; want met, got %s", ctl.Status)
+			}
+			ev = ctl.Evidence
+		}
+	}
+	if ev == "" {
+		t.Fatal("no tool authorisation row in the report")
+	}
+	for _, want := range []string{
+		"3 tools declared",
+		"2 bundles",
+		"1 of those tools can send data outside",
+		"1 team holds an explicit grant",
+		"may call nothing",
+	} {
+		if !strings.Contains(ev, want) {
+			t.Errorf("evidence missing %q:\n%s", want, ev)
+		}
+	}
+}
+
+// Off, the row is a real gap rather than a silence. switchboard forwards tools
+// whether or not it bounds them, so "we have not configured this" and "there is
+// nothing to configure" are different answers.
+func TestToolsOffIsUnmetNotUnknown(t *testing.T) {
+	c := Default()
+	rep := c.Controls()
+	for _, ctl := range rep.Controls {
+		if strings.Contains(ctl.Objective, "authorised before they take effect") {
+			if ctl.Status != StatusUnmet {
+				t.Fatalf("want unmet with tools disabled, got %s", ctl.Status)
+			}
+			return
+		}
+	}
+	t.Fatal("no tool authorisation row in the report")
 }

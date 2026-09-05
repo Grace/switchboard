@@ -86,6 +86,12 @@ func runServe(ctx context.Context, args []string) error {
 		WithMetrics(meter).
 		WithTracer(tracer)
 
+	if cfg.Tools.Enabled {
+		srv = srv.WithTools(cfg.Tools.Manifests(), cfg.Tools.GrantFor)
+		logger.Printf("tools: enforcing over %d declared tool(s); a call outside a "+
+			"caller's envelope is refused and recorded", len(cfg.Tools.Declare))
+	}
+
 	if lim := cfg.Limiter(); lim != nil {
 		srv = srv.WithLimits(lim)
 		d := cfg.Limits.Default

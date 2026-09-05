@@ -115,3 +115,69 @@ func TestRetentionFloorFollowsProfile(t *testing.T) {
 		t.Errorf("3 years clears six months, want met, got %q", got)
 	}
 }
+
+// A deployment that cannot offer tools has no action to authorise. Scoring that
+// as unmet would put a finding in front of a reviewer that nobody can act on,
+// which is the same failure as inventing one from an Unknown.
+func TestNoToolsIsNotAGap(t *testing.T) {
+	d := Deployment{Source: "litellm"}
+	d.Agency.ToolsOffered = No
+	rep := Assess(d)
+	c := find(t, rep, "authorised before they take effect")
+	if c.Status != StatusNotAddressed {
+		t.Fatalf("no tools should be not-addressed, got %s", c.Status)
+	}
+	if rep.Unmet() {
+		t.Fatal("a deployment with no tools must not fail -strict on the agency rows")
+	}
+	// One line about a deployment with no tools is a fact; a second is padding.
+	for _, c := range rep.Controls {
+		if strings.Contains(c.Objective, "Tool calls and refusals are recorded") {
+			t.Fatal("the recording row should be omitted when nothing can call a tool")
+		}
+	}
+}
+
+// Passing tool calls through unchecked is a real gap, and it is the one the
+// whole enforcement path exists to close. It has to fail -strict.
+func TestUnenforcedToolsIsUnmet(t *testing.T) {
+	d := Deployment{Source: "switchboard"}
+	d.Agency.ToolsOffered = Yes
+	d.Agency.Authorised = No
+	d.Agency.CallsRecorded = Yes
+	c := find(t, Assess(d), "authorised before they take effect")
+	if c.Status != StatusUnmet {
+		t.Fatalf("unenforced tools should be unmet, got %s", c.Status)
+	}
+}
+
+// The met row must carry its own limit. A reviewer reads the row and stops, so
+// a claim that an action was prevented has to say where it is only a signal —
+// otherwise the report overstates exactly where it can least afford to.
+func TestEnforcementRowStatesTheStreamingLimit(t *testing.T) {
+	d := Deployment{Source: "switchboard"}
+	d.Agency.ToolsOffered = Yes
+	d.Agency.Authorised = Yes
+	d.Agency.AuthorisedDetail = "4 tools declared."
+	c := find(t, Assess(d), "authorised before they take effect")
+	if c.Status != StatusMet {
+		t.Fatalf("want met, got %s", c.Status)
+	}
+	if !strings.Contains(c.Evidence, "4 tools declared.") {
+		t.Error("evidence dropped the adapter's detail")
+	}
+	if !strings.Contains(c.Evidence, "streaming") {
+		t.Errorf("evidence claims prevention without stating the streaming limit: %q", c.Evidence)
+	}
+}
+
+// A source that says nothing about tools gets Unknown, not No — the same rule
+// every other row here follows.
+func TestSilentSourceGetsUnknownAgency(t *testing.T) {
+	rep := Assess(Deployment{Source: "databricks"})
+	for _, obj := range []string{"authorised before they take effect", "Tool calls and refusals are recorded"} {
+		if c := find(t, rep, obj); c.Status != StatusUnknown {
+			t.Errorf("%s: want unknown, got %s", obj, c.Status)
+		}
+	}
+}

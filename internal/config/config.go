@@ -79,6 +79,8 @@ type Config struct {
 	Limits Limits `json:"limits,omitempty"`
 	// Pricing turns the token counts in the log into money. See pricing.go.
 	Pricing Pricing `json:"pricing,omitempty"`
+	// Tools bounds which functions a model may actually be made to call.
+	Tools Tools `json:"tools,omitempty"`
 	// TLS secures the listener itself.
 	TLS TLS `json:"tls,omitempty"`
 	// Telemetry exports aggregates over OTLP.
@@ -228,6 +230,9 @@ func (c *Config) validate(checkProfile bool) error {
 	// configuration that produced it, and a price for a model retired last
 	// month is exactly what reading last month's entries needs.
 	if err := c.Pricing.validate(); err != nil {
+		return err
+	}
+	if err := c.Tools.validate(); err != nil {
 		return err
 	}
 	if err := c.TLS.validate(c.Listen); err != nil {

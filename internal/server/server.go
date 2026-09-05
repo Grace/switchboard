@@ -18,6 +18,7 @@ import (
 
 	"github.com/Grace/switchboard/internal/audit"
 	"github.com/Grace/switchboard/internal/config"
+	"github.com/Grace/switchboard/internal/envelope"
 	"github.com/Grace/switchboard/internal/limit"
 	"github.com/Grace/switchboard/internal/oidc"
 	"github.com/Grace/switchboard/internal/switchboard"
@@ -56,6 +57,12 @@ type Server struct {
 	metrics *telemetry.Meter
 	// tracer joins this record to the caller's own traces.
 	tracer *telemetry.Tracer
+
+	// toolManifests and toolGrant bound which functions a model may be made to
+	// call. Nil manifests means enforcement is off and calls are recorded
+	// without being judged.
+	toolManifests map[string]envelope.Manifest
+	toolGrant     func(team string) envelope.Grant
 }
 
 // WithTracer adopts the caller's trace context and emits a span per completion.
@@ -148,6 +155,59 @@ func (s *Server) charge(ctx context.Context, usage switchboard.Usage) {
 // WithOIDC lets the server accept identity-provider tokens as well as static
 // team keys. The team a token names must still be on the roster: an identity
 // provider decides who someone is, not which teams exist here.
+// WithTools enforces a permission envelope over the calls a model asks for.
+//
+// Enforcement is on the response rather than the request: offering a tool is
+// not using one, and refusing a request because it made something available
+// would break applications that offer a broad toolset and use a narrow part of
+// it. What is refused is the action.
+//
+// The cost of checking after the completion is that the tokens are already
+// spent by the time a call is refused. That is the right trade — the thing
+// being prevented is the action, not the expense, and refusing earlier would
+// mean refusing on what a caller might do rather than on what the model did.
+func (s *Server) WithTools(manifests map[string]envelope.Manifest, grant func(string) envelope.Grant) *Server {
+	if len(manifests) == 0 || grant == nil {
+		return s
+	}
+	s.toolManifests, s.toolGrant = manifests, grant
+	return s
+}
+
+// checkTools decides which of the calls a model asked for may proceed.
+//
+// It returns the audit view of every call, refusals included, and an error when
+// any was refused. Both are needed: the caller fails the request, and the log
+// records what was attempted.
+func (s *Server) checkTools(team string, offered []switchboard.Tool, calls []switchboard.ToolCall) ([]audit.ToolCall, error) {
+	recorded := auditToolCalls(calls)
+	if s.toolManifests == nil || len(calls) == 0 {
+		return recorded, nil
+	}
+	env := envelope.Compute(auditToolsOffered(offered), s.toolManifests, s.toolGrant(team))
+
+	var refused []string
+	for i := range recorded {
+		if env.Permits(recorded[i].Name) {
+			continue
+		}
+		reason := env.Why(recorded[i].Name)
+		if reason == "" {
+			// The model asked for something the request never offered. That is
+			// not a permission question at all, and it is worth naming
+			// differently: nothing declared this call, so nothing authorised it.
+			reason = "the model asked for a tool this request did not offer"
+		}
+		recorded[i].Refused, recorded[i].Reason = true, reason
+		refused = append(refused, fmt.Sprintf("%s (%s)", recorded[i].Name, reason))
+	}
+	if len(refused) == 0 {
+		return recorded, nil
+	}
+	return recorded, fmt.Errorf("refused %d tool call(s): %s",
+		len(refused), strings.Join(refused, "; "))
+}
+
 func (s *Server) WithOIDC(v *oidc.Verifier) *Server {
 	s.oidc = v
 	return s
@@ -553,11 +613,12 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadGateway, "backend_error", err.Error())
 		return
 	}
+	calls, toolErr := s.checkTools(teamOf(r.Context()), chatReq.Tools, result.ToolCalls)
 	telemetry.Tools(span, auditToolsOffered(chatReq.Tools), traceTools(result.ToolCalls))
-	telemetry.Finish(span, id, result.Usage.InputTokens, result.Usage.OutputTokens, result.StopReason, nil)
+	telemetry.Finish(span, id, result.Usage.InputTokens, result.Usage.OutputTokens, result.StopReason, toolErr)
 	s.charge(r.Context(), result.Usage)
-	s.observe(r.Context(), model, backend.Name(), "ok", result.Usage)
-	_ = s.record(r.Context(), audit.Record{
+	s.observe(r.Context(), model, backend.Name(), okOrRefused(toolErr), result.Usage)
+	rec := audit.Record{
 		ID: id, Model: model, Backend: backend.Name(),
 		Prompt: promptText(chatReq), Completion: result.Text,
 		PromptTokens:     result.Usage.InputTokens,
@@ -565,9 +626,21 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		CacheWriteTokens: result.Usage.CacheWriteTokens,
 		CacheReadTokens:  result.Usage.CacheReadTokens,
 		ToolsOffered:     auditToolsOffered(chatReq.Tools),
-		ToolCalls:        auditToolCalls(result.ToolCalls),
+		ToolCalls:        calls,
 		StopReason:       result.StopReason,
-	})
+	}
+	if toolErr != nil {
+		rec.Error = toolErr.Error()
+	}
+	_ = s.record(r.Context(), rec)
+	// The record is written before the refusal is returned. An attempted
+	// escalation that was stopped is exactly the event this log exists for,
+	// and failing the request first would risk losing it.
+	if toolErr != nil {
+		s.logger.Printf("chat %s: %v", model, toolErr)
+		writeError(w, http.StatusForbidden, "tool_not_permitted", toolErr.Error())
+		return
+	}
 	writeJSON(w, http.StatusOK, s.response(id, model, result))
 }
 
@@ -640,11 +713,12 @@ func (s *Server) streamChat(w http.ResponseWriter, r *http.Request, backend swit
 		return
 	}
 
+	calls, toolErr := s.checkTools(teamOf(r.Context()), req.Tools, result.ToolCalls)
 	telemetry.Tools(span, auditToolsOffered(req.Tools), traceTools(result.ToolCalls))
-	telemetry.Finish(span, id, result.Usage.InputTokens, result.Usage.OutputTokens, result.StopReason, nil)
+	telemetry.Finish(span, id, result.Usage.InputTokens, result.Usage.OutputTokens, result.StopReason, toolErr)
 	s.charge(r.Context(), result.Usage)
-	s.observe(r.Context(), req.Model, backend.Name(), "ok", result.Usage)
-	_ = s.record(r.Context(), audit.Record{
+	s.observe(r.Context(), req.Model, backend.Name(), okOrRefused(toolErr), result.Usage)
+	rec := audit.Record{
 		ID: id, Model: req.Model, Backend: backend.Name(), Streamed: true,
 		Prompt: promptText(req), Completion: result.Text,
 		PromptTokens:     result.Usage.InputTokens,
@@ -652,9 +726,39 @@ func (s *Server) streamChat(w http.ResponseWriter, r *http.Request, backend swit
 		CacheWriteTokens: result.Usage.CacheWriteTokens,
 		CacheReadTokens:  result.Usage.CacheReadTokens,
 		ToolsOffered:     auditToolsOffered(req.Tools),
-		ToolCalls:        auditToolCalls(result.ToolCalls),
+		ToolCalls:        calls,
 		StopReason:       result.StopReason,
-	})
+	}
+	if toolErr != nil {
+		rec.Error = toolErr.Error()
+	}
+	_ = s.record(r.Context(), rec)
+
+	// A refusal on the streaming path is weaker than on the non-streaming one,
+	// and pretending otherwise would be the worst thing this code could do.
+	//
+	// Tool-call deltas are forwarded as the backend produces them, so by the
+	// time the call is complete enough to check, a client assembling deltas has
+	// already seen it. What this does is refuse to send the final frame that
+	// completes the call, emit an error, and write the refusal down. It stops a
+	// client that waits for the finish reason; it does not stop one that acts on
+	// deltas. A deployment that needs tool enforcement to be a control rather
+	// than a signal should not offer tools on streaming requests — see
+	// docs/tools.md.
+	if toolErr != nil {
+		s.logger.Printf("chat %s: %v", req.Model, toolErr)
+		if r.Context().Err() == nil {
+			data, _ := json.Marshal(wire.ErrorResponse{Error: wire.Error{
+				Message: toolErr.Error(),
+				Type:    "tool_not_permitted",
+			}})
+			fmt.Fprintf(w, "data: %s\n\n", data)
+			flusher.Flush()
+			fmt.Fprint(w, "data: [DONE]\n\n")
+			flusher.Flush()
+		}
+		return
+	}
 
 	finish := finishReasonFor(result)
 	final := wire.ChatResponse{
@@ -920,6 +1024,24 @@ func auditToolCalls(calls []switchboard.ToolCall) []audit.ToolCall {
 		out = append(out, audit.ToolCall{Name: c.Name, ID: c.ID, Arguments: c.Arguments})
 	}
 	return out
+}
+
+// teamOf names the caller, or the sentinel for one that presented nothing.
+func teamOf(ctx context.Context) string {
+	if c, ok := switchboard.CallerFrom(ctx); ok {
+		return c.Team
+	}
+	return ""
+}
+
+// okOrRefused labels the metric. A refused call is not a backend error and
+// should not be counted as one — the backend did its job; the gateway declined
+// the result.
+func okOrRefused(err error) string {
+	if err != nil {
+		return "refused"
+	}
+	return "ok"
 }
 
 // traceTools is the same information stripped of arguments, for the span. The
