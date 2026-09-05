@@ -28,28 +28,90 @@ its input, forward-chaining makes rule interaction hard to predict, and the
 claim that this is a reference monitor small enough to read stops being true.
 Trading that away for expressiveness would cost more than it buys.
 
-## Do not embed a language. Ask something that already has one.
+## Recommendation: evaluate in-process
 
-The obvious candidates are CEL and Rego, and the argument between them misses
-what actually decides adoption: **any policy language is a learning cost for the
-buyer**, and that cost is not evenly distributed.
+Two rankings, and they point opposite ways.
 
-Rego is what a great many platform teams already run — OPA is the de facto
-standard for policy-as-code, and a shop with an OPA sidecar has the language,
-the tooling, `opa test`, the CI integration and the reviewers already. For them
-Rego is free and everything else is a new thing to learn.
+**By adoption cost:** an external decision point wins. A shop already running
+OPA writes Rego it knows, in tooling it has. A shop without one writes nothing.
+Any embedded language is a new thing to learn, and for the OPA shops it is a new
+thing to learn *instead of* the one they have.
 
-For a shop *without* OPA, Rego is the most expensive of the options rather than
-the least: it is datalog-derived, its partial-evaluation semantics are
-famously unobvious, and it is the hardest of the three to pick up.
+**By auditability:** the order inverts, and an external decision point comes
+last.
 
-That cost is bimodal, which is the tell. **Any choice of embedded language is
-wrong for half the market**, so this should not choose one.
+That inversion is the whole answer, because auditability is what this is for.
+
+### Why an external decider is worst for audit
+
+With an in-process evaluator, the rules live in the configuration — so the
+policy fingerprint already covers them, the audit entry records which rule
+denied, and **the decision is replayable from this system's own records**. The
+expression is deterministic and the metadata it saw is in the entry. One
+tamper-evident chain answers what happened, under what rules, and why.
+
+With an external decider you can record the endpoint, the deny code, and
+whatever version it reports. You cannot reconstruct *why*. That needs the policy
+bundle at that version and the decider's own decision log — so the trail is now
+split across two systems, with two retention policies, two chains of custody and
+no shared integrity guarantee. "We have the gateway's chain and the OPA decision
+log and they need correlating" is materially worse in an investigation than one
+chain that answers everything, and correlation is exactly what fails when a
+bundle from fourteen months ago is in nobody's artifact store.
+
+**So the option that is best for adoption is worst for the thing this claims to
+be.** The front page says *an LLM gateway that can prove what happened*. That
+settles it.
+
+### What to build
+
+A small expression language, evaluated in-process: identifiers from a fixed
+typed table, string, integer, float and boolean literals, comparison, boolean
+composition, parentheses, membership in a literal list. Recursive descent and a
+lookup table, on the order of 450 lines with a type checker.
+
+Termination is a property of the grammar rather than a promise — no loops, no
+calls, no recursion, nothing to bound. Type checking is a table lookup, because
+the variables are known in advance. No dependency, so `go.mod` stays the
+standard library and the AWS SDK.
+
+The learning cost is real and should not be waved away. It is a comparison
+grammar rather than a language: a reader who has written a spreadsheet formula
+can read one of these rules. That is the price of the audit story being
+complete, and it is worth naming as a price.
+
+**A rule that silently never fires looks exactly like a rule that is working**,
+which is the same failure as a redaction rule that never matches. So this ships
+with the command or it does not ship:
+
+```
+$ switchboard policy check -team research -model claude-opus
+  research-stays-on-device      FIRES   → PROVIDER_NOT_PERMITTED
+  opus-business-hours           no      (time.hour_utc is 14)
+  large-requests-need-a-person  no      (max_tokens unset)
+```
+
+### Boundaries, written down before starting
+
+This grows into a language one reasonable request at a time, so:
+
+- **No function calls.** Not even `startsWith`.
+- **No arithmetic.** Compare values, do not compute them.
+- **No regex.** That is a content filter arriving through a side door.
+- **No collection operations** beyond membership in a literal list.
+
+Past that boundary the condition belongs in code. And it is **not CEL** — a
+subset wearing that name promises semantics it does not have.
+
+## OPA, as a documented integration
+
+Some deployments have already standardised on OPA, and telling them to express
+policy twice is not a serious answer. So the same admission point can call out
+instead:
 
 ```json
 {
   "policy": {
-    "enabled": true,
     "endpoint": "http://127.0.0.1:8181/v1/data/switchboard/admission",
     "timeout": "50ms",
     "fail": "closed"
@@ -57,42 +119,21 @@ wrong for half the market**, so this should not choose one.
 }
 ```
 
-switchboard posts a metadata document and reads a decision back. The path shape
-is OPA's data API, so a team with an OPA sidecar points at it and writes Rego
-they already know. A team without one writes nothing and keeps static
-configuration. A team that wants CEL puts a CEL service behind the same
-interface. switchboard learns no language, gains no dependency — this is an HTTP
-POST with `net/http` — and stays a thing you can read.
+The path shape is OPA's data API, so an existing sidecar works unchanged.
 
-### The trade, stated plainly
+**This is an integration, not the recommended path**, and the reason is the one
+above: it splits the audit trail. The documentation should say so rather than
+presenting the two as equivalent.
 
-This costs the property most of the rest of this design rests on: that you can
-read the configuration and know what the gateway will do. Policy now lives
-somewhere else, in something else's language.
+One mitigation recovers most of what is lost: **record the full decision input
+and output in this system's own chain**, not merely the verdict. You still
+cannot reconstruct *why* the decider answered as it did — that reasoning lives
+in a bundle you may no longer have — but you can prove, tamper-evidently and
+without them, exactly what was asked and what came back. For most investigations
+that is the question.
 
-That is a real regression and it should be the operator's decision rather than
-one made for them. So:
-
-- It is **off by default**. Static configuration remains the whole story unless
-  someone turns this on.
-- `fail: "closed"` is the default. An unreachable decision point refuses
-  requests rather than admitting them, because a policy layer that fails open is
-  worse than none — it is the appearance of enforcement.
-- The **timeout is bounded and short**. A slow decision point becomes a refusal,
-  not a slow gateway.
-- The policy fingerprint records the endpoint and whatever version the decision
-  point reports, so "which rules were in force" stays answerable.
-
-### What it does not change
-
-The decision point sees the same metadata document described below and **never
-prompt content**. Moving policy out of the process does not move that line.
-
-Its answer is still **deny-only**: it may refuse a request static configuration
-would have allowed, and may not grant one static configuration refused. An
-external system cannot widen access, which keeps the monotonic property and
-means a compromised or misconfigured decision point can cause an outage but not
-an authorisation bypass.
+Fail-closed remains the default. A policy layer that fails open is the
+appearance of enforcement, which is worse than no policy layer at all.
 
 ## Shape
 
@@ -207,12 +248,11 @@ right choice for something that needs CEL's semantics, and it costs both a
 dependency and a language the buyer may not want. Half of them already have a
 different one.
 
-**Embedding a small hand-written expression language** — the second version of
-this proposal argued for it: a fixed typed variable table, comparison and
-boolean composition, roughly 450 lines, no dependency. It is a good design and
-it is still the wrong one, because it asks every buyer to learn a language that
-exists nowhere else, in exchange for saving the ones who already run OPA from
-using what they have.
+**An external decision point as the primary mechanism** — the third version of
+this proposal argued for it, on adoption grounds that are correct as far as they
+go. It loses on the criterion that decides this: policy living elsewhere means a
+decision cannot be reconstructed from this system's records. It survives as an
+integration, above.
 
 **Embedding OPA as a library** — possible, and a very large dependency: it
 brings the Rego compiler and runtime into the process. Calling a sidecar gets
