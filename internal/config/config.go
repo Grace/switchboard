@@ -64,6 +64,9 @@ type Config struct {
 	Bedrock      Bedrock `json:"bedrock"`
 	Models       []Line  `json:"models"`
 
+	// Profile declares the regulatory regime this deployment operates under,
+	// which turns the advisory audit floors into load-time errors. See profile.go.
+	Profile Profile `json:"profile,omitempty"`
 	// Attribution splits provider spend back out by caller. See attribution.go.
 	Attribution Attribution `json:"attribution,omitempty"`
 	// Redaction strips sensitive content before anything is written down.
@@ -76,6 +79,8 @@ type Config struct {
 	Limits Limits `json:"limits,omitempty"`
 	// TLS secures the listener itself.
 	TLS TLS `json:"tls,omitempty"`
+	// Telemetry exports aggregates over OTLP.
+	Telemetry Telemetry `json:"telemetry,omitempty"`
 	// Teams are the attribution units and their API keys.
 	Teams []Team `json:"teams,omitempty"`
 	// OIDC trusts an identity provider instead of shared keys.
@@ -204,6 +209,9 @@ func (c *Config) Validate() error {
 		return err
 	}
 	if err := c.TLS.validate(c.Listen); err != nil {
+		return err
+	}
+	if err := c.Telemetry.validate(); err != nil {
 		return err
 	}
 	if err := c.Vault.validate(c.Redaction, c.Audit); err != nil {

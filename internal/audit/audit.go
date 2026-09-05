@@ -96,6 +96,10 @@ type Log struct {
 	// what happened under them.
 	policy string
 
+	// observe receives redaction counts as they happen, so the aggregate view
+	// can show what is being removed without anything reading the log.
+	observe func(map[string]int)
+
 	// chain is the last self-verification result. See watch.go.
 	chain *ChainState
 }
@@ -190,6 +194,14 @@ func (l *Log) WithVault(w *vault.Writer) *Log {
 	return l
 }
 
+// WithObserver reports redaction counts as they happen.
+func (l *Log) WithObserver(f func(map[string]int)) *Log {
+	if l != nil {
+		l.observe = f
+	}
+	return l
+}
+
 // WithPolicy stamps every entry with the fingerprint of the configuration that
 // produced it.
 func (l *Log) WithPolicy(fingerprint string) *Log {
@@ -238,6 +250,9 @@ func (l *Log) Write(r Record) error {
 	}
 	if len(counts) > 0 {
 		r.Redactions = counts
+		if l.observe != nil {
+			l.observe(counts)
+		}
 	}
 
 	if l.content {

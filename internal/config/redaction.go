@@ -52,10 +52,7 @@ type Audit struct {
 	VerifyInterval Duration `json:"verify_interval,omitempty"`
 }
 
-// Art26Minimum is the retention floor the EU AI Act sets for deployers of
-// high-risk systems. switchboard cannot know which regime applies to you, so it
-// warns rather than enforces.
-const Art26Minimum = 6 * 30 * 24 * time.Hour
+// Art26Minimum, and the other retention floors, live in profile.go.
 
 // Empty reports whether any redaction is configured at all.
 func (r Redaction) Empty() bool { return len(r.Rules) == 0 && len(r.Custom) == 0 }

@@ -182,6 +182,8 @@ Working: routing, both backends, streaming and non-streaming completions, tool c
 
 **Redaction and audit.** A structured JSONL record of what was sent to which provider, with redaction applied inside the log itself so no call site can skip it — which is what makes it a control rather than a convention that every application team has to remember. Content logging is refused outright unless redaction rules are configured. See [docs/redaction.md](docs/redaction.md).
 
+**Aggregates where you already look.** The audit log reconstructs any single decision and says nothing about trends, so completions, tokens, refusals and redaction counts export over OTLP — into Splunk, Honeycomb, Grafana, a collector fanning out to all three. Attributed by team, model and outcome, and deliberately never by user: a series per person is unbounded, and per-person questions belong to the log.
+
 **Limits that stop spend, not just report it.** Per-team request rate, concurrency ceiling and token budget over a window — MITRE ATLAS AML.M0004 — enforced against the same identity the provider's bill splits by. Refusals are 429 naming which limit was reached and when it lifts.
 
 **Per-team cost attribution.** A gateway calls Bedrock under one role, so every team's spend lands on the bill as one identity. switchboard resolves a caller's key to a team, assumes a role with that team as the session name and a session tag, and makes the call with those credentials — so the provider bills an identity you can split on. Optionally fails closed on unattributed requests. See [docs/cost-attribution.md](docs/cost-attribution.md), including how to verify it against a real bill.

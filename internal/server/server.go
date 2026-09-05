@@ -21,6 +21,7 @@ import (
 	"github.com/Grace/switchboard/internal/limit"
 	"github.com/Grace/switchboard/internal/oidc"
 	"github.com/Grace/switchboard/internal/switchboard"
+	"github.com/Grace/switchboard/internal/telemetry"
 	"github.com/Grace/switchboard/internal/wire"
 )
 
@@ -46,6 +47,33 @@ type Server struct {
 
 	// limits bounds what a caller may consume. Nil means unlimited.
 	limits *limit.Limiter
+
+	// metrics answers the aggregate question the audit log cannot. Nil means
+	// the endpoint is not served.
+	metrics *telemetry.Meter
+}
+
+// WithMetrics records completions, refusals and redactions.
+func (s *Server) WithMetrics(r *telemetry.Meter) *Server {
+	s.metrics = r
+	return s
+}
+
+// observe records one completion for the aggregate view.
+//
+// Labelled by team, model, backend and outcome — all bounded by configuration.
+// Deliberately not by subject: a series per person grows without limit, and
+// per-person questions belong to the audit log, which carries subject on every
+// entry.
+func (s *Server) observe(ctx context.Context, model, backend, outcome string, u switchboard.Usage) {
+	if s.metrics == nil {
+		return
+	}
+	var team string
+	if c, ok := switchboard.CallerFrom(ctx); ok {
+		team = c.Team
+	}
+	s.metrics.Completion(ctx, team, model, backend, outcome, u.InputTokens, u.OutputTokens)
 }
 
 // WithLimits bounds requests, concurrency and token spend per caller —
@@ -80,6 +108,9 @@ func (s *Server) admit(w http.ResponseWriter, r *http.Request) (func(), bool) {
 	retry := int(ex.RetryAfter.Seconds())
 	if retry < 1 {
 		retry = 1
+	}
+	if s.metrics != nil {
+		s.metrics.Refused(r.Context(), ex.Limit, team)
 	}
 	w.Header().Set("Retry-After", strconv.Itoa(retry))
 	w.Header().Set("X-RateLimit-Limit", ex.Limit)
@@ -482,6 +513,7 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	result, err := backend.Chat(r.Context(), chatReq, func(switchboard.Chunk) error { return nil })
 	if err != nil {
 		s.logger.Printf("chat %s: %v", model, err)
+		s.observe(r.Context(), model, backend.Name(), "error", switchboard.Usage{})
 		_ = s.record(r.Context(), audit.Record{
 			ID: id, Model: model, Backend: backend.Name(),
 			Prompt: promptText(chatReq), Error: err.Error(),
@@ -490,6 +522,7 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.charge(r.Context(), result.Usage)
+	s.observe(r.Context(), model, backend.Name(), "ok", result.Usage)
 	_ = s.record(r.Context(), audit.Record{
 		ID: id, Model: model, Backend: backend.Name(),
 		Prompt: promptText(chatReq), Completion: result.Text,
@@ -547,6 +580,7 @@ func (s *Server) streamChat(w http.ResponseWriter, r *http.Request, backend swit
 		})
 	})
 	if err != nil {
+		s.observe(r.Context(), req.Model, backend.Name(), "error", switchboard.Usage{})
 		_ = s.record(r.Context(), audit.Record{
 			ID: id, Model: req.Model, Backend: backend.Name(), Streamed: true,
 			Prompt: promptText(req), Error: err.Error(),
@@ -566,6 +600,7 @@ func (s *Server) streamChat(w http.ResponseWriter, r *http.Request, backend swit
 	}
 
 	s.charge(r.Context(), result.Usage)
+	s.observe(r.Context(), req.Model, backend.Name(), "ok", result.Usage)
 	_ = s.record(r.Context(), audit.Record{
 		ID: id, Model: req.Model, Backend: backend.Name(), Streamed: true,
 		Prompt: promptText(req), Completion: result.Text,

@@ -57,7 +57,7 @@ certification. switchboard is software you run; the controls are yours.
 | Configuration is validated before use | SOC 2 CC8.1 · NIST CM-3 | ✅ | The whole config is validated at load, before the listener opens. Unknown fields are rejected rather than ignored, so a misspelled key fails in front of whoever typed it instead of silently widening behaviour. |
 | Insecure combinations are refused | SOC 2 CC8.1 | ✅ | Content logging without redaction rules, and `require_caller` without attribution, are both refused at startup. |
 | Builds are reproducible and attributable | SOC 2 CC8.1 · SLSA · NIST SR-4 | ✅ | Tagged releases build from source in CI with pinned Go. Checksums and container images are signed with keyless cosign, so a signature identifies the workflow, repository and tag that produced the artifact and is recorded in a public transparency log. Every archive ships an SPDX SBOM. See [verifying.md](verifying.md). |
-| Dependencies are minimal and auditable | ISO 27001 A.8.30 | ✅ | Standard library plus the AWS SDK. `go.mod` is the whole list; token verification is in-tree rather than a JOSE dependency. |
+| Dependencies are minimal and auditable | ISO 27001 A.8.30 | ◐ | Standard library, the AWS SDK, and the OpenTelemetry SDK — the last added deliberately, since the destinations that matter ingest OTLP natively and a bespoke endpoint would have been ours to maintain forever. Token verification remains in-tree rather than a JOSE dependency. Every archive ships an SBOM. |
 
 ## Availability and operations
 
@@ -65,6 +65,7 @@ certification. switchboard is software you run; the controls are yours.
 |---|---|---|---|
 | Graceful shutdown without losing work | SOC 2 A1.1 | ✅ | Draining shutdown; local models are unloaded and their processes stopped. |
 | Health checking | SOC 2 A1.1 · NIST SI-4 | ✅ | `GET /health`, reporting a failing audit log as degraded in the body rather than as a failed probe. |
+| Aggregate visibility | SOC 2 CC7.2 · NIST AU-6 | ✅ | Completions, tokens, refusals and redaction counts exported over OTLP, attributed by team, model, backend and outcome. Deliberately not by user: a series per person is unbounded, and per-person questions belong to the audit log, which carries subject on every entry. |
 | Resource limits | SOC 2 A1.1 · NIST SC-5 · ATLAS AML.M0004 | ✅ | Per-team request rate, concurrency ceiling and token budget over a window, keyed on the caller identity attribution resolves. Refusals are 429 naming which limit was hit. Tokens are charged after a completion, so a team may overshoot by one request. |
 | Auditing cannot fail silently | SOC 2 CC7.2 · NIST AU-5 | ✅ | Write failures are counted and surfaced through `/health`. With `audit.required`, a completion that cannot be recorded is refused with 503 rather than served unrecorded. |
 | Failure is reported honestly | SOC 2 CC7.3 | ✅ | A mid-stream backend error becomes an error frame before `[DONE]` rather than a truncated response that reads as a short success. Backends that cannot forward tools refuse the request rather than silently dropping them. |

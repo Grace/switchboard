@@ -12,6 +12,7 @@ import (
 	"github.com/Grace/switchboard/internal/audit"
 	"github.com/Grace/switchboard/internal/config"
 	"github.com/Grace/switchboard/internal/server"
+	"github.com/Grace/switchboard/internal/telemetry"
 	"github.com/Grace/switchboard/internal/vault"
 )
 
@@ -50,7 +51,25 @@ func runServe(ctx context.Context, args []string) error {
 		logger.Printf("  (no models configured — see 'switchboard init')")
 	}
 
-	srv := server.New(reg, logger).WithAttribution(cfg.Teams, cfg.Attribution.RequireCaller)
+	meter, err := telemetry.New(ctx, cfg.Telemetry.Options(Version))
+	if err != nil {
+		return fmt.Errorf("telemetry: %w", err)
+	}
+	if meter != nil {
+		defer func() {
+			shutCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			if err := meter.Shutdown(shutCtx); err != nil {
+				logger.Printf("telemetry: flushing on shutdown: %v", err)
+			}
+		}()
+		logger.Printf("telemetry: exporting to %s every %s",
+			cfg.Telemetry.Endpoint, time.Duration(cfg.Telemetry.Interval))
+	}
+
+	srv := server.New(reg, logger).
+		WithAttribution(cfg.Teams, cfg.Attribution.RequireCaller).
+		WithMetrics(meter)
 
 	if lim := cfg.Limiter(); lim != nil {
 		srv = srv.WithLimits(lim)
@@ -85,6 +104,9 @@ func runServe(ctx context.Context, args []string) error {
 			return fmt.Errorf("audit log: %w", err)
 		}
 		lg = lg.WithPolicy(cfg.PolicyFingerprint())
+		// Redaction counts reach the aggregate view without anything reading
+		// the log: the count travels, the value never does.
+		lg = lg.WithObserver(func(counts map[string]int) { meter.Redacted(ctx, counts) })
 		lg = lg.WithRotation(audit.Rotation{
 			MaxBytes:       cfg.Audit.MaxBytes,
 			Retention:      time.Duration(cfg.Audit.Retention),
