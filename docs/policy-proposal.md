@@ -63,22 +63,44 @@ bundle from fourteen months ago is in nobody's artifact store.
 be.** The front page says *an LLM gateway that can prove what happened*. That
 settles it.
 
-### What to build
+### What to build: CEL, via cel-go
 
-A small expression language, evaluated in-process: identifiers from a fixed
-typed table, string, integer, float and boolean literals, comparison, boolean
-composition, parentheses, membership in a literal list. Recursive descent and a
-lookup table, on the order of 450 lines with a type checker.
+Evaluate in-process, using [cel-go](https://github.com/google/cel-go).
 
-Termination is a property of the grammar rather than a promise — no loops, no
-calls, no recursion, nothing to bound. Type checking is a table lookup, because
-the variables are known in advance. No dependency, so `go.mod` stays the
-standard library and the AWS SDK.
+An earlier version of this proposal argued for a hand-written expression
+language — a fixed typed variable table, comparison and boolean composition,
+roughly 450 lines — on the grounds that it added no dependency. Two things
+changed.
 
-The learning cost is real and should not be waved away. It is a comparison
-grammar rather than a language: a reader who has written a spreadsheet formula
-can read one of these rules. That is the price of the audit story being
-complete, and it is worth naming as a price.
+**The audit argument never distinguished the two.** It argued in-process against
+external. A CEL expression in the configuration is covered by the fingerprint,
+deterministic, and replayable from this system's own records exactly as a
+bespoke grammar would be. That criterion is neutral here.
+
+**And the learning-cost argument runs the other way.** A new language is a cost
+to whoever adopts this — which is a heavier objection to a grammar *nobody*
+knows than to CEL, which people meet in Kubernetes admission policy, Envoy and
+gRPC authorization. A bespoke expression language is the worst case of that
+objection rather than an escape from it.
+
+The remaining argument was the dependency, and the OpenTelemetry SDK has since
+brought protobuf into the tree, so cel-go is no longer a new dependency family.
+Writing a parser, a type checker and an evaluator to avoid something already
+present is not a trade worth making — particularly when the failure mode of
+getting it wrong is a rule that silently never fires.
+
+What cel-go gives that is worth having: compilation and type-checking at load,
+so a malformed or ill-typed expression is a startup error under the same
+contract as the rest of the configuration; guaranteed termination, since CEL is
+not Turing-complete; and a cost model, so an expensive expression is refused
+rather than discovered under load.
+
+### Boundaries still apply
+
+CEL is larger than these conditions need, and an environment can be narrower
+than the language. Declare only the variables below, and no extension
+functions — no regex, since that is a content filter arriving through a side
+door, and nothing that reaches outside the request.
 
 **A rule that silently never fires looks exactly like a rule that is working**,
 which is the same failure as a redaction rule that never matches. So this ships
@@ -90,18 +112,6 @@ $ switchboard policy check -team research -model claude-opus
   opus-business-hours           no      (time.hour_utc is 14)
   large-requests-need-a-person  no      (max_tokens unset)
 ```
-
-### Boundaries, written down before starting
-
-This grows into a language one reasonable request at a time, so:
-
-- **No function calls.** Not even `startsWith`.
-- **No arithmetic.** Compare values, do not compute them.
-- **No regex.** That is a content filter arriving through a side door.
-- **No collection operations** beyond membership in a literal list.
-
-Past that boundary the condition belongs in code. And it is **not CEL** — a
-subset wearing that name promises semantics it does not have.
 
 ## OPA, as a documented integration
 
@@ -243,16 +253,16 @@ usually a separate process or a much larger embed, and Rego is a language a
 platform team has to learn. CEL expressions read like the conditions they
 replace.
 
-**Embedding cel-go** — the first version of this proposal assumed it. It is the
-right choice for something that needs CEL's semantics, and it costs both a
-dependency and a language the buyer may not want. Half of them already have a
-different one.
+**A hand-written expression language** — argued for in an earlier version, on
+the grounds that it added no dependency. It loses now that protobuf is already
+in the tree, and it always lost on learning cost: a grammar nobody knows is a
+worse answer to "customers must learn a new language" than one they have met in
+Kubernetes.
 
-**An external decision point as the primary mechanism** — the third version of
-this proposal argued for it, on adoption grounds that are correct as far as they
-go. It loses on the criterion that decides this: policy living elsewhere means a
-decision cannot be reconstructed from this system's records. It survives as an
-integration, above.
+**An external decision point as the primary mechanism** — argued for in another
+version, on adoption grounds that are correct as far as they go. It loses on the
+criterion that decides this: policy living elsewhere means a decision cannot be
+reconstructed from this system's records. It survives as an integration, above.
 
 **Embedding OPA as a library** — possible, and a very large dependency: it
 brings the Rego compiler and runtime into the process. Calling a sidecar gets

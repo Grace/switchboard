@@ -217,7 +217,13 @@ func (c *Config) Validate() error {
 	if err := c.Vault.validate(c.Redaction, c.Audit); err != nil {
 		return err
 	}
-	return c.validateIO()
+	if err := c.validateIO(); err != nil {
+		return err
+	}
+	// Last, deliberately. A profile asserts obligations over a configuration
+	// that already has to make sense on its own terms, and "audit.enabled
+	// requires audit.path" is a more useful first error than a citation.
+	return c.Profile.validate(c)
 }
 
 // Save writes the config, creating the parent directory if needed.

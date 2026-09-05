@@ -22,6 +22,7 @@ import (
 // a field here is a decision to make, not a mechanical step.
 
 type policyView struct {
+	Profile     Profile     `json:"profile"`
 	Models      []Line      `json:"models"`
 	Default     string      `json:"default_model"`
 	Attribution Attribution `json:"attribution"`
@@ -67,6 +68,7 @@ func (c *Config) PolicyFingerprint() string {
 	}
 
 	v := policyView{
+		Profile:     c.Profile,
 		Models:      c.Models,
 		Default:     c.DefaultModel,
 		Attribution: c.Attribution,
