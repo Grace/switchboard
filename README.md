@@ -1,19 +1,50 @@
 # switchboard
 
-**An LLM gateway for environments where the model provider is not your choice to make.**
+**An LLM gateway that can prove what happened.**
 
-One OpenAI-compatible endpoint in front of models running on your own hardware and models running in your own AWS account. Callers ask for a model by name; switchboard decides whether that means a `llama.cpp` process on this laptop or Bedrock in `us-east-1`. Nothing on the client side changes when the answer changes.
+One OpenAI-compatible endpoint in front of Bedrock and on-device models — with
+per-team cost attribution the provider's own bill agrees with, redaction at a
+point no application can bypass, and a tamper-evident record of every
+completion.
 
 ```
 client ──▶ /v1/chat/completions ──▶ registry ──┬──▶ local   (llama.cpp, on-device)
              OpenAI dialect                    └──▶ bedrock (AWS Converse API)
+                     │
+                     └──▶ attribution · redaction · limits · audit
 ```
 
 ## Why
 
-Most teams that adopt an LLM discover the same constraint in the same order: the data cannot leave the network, the provider is chosen by someone else, and the choice changes. That points at a gateway — a layer that owns provider selection, keeps request and response under your control, and gives every internal caller one stable interface to build against.
+Routing is the easy half. Every gateway does it, and if that is all you need,
+several mature ones will do it better than this one.
 
-switchboard is a small, readable implementation of that shape. It runs on a laptop with no cloud account at all, and it runs against Bedrock with an instance role, using the same config file and the same API.
+The half that is hard to buy is being able to answer, afterwards, what your
+models were asked to do and on whose behalf — in a form that survives someone
+disputing it.
+
+**Attribution the provider's bill agrees with.** A gateway calls Bedrock under
+one role, so every team's spend arrives on the invoice as a single identity —
+the gateway erased exactly the distinction finance needs. switchboard assumes a
+role per caller, so the split is one AWS itself confirms rather than a number
+from your own ledger that someone has to trust.
+
+**Redaction somewhere it cannot be skipped.** The usual advice is to mask in
+each application before telemetry leaves. That is correct only if every team
+configured it, configured it right, and has not regressed it — and nobody can
+demonstrate that to an auditor. A gateway cannot be bypassed, which is what
+makes redaction here a control rather than a convention.
+
+**A record where editing an entry is detectable.** An append-only file is a
+history right up until someone with disk access decides otherwise. Every entry
+carries the digest of the one before it, across rotated segments, and the chain
+is walked at startup — the window when the process is down being exactly when a
+file would be edited.
+
+And it still runs on a laptop with no cloud account at all, against a local
+`llama.cpp` model, using the same config file and the same API. That is not a
+second product; it is the same binary in a network where no provider is
+reachable either.
 
 ## Quickstart
 
