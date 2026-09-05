@@ -183,3 +183,53 @@ func TestRedactionBuildsWhatItDeclares(t *testing.T) {
 		t.Error("no rules should report empty")
 	}
 }
+
+// --- tls -----------------------------------------------------------------
+
+// Binding a plaintext listener to a public address is a decision, not a
+// default, and it should be named at config load rather than at incident.
+func TestPlaintextOnAPublicBindIsRefused(t *testing.T) {
+	for _, addr := range []string{"0.0.0.0:11435", "10.0.0.5:11435", "[::]:11435"} {
+		c := base()
+		c.Listen = addr
+		if err := c.Validate(); err == nil {
+			t.Errorf("listen %q with no TLS must be refused", addr)
+		}
+	}
+}
+
+func TestLoopbackWithoutTLSIsFine(t *testing.T) {
+	for _, addr := range []string{"127.0.0.1:11435", "localhost:11435", "[::1]:11435", "127.0.0.5:8080"} {
+		c := base()
+		c.Listen = addr
+		if err := c.Validate(); err != nil {
+			t.Errorf("listen %q should be allowed behind a terminator: %v", addr, err)
+		}
+	}
+}
+
+func TestMutualTLSNeedsTLS(t *testing.T) {
+	c := base()
+	c.TLS = TLS{ClientCAFile: "/etc/ca.pem"}
+	if err := c.Validate(); err == nil {
+		t.Fatal("a client CA without a server certificate must be refused")
+	}
+}
+
+func TestTLSFilesMustExist(t *testing.T) {
+	c := base()
+	c.Listen = "0.0.0.0:11435"
+	c.TLS = TLS{CertFile: "/nonexistent/x.crt", KeyFile: "/nonexistent/x.key"}
+	if err := c.Validate(); err == nil {
+		t.Fatal("missing certificate files must be refused at load, not at bind")
+	}
+}
+
+func TestTLSHalfConfiguredIsRefused(t *testing.T) {
+	c := base()
+	c.Listen = "0.0.0.0:11435"
+	c.TLS = TLS{CertFile: "/tmp/only.crt"}
+	if err := c.Validate(); err == nil {
+		t.Fatal("a certificate without a key must be refused")
+	}
+}

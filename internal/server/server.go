@@ -764,16 +764,39 @@ func writeError(w http.ResponseWriter, status int, kind, message string) {
 // ListenAndServe runs the server until ctx is cancelled, then drains in-flight
 // requests before returning.
 func (s *Server) ListenAndServe(ctx context.Context, addr string) error {
+	return s.listenAndServe(ctx, addr, TLS{})
+}
+
+// ListenAndServeTLS serves over TLS, optionally requiring client certificates.
+func (s *Server) ListenAndServeTLS(ctx context.Context, addr string, t TLS) error {
+	return s.listenAndServe(ctx, addr, t)
+}
+
+func (s *Server) listenAndServe(ctx context.Context, addr string, t TLS) error {
+	tlsCfg, err := t.config()
+	if err != nil {
+		return err
+	}
+
 	srv := &http.Server{
 		Addr:    addr,
 		Handler: s.Handler(),
 		// No write timeout: a long generation is a long response, and cutting
 		// it off mid-stream is worse than an idle connection.
 		ReadHeaderTimeout: 15 * time.Second,
+		TLSConfig:         tlsCfg,
 	}
 
 	errc := make(chan error, 1)
-	go func() { errc <- srv.ListenAndServe() }()
+	go func() {
+		if tlsCfg != nil {
+			// Paths are already in TLSConfig; passing them again would reload
+			// and could pick up a different file.
+			errc <- srv.ListenAndServeTLS("", "")
+			return
+		}
+		errc <- srv.ListenAndServe()
+	}()
 
 	select {
 	case err := <-errc:

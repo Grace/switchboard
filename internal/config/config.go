@@ -74,6 +74,8 @@ type Config struct {
 	Vault Vault `json:"vault,omitempty"`
 	// Limits bounds what callers may consume.
 	Limits Limits `json:"limits,omitempty"`
+	// TLS secures the listener itself.
+	TLS TLS `json:"tls,omitempty"`
 	// Teams are the attribution units and their API keys.
 	Teams []Team `json:"teams,omitempty"`
 	// OIDC trusts an identity provider instead of shared keys.
@@ -188,10 +190,23 @@ func (c *Config) Validate() error {
 	default:
 		return fmt.Errorf("local.device %q: want auto, metal, cuda, or cpu", c.Local.Device)
 	}
+	// Each concern validates explicitly and unconditionally. An earlier version
+	// hung several of these off validateIO, which returns early when auditing
+	// is disabled — so limits, TLS and vault checks silently never ran for
+	// anyone who had not turned auditing on.
 	if err := c.Attribution.validate(c.Teams, c.OIDC.Enabled); err != nil {
 		return err
 	}
 	if err := c.OIDC.validate(c.Teams); err != nil {
+		return err
+	}
+	if err := c.Limits.validate(c.Teams); err != nil {
+		return err
+	}
+	if err := c.TLS.validate(c.Listen); err != nil {
+		return err
+	}
+	if err := c.Vault.validate(c.Redaction, c.Audit); err != nil {
 		return err
 	}
 	return c.validateIO()

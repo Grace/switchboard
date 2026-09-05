@@ -136,6 +136,8 @@ AWS credentials come from the standard chain — environment, shared config, SSO
 
 Working: routing, both backends, streaming and non-streaming completions, tool calling on the local backend, token usage accounting, model lifecycle, graceful drain on shutdown. The HTTP surface and the tool-translation layer are covered by tests.
 
+**TLS, and mutual TLS.** The listener speaks TLS 1.2+ given a certificate, and requires a verified client certificate given a CA. A plaintext listener bound to anything but loopback is refused at config load — "assume something terminates in front of it" is not an assumption worth making silently.
+
 **SSO.** Callers can present an OIDC token instead of a shared key, so the audit log records a person rather than a credential. Verification is a deliberately narrow implementation over the standard library — RS256/ES256, verification only — with the algorithm chosen from the key rather than the token, and an adversarial test suite that constructs each classic attack and asserts it is refused. See [docs/sso.md](docs/sso.md).
 
 **Recovery for an investigation.** Redacted values can be sealed to a public key the gateway does not hold the private half of, so an incident can recover the address an injected instruction was exfiltrating to — the one string redaction removes and an investigator most needs. The gateway cannot read back what it wrote; recovery runs where the private key lives. Off unless configured, because it changes what the system retains. See [docs/redaction.md](docs/redaction.md).

@@ -20,6 +20,7 @@ certification. switchboard is software you run; the controls are yours.
 
 | Objective | Frameworks | Status | Evidence |
 |---|---|---|---|
+| Mutual authentication at the transport | SOC 2 CC6.1 · NIST IA-3 | ✅ | `tls.client_ca_file` requires a client certificate signed by that authority, verified rather than merely required. A certificate says which machine; a token says which person. They compose. |
 | Callers are authenticated before use | SOC 2 CC6.1 · ISO 27001 A.5.15 · HIPAA §164.312(d) · NIST AC-2 | ✅ | OIDC tokens from a configured issuer, or per-team API keys compared in constant time. Tokens expire on their own; the team they name must be on the roster. See [sso.md](sso.md). |
 | Unauthenticated access is denied | SOC 2 CC6.1 · NIST AC-3 | ✅ | `attribution.require_caller` returns 401 for requests presenting no valid key. Off by default; on, it fails closed. |
 | Least privilege for provider credentials | SOC 2 CC6.3 · NIST AC-6 | ✅ | The gateway assumes a per-caller role; the Bedrock permissions live on the assumed role, not the gateway's own. Trust policy scope is yours to set. |
@@ -45,7 +46,7 @@ certification. switchboard is software you run; the controls are yours.
 | Data does not leave the trust boundary | SOC 2 CC6.6 · HIPAA §164.312(e) | ✅ | Self-hosted, single static binary. Talks only to the providers you configure. No telemetry, no phone-home, no vendor in the path. |
 | Data can be kept in-region or on-premises | ISO 27001 A.5.34 · FedRAMP SA-9 | ✅ | Bedrock region is configured; the local backend serves models on the host with no cloud dependency at all, for networks where no provider is reachable. |
 | Redaction toward the provider | ISO 27001 A.8.11 | ❌ | Content is redacted before it is logged. It still reaches the model as written. |
-| Encryption in transit | SOC 2 CC6.7 · HIPAA §164.312(e)(1) | ◐ | Provider calls use the SDK's TLS. **The gateway's own listener is plain HTTP** and expects to sit behind a TLS terminator; it binds loopback by default. |
+| Encryption in transit | SOC 2 CC6.7 · HIPAA §164.312(e)(1) · NIST SC-8 | ✅ | Provider calls use the SDK's TLS. The listener serves TLS 1.2+ when `tls.cert_file` and `tls.key_file` are set, and a plaintext listener bound to anything but loopback is refused at config load rather than discovered later. |
 | Encryption at rest | HIPAA §164.312(a)(2)(iv) · NIST SC-28 | ◐ | Sealed values are encrypted with AES-256-GCM under RSA-OAEP-wrapped keys, to a public key the gateway holds no private half of. **The audit log itself is a 0600 file; encrypting it is the filesystem's job.** |
 
 ## Configuration and change management

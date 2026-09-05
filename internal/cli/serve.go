@@ -38,7 +38,11 @@ func runServe(ctx context.Context, args []string) error {
 
 	logger := log.New(os.Stderr, "switchboard: ", log.LstdFlags)
 	models := reg.Models(ctx)
-	logger.Printf("serving %d model(s) on http://%s", len(models), cfg.Listen)
+	proto := "http"
+	if cfg.TLS.CertFile != "" {
+		proto = "https"
+	}
+	logger.Printf("serving %d model(s) on %s://%s", len(models), proto, cfg.Listen)
 	for _, m := range models {
 		logger.Printf("  %-24s %s", m.Name, m.Backend)
 	}
@@ -136,7 +140,13 @@ func runServe(ctx context.Context, args []string) error {
 		srv = srv.WithAudit(lg, cfg.Audit.Required)
 	}
 
-	if err := srv.ListenAndServe(ctx, cfg.Listen); err != nil {
+	cert, key, clientCA := cfg.TLS.Paths()
+	if clientCA != "" {
+		logger.Printf("tls: mutual — callers must present a certificate signed by %s", clientCA)
+	}
+	tlsOpts := server.TLS{CertFile: cert, KeyFile: key, ClientCAFile: clientCA}
+
+	if err := srv.ListenAndServeTLS(ctx, cfg.Listen, tlsOpts); err != nil {
 		return fmt.Errorf("serve: %w", err)
 	}
 	logger.Printf("shut down")
