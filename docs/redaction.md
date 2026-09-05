@@ -186,6 +186,11 @@ be the same person who administers the gateway.
   all of it. That is what makes an incident reconstructable from a single
   entry, and it means a twenty-turn conversation writes its history twenty
   times. Fine for ordinary traffic; watch it for long agent loops.
+- **Per-person questions have three answers, and they differ.** The audit log
+  carries `subject` on every entry always, which is where an investigation that
+  needs proof goes. Traces carry it only with `telemetry.include_subject`,
+  which is where an investigation that needs speed goes. Metrics never carry it,
+  because a series per person has no upper bound.
 - **A caller's trace context is adopted when sent.** A request arriving with a
   W3C `traceparent` has its trace and span ids recorded on the entry, so an
   investigation can move between the caller's own traces and this log without
