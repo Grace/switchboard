@@ -50,6 +50,7 @@ commands:
   redact     check redaction rules against text on stdin
   audit      verify the audit chain, or reconstruct one decision
   controls   assess this config against the control objectives a review asks about
+  evidence   package a period of the log for someone who does not trust you
   version    print the version
 
 run "switchboard <command> -h" for a command's flags.
@@ -82,6 +83,8 @@ func Main(ctx context.Context, args []string) int {
 		err = runAudit(ctx, args[1:])
 	case "controls":
 		err = runControls(ctx, args[1:])
+	case "evidence":
+		err = runEvidence(ctx, args[1:])
 	case "version":
 		fmt.Println(versionString())
 	case "-h", "--help", "help":
