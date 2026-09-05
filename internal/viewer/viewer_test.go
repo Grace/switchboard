@@ -1,6 +1,7 @@
 package viewer
 
 import (
+	"bytes"
 	"io"
 	"net/http"
 	"os"
@@ -213,5 +214,29 @@ func TestReadOnly(t *testing.T) {
 	after, _ := os.ReadFile(path)
 	if string(before) != string(after) {
 		t.Error("the log changed; this must never write")
+	}
+}
+
+// A file has no server. Any element that looks clickable and does nothing is
+// worse than one that never looked clickable, and an auditor clicking through
+// an evidence package is exactly who would find out.
+func TestStaticFileHasNothingThatNavigates(t *testing.T) {
+	log := demoLog(t, true)
+	out := t.TempDir() + "/report.html"
+	if _, err := WriteFile(out, log, nil, Prices{}); err != nil {
+		t.Fatal(err)
+	}
+	body, err := os.ReadFile(out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n := bytes.Count(body, []byte(`href="?`)); n != 0 {
+		t.Errorf("%d filter links survive in the static file", n)
+	}
+	// And it must stay self-contained: no script, no remote reference.
+	for _, bad := range []string{"<script", "http://", "https://"} {
+		if bytes.Contains(bytes.ToLower(body), []byte(bad)) {
+			t.Errorf("static report contains %q", bad)
+		}
 	}
 }

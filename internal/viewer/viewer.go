@@ -53,6 +53,14 @@ type Summary struct {
 	Query  Query
 	Prices Prices
 	Flow   *Flow
+	// Timeline is the activity of the window with the policy changes marked.
+	// Nil when there is too little to draw.
+	Timeline *Timeline
+	// Static is set when this is being written to a file rather than served.
+	// A file has no server behind it, so anything that navigates has to be
+	// suppressed: a link an auditor clicks and nothing happens is worse than
+	// no link.
+	Static bool
 
 	Teams      []TeamRow
 	Models     []ModelRow
@@ -177,6 +185,7 @@ func Summarise(path string, key []byte, q Query, prices Prices) (*Summary, error
 	unpriced := map[string]bool{}
 	tools := map[string]*ToolRow{}
 	flow := NewFlow(q, prices)
+	var tl timelineAcc
 
 	err = audit.Walk(path, func(r audit.Record) error {
 		s.Entries++
@@ -185,6 +194,7 @@ func Summarise(path string, key []byte, q Query, prices Prices) (*Summary, error
 		}
 		s.Matched++
 		flow.Add(r)
+		tl.add(r.Time, r.Policy, r.Error != "")
 
 		tk := tokensOf(r)
 		cost, priced := prices.Cost(r.Model, tk)
@@ -355,6 +365,7 @@ func Summarise(path string, key []byte, q Query, prices Prices) (*Summary, error
 	for i, j := 0, len(s.Recent)-1; i < j; i, j = i+1, j-1 {
 		s.Recent[i], s.Recent[j] = s.Recent[j], s.Recent[i]
 	}
+	s.Timeline = tl.build()
 	return s, nil
 }
 

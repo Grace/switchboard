@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"regexp"
 	"strings"
 )
 
@@ -77,6 +78,7 @@ func commas(n int) string {
 }
 
 var page = template.Must(template.New("page").Funcs(template.FuncMap{
+	"inc":    func(i int) int { return i + 1 },
 	"commas": commas,
 	"short": func(s string) string {
 		if len(s) > 12 {
@@ -149,6 +151,19 @@ var page = template.Must(template.New("page").Funcs(template.FuncMap{
 
   /* KPI row. A handful of headline numbers is a row of tiles, not a chart. */
   .tiles { display:grid; grid-template-columns:repeat(auto-fit,minmax(9.5rem,1fr)); gap:.6rem; margin:0 0 1.4rem; }
+  .tlwrap { margin:1.1rem 0 .3rem; }
+  .tl { width:100%; height:auto; display:block; }
+  .tlbar { fill: var(--ink); opacity:.30; }
+  .tlbar:hover { opacity:.70; }
+  .tlerr { fill:#b3261e; opacity:.85; }
+  .tlaxis { stroke: var(--line); stroke-width:1; }
+  .tlchange { stroke: var(--ink); stroke-width:1; stroke-dasharray:2 3; opacity:.55; }
+  .tlflag { fill: var(--surface); stroke: var(--ink); stroke-width:1.2; }
+  .tlflagn { font:600 8px system-ui, sans-serif; fill: var(--ink); text-anchor:middle; }
+  .tltick { font:400 10px ui-monospace, SFMono-Regular, Menlo, monospace; fill: var(--muted); }
+  .tlright { text-anchor:end; }
+  .tlkey { font-size:.76rem; color:var(--dim); margin:.15rem 0 0; }
+  .tlkey b { font-weight:600; color:var(--ink); }
   .tile { border:1px solid var(--line); padding:.55rem .7rem; }
   .tile .k { font-size:.72rem; text-transform:uppercase; letter-spacing:.06em; color:var(--muted); }
   .tile .v { font: 600 1.35rem/1.25 system-ui, -apple-system, "Segoe UI", sans-serif; }
@@ -202,7 +217,7 @@ everything.</p>
 <div class="filters">
 {{if .Filtered}}
   {{range .Query.Chips}}<span class="chip"><b>{{.Label}}</b> {{.Value}} <a href="{{.Clear}}" title="remove this filter">✕</a></span>{{end}}
-  <a class="clear" href="?">clear all</a>
+  {{if not .Static}}<a class="clear" href="?">clear all</a>{{end}}
   <span class="clear">· {{commas .Matched}} of {{commas .Entries}} entries</span>
 {{else}}
   <span class="clear">No filter — showing all {{commas .Entries}} entries. Click anything on the diagram to narrow.</span>
@@ -226,6 +241,19 @@ everything.</p>
   <div class="tile"><div class="k">policies</div><div class="v">{{len .Policies}}</div>
     <div class="s">{{if gt (len .Policies) 1}}<span class="bad">rules changed</span>{{else}}one set of rules{{end}}</div></div>
 </div>
+
+{{with .Timeline}}
+<div class="tlwrap">
+  {{.SVG}}
+  {{if .Changes}}
+  <p class="tlkey">Dashed marks are points where the decision-affecting configuration changed.
+  Entries either side of one were decided under different rules.
+  {{range $i, $c := .Changes}}<br><b>{{inc $i}}</b> {{$c.At.Format "2006-01-02 15:04"}} — {{$c.From}} → {{$c.To}}{{end}}</p>
+  {{else}}
+  <p class="tlkey">One set of rules in force across the whole window.</p>
+  {{end}}
+</div>
+{{end}}
 
 {{if and .Priced .UnpricedModels}}
 <div class="banner"><strong class="bad">{{commas .UnpricedRequests}} requests are unpriced</strong> —
@@ -344,7 +372,7 @@ at least one model in that row has no configured rate, so the row would understa
 <h2>Policy in force</h2>
 <table>
 <tr><th>fingerprint</th><th class="n">entries</th><th>from</th><th>to</th></tr>
-{{range .Policies}}<tr class="row"><td><a href="{{($.Query.With "policy" .Fingerprint).Encode}}">{{.Fingerprint}}</a></td>
+{{range .Policies}}<tr class="row"><td>{{if $.Static}}{{.Fingerprint}}{{else}}<a href="{{($.Query.With "policy" .Fingerprint).Encode}}">{{.Fingerprint}}</a>{{end}}</td>
 <td class="n">{{commas .Entries}}</td>
 <td>{{stamp .From}}</td><td>{{stamp .To}}</td></tr>{{end}}
 </table>
@@ -429,6 +457,39 @@ func Render(w io.Writer, path string, key []byte, q Query, prices Prices) (*Summ
 	return s, nil
 }
 
+// query links are the filter navigation: href="?team=x" and friends. They are
+// generated in the template and in the flow diagram, and both are right to do
+// so when something is serving. In a file they are a lie — a reader clicks and
+// nothing happens, which is worse than an element that never looked clickable.
+//
+// Stripping the attribute rather than the element leaves the anchor in place
+// as plain text, so the layout is identical and the page is not re-authored
+// for the static case. Anchored to href="? so it can only ever match the
+// filter links, never a real destination.
+var queryLink = regexp.MustCompile(`\s*href="\?[^"]*"`)
+
+func inert(b []byte) []byte { return queryLink.ReplaceAll(b, nil) }
+
+// RenderStatic writes the page as a standalone file rather than as a served
+// response: filter navigation is removed, because there will be nothing behind
+// it. Both file-producing paths go through here so neither can drift into
+// shipping links that do nothing.
+func RenderStatic(w io.Writer, path string, key []byte, q Query, prices Prices) (*Summary, error) {
+	s, err := Summarise(path, key, q, prices)
+	if err != nil {
+		return nil, err
+	}
+	s.Static = true
+	var buf bytes.Buffer
+	if err := page.Execute(&buf, s); err != nil {
+		return nil, err
+	}
+	if _, err := w.Write(inert(buf.Bytes())); err != nil {
+		return nil, err
+	}
+	return s, nil
+}
+
 // WriteFile renders the whole log to a self-contained HTML file and returns the
 // number of bytes written.
 //
@@ -437,14 +498,15 @@ func Render(w io.Writer, path string, key []byte, q Query, prices Prices) (*Summ
 // never heard of switchboard.
 func WriteFile(out, path string, key []byte, prices Prices) (int, error) {
 	var buf bytes.Buffer
-	if _, err := Render(&buf, path, key, Query{}, prices); err != nil {
+	if _, err := RenderStatic(&buf, path, key, Query{}, prices); err != nil {
 		return 0, err
 	}
+	body := buf.Bytes()
 	// 0600: it carries spend, identities and — where content logging is on —
 	// redacted prompts. The serving path refuses to bind a public interface for
 	// the same reason; the file form should not be laxer than the page it is.
-	if err := os.WriteFile(out, buf.Bytes(), 0o600); err != nil {
+	if err := os.WriteFile(out, body, 0o600); err != nil {
 		return 0, err
 	}
-	return buf.Len(), nil
+	return len(body), nil
 }

@@ -218,7 +218,8 @@ func Build(o Options) (*Result, error) {
 	// The page, filtered to the period, rendered by the same code that serves it.
 	var report bytes.Buffer
 	q := viewer.Query{}.Between(o.Period.From, o.Period.To)
-	if _, err := viewer.Render(&report, o.LogPath, o.Key, q, o.Prices); err != nil {
+	// Static: this page goes in a package, and a package has no server.
+	if _, err := viewer.RenderStatic(&report, o.LogPath, o.Key, q, o.Prices); err != nil {
 		return nil, err
 	}
 
