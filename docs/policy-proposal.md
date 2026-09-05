@@ -28,58 +28,71 @@ its input, forward-chaining makes rule interaction hard to predict, and the
 claim that this is a reference monitor small enough to read stops being true.
 Trading that away for expressiveness would cost more than it buys.
 
-## Why an expression language, and why a small one
+## Do not embed a language. Ask something that already has one.
 
-[CEL](https://cel.dev) is the well-known answer: compiled and type-checked
-ahead of evaluation, not Turing-complete, cost-modelled, and already accepted by
-security reviewers because Kubernetes admission control uses it.
+The obvious candidates are CEL and Rego, and the argument between them misses
+what actually decides adoption: **any policy language is a learning cost for the
+buyer**, and that cost is not evenly distributed.
 
-But look at what the conditions above actually need. Identifiers drawn from a
-**fixed, typed table**. String, integer, float and boolean literals. Comparison.
-Boolean composition. Parentheses. That is a recursive-descent parser and a
-lookup table — on the order of 450 lines with a type checker, against cel-go's
-fifty thousand, because CEL carries protobuf types, macros, comprehensions and a
-general type system that none of this uses.
+Rego is what a great many platform teams already run — OPA is the de facto
+standard for policy-as-code, and a shop with an OPA sidecar has the language,
+the tooling, `opa test`, the CI integration and the reviewers already. For them
+Rego is free and everything else is a new thing to learn.
 
-Termination is not a promise here, it is a property of the grammar: no loops, no
-function calls, no recursion, nothing to bound. Type checking is a table lookup
-rather than inference, because the variables are known in advance.
+For a shop *without* OPA, Rego is the most expensive of the options rather than
+the least: it is datalog-derived, its partial-evaluation semantics are
+famously unobvious, and it is the hardest of the three to pick up.
 
-So the same argument that put JWT verification in-tree applies, with one
-difference worth being precise about.
+That cost is bimodal, which is the tell. **Any choice of embedded language is
+wrong for half the market**, so this should not choose one.
 
-**The failure mode is not the same.** A wrong JWT verifier accepts forged
-tokens: loud, and testable by constructing each attack. A wrong expression
-evaluator produces **a rule that silently never fires** — nothing errors, the
-policy looks enforced, and it is not. That is the redaction-rule failure again,
-and it has the same answer:
-
-```
-$ switchboard policy test -team research -model claude-opus
-  research-stays-on-device      FIRES   → PROVIDER_NOT_PERMITTED
-  opus-business-hours           no      (time.hour_utc is 14)
-  large-requests-need-a-person  no      (max_tokens unset)
+```json
+{
+  "policy": {
+    "enabled": true,
+    "endpoint": "http://127.0.0.1:8181/v1/data/switchboard/admission",
+    "timeout": "50ms",
+    "fail": "closed"
+  }
+}
 ```
 
-**Without that command, this should not be built.** With it, a rule that never
-fires is visible in one command rather than never.
+switchboard posts a metadata document and reads a decision back. The path shape
+is OPA's data API, so a team with an OPA sidecar points at it and writes Rego
+they already know. A team without one writes nothing and keeps static
+configuration. A team that wants CEL puts a CEL service behind the same
+interface. switchboard learns no language, gains no dependency — this is an HTTP
+POST with `net/http` — and stays a thing you can read.
 
-### Boundaries, written down before starting
+### The trade, stated plainly
 
-This is the kind of thing that grows into a language one reasonable request at a
-time, so:
+This costs the property most of the rest of this design rests on: that you can
+read the configuration and know what the gateway will do. Policy now lives
+somewhere else, in something else's language.
 
-- **No function calls.** Not even `startsWith`.
-- **No arithmetic.** Compare values, do not compute them.
-- **No regex.** That is a content filter arriving through a side door.
-- **No collection operations** beyond membership in a literal list.
+That is a real regression and it should be the operator's decision rather than
+one made for them. So:
 
-Anything past that boundary is a signal the condition belongs in code, not in
-configuration.
+- It is **off by default**. Static configuration remains the whole story unless
+  someone turns this on.
+- `fail: "closed"` is the default. An unreachable decision point refuses
+  requests rather than admitting them, because a policy layer that fails open is
+  worse than none — it is the appearance of enforcement.
+- The **timeout is bounded and short**. A slow decision point becomes a refusal,
+  not a slow gateway.
+- The policy fingerprint records the endpoint and whatever version the decision
+  point reports, so "which rules were in force" stays answerable.
 
-**And it is not CEL.** A subset wearing that name promises semantics it does not
-have, which is the same species of overclaim as "tamper-proof". It is a
-condition expression, and the documentation should say exactly what it accepts.
+### What it does not change
+
+The decision point sees the same metadata document described below and **never
+prompt content**. Moving policy out of the process does not move that line.
+
+Its answer is still **deny-only**: it may refuse a request static configuration
+would have allowed, and may not grant one static configuration refused. An
+external system cannot widen access, which keeps the monotonic property and
+means a compromised or misconfigured decision point can cause an outage but not
+an authorisation bypass.
 
 ## Shape
 
@@ -161,19 +174,26 @@ invisible in the log, which defeats the fingerprint's purpose.
 **Deny happens before the backend call**, so a refused request costs nothing and
 appears in the audit log with an outcome and no tokens.
 
-## The cost, stated plainly
+## What still has to be built
 
-Roughly 450 lines of parser, type checker and evaluator that have to be right,
-plus the test command without which a silent non-firing rule is undetectable.
-That is real work, and it is code this project would own forever.
+An HTTP client with a bounded timeout, a documented input document, fail-closed
+semantics, and the fingerprint carrying the endpoint. Small.
 
-What it does not cost is a dependency. `docs/controls.md` says under ISO 27001
-A.8.30 that go.mod is the standard library plus the AWS SDK, and that sentence
-has done real work here.
+And the thing without which none of it should ship: a way to see what a policy
+actually does before it is in the request path.
 
-Whether the expressiveness is worth it depends on whether anyone actually asks
-for these conditions. Nobody has yet. **This is written down rather than built
-for that reason** — not because the design is unresolved.
+```
+$ switchboard policy check -team research -model claude-opus
+  endpoint  http://127.0.0.1:8181/v1/data/switchboard/admission
+  decision  DENY → PROVIDER_NOT_PERMITTED   (14ms)
+```
+
+A policy that silently never denies looks exactly like a policy that is working.
+That failure is the same shape as a redaction rule that never matches, and it
+has the same answer: make it checkable in one command.
+
+Nobody has asked for any of this yet. **It is written down rather than built for
+that reason** — not because the design is unresolved.
 
 ## Alternatives considered
 
@@ -182,10 +202,21 @@ usually a separate process or a much larger embed, and Rego is a language a
 platform team has to learn. CEL expressions read like the conditions they
 replace.
 
-**cel-go** — the obvious dependency, and the one this proposal originally
-assumed. It is the right choice for anything needing CEL's semantics. Nothing
-here does, and it would cost the sentence under ISO 27001 A.8.30 that currently
-reads *standard library plus the AWS SDK* — a sentence that has done real work.
+**Embedding cel-go** — the first version of this proposal assumed it. It is the
+right choice for something that needs CEL's semantics, and it costs both a
+dependency and a language the buyer may not want. Half of them already have a
+different one.
+
+**Embedding a small hand-written expression language** — the second version of
+this proposal argued for it: a fixed typed variable table, comparison and
+boolean composition, roughly 450 lines, no dependency. It is a good design and
+it is still the wrong one, because it asks every buyer to learn a language that
+exists nowhere else, in exchange for saving the ones who already run OPA from
+using what they have.
+
+**Embedding OPA as a library** — possible, and a very large dependency: it
+brings the Rego compiler and runtime into the process. Calling a sidecar gets
+the same capability without it, and OPA is normally deployed that way anyway.
 
 **Leaving it static** — what exists today. The honest default until someone
 names a condition they cannot express.

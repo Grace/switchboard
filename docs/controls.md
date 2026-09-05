@@ -76,7 +76,7 @@ certification. switchboard is software you run; the controls are yours.
 | Objective | Reference | Status | Evidence |
 |---|---|---|---|
 | Automatic recording of events over the lifecycle | EU AI Act Art. 12 | ✅ | See Audit above. |
-| Deployer retains logs ≥6 months | EU AI Act Art. 26 | ❌ | Retention is not implemented. |
+| Deployer retains logs ≥6 months | EU AI Act Art. 26 | ◐ | Rotation, an archive hook, and retention that prunes only archived segments; startup warns when `audit.retention` is under the Article 26 floor or when no archive is configured. See Audit above. **The six months is yours to configure and yours to hold — switchboard warns, it does not enforce.** |
 | Policy enforcement at the model boundary | MITRE ATLAS AML.M0033 | ◐ | Team-scoped access and fail-closed configuration. No content policy or output filtering. |
 | Telemetry logging | MITRE ATLAS AML.M0024 | ✅ | The audit log. |
 | Limit model queries | MITRE ATLAS AML.M0004 | ✅ | Request rate, concurrency and token budgets per team. See [cost-attribution.md](cost-attribution.md). |
