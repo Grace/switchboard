@@ -137,7 +137,9 @@ func Default() *Config {
 
 // Load reads path, falling back to Default when the file does not exist. The
 // returned bool reports whether a file was actually found.
-func Load(path string) (*Config, bool, error) {
+func Load(path string) (*Config, bool, error) { return load(path, true) }
+
+func load(path string, checkProfile bool) (*Config, bool, error) {
 	data, err := os.ReadFile(path)
 	if os.IsNotExist(err) {
 		return Default(), false, nil
@@ -152,15 +154,27 @@ func Load(path string) (*Config, bool, error) {
 	if err := dec.Decode(cfg); err != nil {
 		return nil, true, fmt.Errorf("%s: %w", path, err)
 	}
-	if err := cfg.Validate(); err != nil {
+	if err := cfg.validate(checkProfile); err != nil {
 		return nil, true, fmt.Errorf("%s: %w", path, err)
 	}
 	return cfg, true, nil
 }
 
+// LoadForReport is Load without the profile assertion.
+//
+// A profile turns unmet obligations into load errors, which is right for
+// serving and wrong for reporting: the configuration you most want a control
+// report about is the one that does not yet satisfy its regime. This lets
+// `switchboard controls` render the gaps instead of refusing to open the file.
+func LoadForReport(path string) (*Config, bool, error) {
+	return load(path, false)
+}
+
 // Validate catches the config mistakes that would otherwise surface as a
 // confusing runtime error much later.
-func (c *Config) Validate() error {
+func (c *Config) Validate() error { return c.validate(true) }
+
+func (c *Config) validate(checkProfile bool) error {
 	seen := make(map[string]bool, len(c.Models))
 	for i, m := range c.Models {
 		switch {
@@ -223,6 +237,9 @@ func (c *Config) Validate() error {
 	// Last, deliberately. A profile asserts obligations over a configuration
 	// that already has to make sense on its own terms, and "audit.enabled
 	// requires audit.path" is a more useful first error than a citation.
+	if !checkProfile {
+		return nil
+	}
 	return c.Profile.validate(c)
 }
 
