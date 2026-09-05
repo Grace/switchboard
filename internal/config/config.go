@@ -77,6 +77,8 @@ type Config struct {
 	Vault Vault `json:"vault,omitempty"`
 	// Limits bounds what callers may consume.
 	Limits Limits `json:"limits,omitempty"`
+	// Pricing turns the token counts in the log into money. See pricing.go.
+	Pricing Pricing `json:"pricing,omitempty"`
 	// TLS secures the listener itself.
 	TLS TLS `json:"tls,omitempty"`
 	// Telemetry exports aggregates over OTLP.
@@ -222,6 +224,12 @@ func (c *Config) validate(checkProfile bool) error {
 	if err := c.Limits.validate(c.Teams); err != nil {
 		return err
 	}
+	// Rates are not checked against the model roster: a log outlives the
+	// configuration that produced it, and a price for a model retired last
+	// month is exactly what reading last month's entries needs.
+	if err := c.Pricing.validate(); err != nil {
+		return err
+	}
 	if err := c.TLS.validate(c.Listen); err != nil {
 		return err
 	}
@@ -240,7 +248,7 @@ func (c *Config) validate(checkProfile bool) error {
 	if !checkProfile {
 		return nil
 	}
-	return c.Profile.validate(c)
+	return validateProfile(c.Profile, c)
 }
 
 // Save writes the config, creating the parent directory if needed.

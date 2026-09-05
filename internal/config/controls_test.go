@@ -2,6 +2,7 @@ package config
 
 import (
 	"crypto/fips140"
+	"github.com/Grace/switchboard/internal/assess"
 	"strings"
 	"testing"
 	"time"
@@ -43,7 +44,7 @@ func TestControlsReportsAnEmptyConfigHonestly(t *testing.T) {
 		if strings.TrimSpace(c.Evidence) == "" {
 			t.Errorf("control %q has no evidence", c.Objective)
 		}
-		if strings.TrimSpace(c.Refs) == "" {
+		if len(c.Refs) == 0 {
 			t.Errorf("control %q cites no framework", c.Objective)
 		}
 	}
@@ -63,8 +64,8 @@ func TestControlsProfileTightensPersonIdentity(t *testing.T) {
 	if row.Status != StatusUnmet {
 		t.Errorf("hipaa should make a shared key unmet, got %q", row.Status)
 	}
-	if !strings.Contains(row.Refs, "164.312(d)") {
-		t.Errorf("row should cite the regime's authority, got %q", row.Refs)
+	if !strings.Contains(assess.Render(row.Refs, ""), "164.312(d)") {
+		t.Errorf("row should cite the regime's authority, got %v", row.Refs)
 	}
 }
 
@@ -218,12 +219,25 @@ func TestControlsSaysWhenARetentionFloorIsNotStatutory(t *testing.T) {
 	// overclaim this report exists to avoid.
 	c := compliant(t)
 	c.Profile = ProfileFedRAMP
-	if ev := find(t, c.Controls(), "Log retention").Evidence; !strings.Contains(ev, "not a statutory number") {
+	if ev := find(t, c.Controls(), "Log retention").Evidence; !strings.Contains(ev, "rather than a statutory number") {
 		t.Errorf("federal retention should be marked as a default, got %q", ev)
 	}
 
 	c.Profile = ProfileHIPAA
-	if ev := find(t, c.Controls(), "Log retention").Evidence; strings.Contains(ev, "not a statutory number") {
+	if ev := find(t, c.Controls(), "Log retention").Evidence; strings.Contains(ev, "rather than a statutory number") {
 		t.Errorf("HIPAA's floor is statutory and should not carry the caveat, got %q", ev)
+	}
+}
+
+func TestControlsSkipsProviderRowWithNoProvider(t *testing.T) {
+	// A finding nobody can act on teaches people to skim the report.
+	c := compliant(t)
+	if got := find(t, c.Controls(), "Least privilege").Status; got != StatusNotAddressed {
+		t.Errorf("local-only deployment, want not-addressed, got %q", got)
+	}
+
+	c.Models = []Line{{Name: "claude", Backend: BackendBedrock, ModelID: "anthropic.x"}}
+	if got := find(t, c.Controls(), "Least privilege").Status; got != StatusPartial {
+		t.Errorf("bedrock configured without attribution, want partial, got %q", got)
 	}
 }

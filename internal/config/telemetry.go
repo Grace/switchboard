@@ -14,6 +14,20 @@ import (
 // This is the other half: what a team spent, which models, how often a limit
 // refused someone. Off unless an endpoint is configured — a gateway should not
 // start emitting somewhere by default.
+//
+// There is deliberately no `headers` field, and its absence is the feature.
+// Every hosted OTLP backend authenticates with one — Honeycomb wants
+// x-honeycomb-team, Grafana Cloud basic auth, Datadog DD-API-KEY — which makes
+// headers credentials, and switchboard does not keep credentials in a config
+// file. The exporter reads the standard environment variable instead:
+//
+//	export OTEL_EXPORTER_OTLP_HEADERS="x-honeycomb-team=KEY"
+//	"telemetry": { "endpoint": "api.honeycomb.io:443", "interval": "60s" }
+//
+// Attributes follow the OpenTelemetry GenAI semantic conventions, so any OTLP
+// backend understands the spans without an adapter. Each span carries
+// switchboard.audit.id, which is the join back to the audit entry: the span
+// expires on your observability vendor's retention, the record does not.
 type Telemetry struct {
 	Endpoint string   `json:"endpoint,omitempty"`
 	Insecure bool     `json:"insecure,omitempty"`

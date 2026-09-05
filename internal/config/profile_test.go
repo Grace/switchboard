@@ -23,10 +23,11 @@ func compliant(t *testing.T) *Config {
 		}
 	}
 	return &Config{
-		Listen: "127.0.0.1:11435",
-		TLS:    TLS{CertFile: crt, KeyFile: key},
-		OIDC:   OIDC{Enabled: true, Issuer: "https://idp.example", Audience: "switchboard"},
-		Teams:  []Team{{Name: "platform"}},
+		Listen:      "127.0.0.1:11435",
+		TLS:         TLS{CertFile: crt, KeyFile: key},
+		OIDC:        OIDC{Enabled: true, Issuer: "https://idp.example", Audience: "switchboard"},
+		Teams:       []Team{{Name: "platform", Keys: []string{"a-key-long-enough-to-pass"}}},
+		Attribution: Attribution{RequireCaller: true},
 		Audit: Audit{
 			Enabled:        true,
 			Path:           "/tmp/audit.jsonl",
@@ -272,5 +273,77 @@ func write(t *testing.T, path, body string) {
 	t.Helper()
 	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// Requiring a credential and assuming a role per caller are different
+// decisions. A deployment serving only local models has nothing to attribute
+// to a provider bill and every reason to demand a key; the validator used to
+// refuse that combination outright.
+func TestRequireCallerWorksWithoutAWS(t *testing.T) {
+	c := &Config{
+		Listen:      "127.0.0.1:11435",
+		Teams:       []Team{{Name: "local", Keys: []string{"a-key-long-enough-to-pass"}}},
+		Attribution: Attribution{RequireCaller: true}, // Enabled stays false: no AWS
+	}
+	if err := c.Validate(); err != nil {
+		t.Fatalf("require_caller without attribution should be valid: %v", err)
+	}
+	if c.Attribution.Enabled {
+		t.Error("validate must not switch AWS role assumption on by itself")
+	}
+}
+
+func TestRequireCallerNeedsSomethingToAuthenticateAgainst(t *testing.T) {
+	c := &Config{Listen: "127.0.0.1:11435", Attribution: Attribution{RequireCaller: true}}
+	err := c.Validate()
+	if err == nil || !strings.Contains(err.Error(), "nothing can authenticate") {
+		t.Fatalf("want a no-credentials error, got %v", err)
+	}
+
+	// OIDC alone is enough — no static keys required.
+	c.OIDC = OIDC{Enabled: true, Issuer: "https://idp", Audience: "sb"}
+	c.Teams = []Team{{Name: "platform"}}
+	if err := c.Validate(); err != nil {
+		t.Fatalf("oidc should satisfy it: %v", err)
+	}
+}
+
+func TestRosterIsCheckedWithoutAttribution(t *testing.T) {
+	// A short key used to be accepted in silence whenever attribution was off.
+	c := &Config{
+		Listen: "127.0.0.1:11435",
+		Teams:  []Team{{Name: "local", Keys: []string{"tooshort"}}},
+	}
+	err := c.Validate()
+	if err == nil || !strings.Contains(err.Error(), "16 characters") {
+		t.Fatalf("want a key-length error with attribution off, got %v", err)
+	}
+}
+
+func TestSTSNamingRulesOnlyApplyToAWS(t *testing.T) {
+	// "a" is too short for an STS session name. That constraint is meaningless
+	// for a deployment that never calls AWS and should not be imposed on one.
+	c := &Config{
+		Listen: "127.0.0.1:11435",
+		Teams:  []Team{{Name: "a", Keys: []string{"a-key-long-enough-to-pass"}}},
+	}
+	if err := c.Validate(); err != nil {
+		t.Fatalf("local-only deployment should not face STS naming rules: %v", err)
+	}
+
+	c.Attribution = Attribution{Enabled: true, RoleARN: "arn:aws:iam::1:role/r"}
+	if err := c.Validate(); err == nil {
+		t.Error("with AWS on, the STS naming rule should apply")
+	}
+}
+
+func TestProfileRequiresAuthenticatedCallers(t *testing.T) {
+	c := compliant(t)
+	c.Profile = ProfileHIPAA
+	c.Attribution.RequireCaller = false
+	err := c.Validate()
+	if err == nil || !strings.Contains(err.Error(), "require_caller") {
+		t.Fatalf("a record-keeping regime should refuse anonymous callers, got %v", err)
 	}
 }
