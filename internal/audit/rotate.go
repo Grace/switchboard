@@ -1,9 +1,11 @@
 package audit
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -41,6 +43,11 @@ func segmentPath(base string, at time.Time) string {
 	return filepath.Join(dir, stem+"-"+at.UTC().Format(segmentSuffix)+ext)
 }
 
+// archivedSuffix marks a segment that has been copied somewhere durable and is
+// therefore safe to delete locally. It is a rename rather than a sidecar file
+// or in-memory state so it survives a restart and is obvious on disk.
+const archivedSuffix = ".archived"
+
 // Segments lists every file belonging to one log, oldest first, with the
 // active file last.
 func Segments(base string) ([]string, error) {
@@ -55,7 +62,17 @@ func Segments(base string) ([]string, error) {
 	if err != nil {
 		return nil, err
 	}
-	sort.Strings(matches)
+	archived, err := filepath.Glob(filepath.Join(dir, stem+"-*"+ext+archivedSuffix))
+	if err != nil {
+		return nil, err
+	}
+	matches = append(matches, archived...)
+	// Sort on the timestamp, so an archived segment keeps its place in history
+	// rather than sorting after every unarchived one.
+	sort.Slice(matches, func(i, j int) bool {
+		return strings.TrimSuffix(matches[i], archivedSuffix) <
+			strings.TrimSuffix(matches[j], archivedSuffix)
+	})
 
 	if _, err := os.Stat(base); err == nil {
 		matches = append(matches, base)
@@ -97,8 +114,51 @@ func (l *Log) rotate() error {
 
 	// Sequence and digest carry over, so the new segment continues the chain
 	// rather than beginning a second one beside it.
+	l.archive(seg)
 	return l.prune()
 }
+
+// archive hands a closed segment to whatever ships it somewhere durable, and
+// marks it only if that succeeded.
+//
+// The gateway's disk is a buffer, not an archive. Retention alone forces a
+// choice between running out of space and deleting evidence; copying segments
+// off the box removes the choice, and this is the hook that does it — a command
+// rather than an integration, so it works with S3, rsync, a SIEM shipper or
+// anything else already in place.
+func (l *Log) archive(seg string) {
+	if l.archiveCmd == "" {
+		return
+	}
+	// Archiving must never block a completion, and a slow or wedged shipper
+	// must not become a slow gateway.
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), archiveTimeout)
+		defer cancel()
+
+		cmd := exec.CommandContext(ctx, "sh", "-c", l.archiveCmd)
+		cmd.Env = append(os.Environ(), "SEGMENT="+seg)
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			l.mu.Lock()
+			l.archiveErr = fmt.Errorf("archiving %s: %w: %s", filepath.Base(seg), err,
+				strings.TrimSpace(string(out)))
+			l.mu.Unlock()
+			return
+		}
+		if err := os.Rename(seg, seg+archivedSuffix); err != nil {
+			l.mu.Lock()
+			l.archiveErr = err
+			l.mu.Unlock()
+			return
+		}
+		l.mu.Lock()
+		l.archiveErr = nil
+		l.mu.Unlock()
+	}()
+}
+
+const archiveTimeout = 10 * time.Minute
 
 // prune deletes segments older than the retention period.
 //
@@ -119,6 +179,12 @@ func (l *Log) prune() error {
 	for _, s := range segs {
 		if s == l.path {
 			continue // never the active file
+		}
+		// The invariant: a segment that has not been copied somewhere durable
+		// is not deleted, however old it is. Retention bounds the buffer, and
+		// deleting an unarchived segment would bound the evidence instead.
+		if l.archiveCmd != "" && !strings.HasSuffix(s, archivedSuffix) {
+			continue
 		}
 		info, err := os.Stat(s)
 		if err != nil {

@@ -327,6 +327,66 @@ Which means **deleting a whole segment is detected**. That matters because
 removing a file is the tidy version of deleting history, and it is exactly what
 a retention script or a nervous administrator would reach for.
 
+### Ship it off the box
+
+Retention alone only trades one problem for another: run out of disk, or delete
+evidence. The way out is that **the gateway's disk is a buffer, not the
+archive.**
+
+```json
+{
+  "audit": {
+    "max_bytes": 268435456,
+    "archive_command": "aws s3 cp \"$SEGMENT\" s3://audit-archive/switchboard/",
+    "retention": "168h"
+  }
+}
+```
+
+`archive_command` runs for each closed segment with `$SEGMENT` set to its path.
+It is a command rather than an integration so it works with whatever you already
+have — S3, rsync, a SIEM shipper, a tape robot.
+
+**A segment is pruned only after that command has exited zero.** That invariant
+is what makes short local retention safe: a week on disk is fine when the
+durable copy is elsewhere, and a broken shipper means segments accumulate rather
+than disappear. It runs off the request path, so a slow or wedged archiver never
+becomes a slow gateway, and a failing one shows up in `/healthz` — not an outage
+yet, but the beginning of one, and silent otherwise.
+
+Archived segments are renamed with an `.archived` suffix rather than tracked in
+memory or a sidecar, so the state survives a restart and is obvious on disk.
+
+Worth knowing: **S3 Object Lock in compliance mode is stronger than the hash
+chain.** The chain makes tampering *detectable*; object lock makes it
+*impossible*, enforced by the platform. If you have that available, the chain
+becomes a second, independent check rather than the only one.
+
+### Retention periods worth knowing
+
+switchboard cannot know which regime binds you, so it enforces none. For
+context, the common ones:
+
+| Regime | Period |
+|---|---|
+| PCI DSS 10.7 | 12 months, with 3 months immediately available |
+| EU AI Act Art. 26 | ≥6 months, for deployers of high-risk systems |
+| SEC Rule 17a-4 | 3–6 years depending on record type, first 2 years readily accessible |
+| FINRA Rule 4511 | 6 years where no other period is specified |
+| SOX §802 | 7 years for audit documentation |
+| MiFID II Art. 16(7) | 5 years, 7 if a competent authority asks |
+
+In financial services the binding number is usually **6 or 7 years**, which is
+also the clearest argument for archiving rather than retaining locally: seven
+years of prompt logs is not a thing that lives on a gateway's disk.
+
+Whether an LLM gateway's log is a *book and record* at all depends on what the
+model is used for. A model in the path of a customer decision — credit, fraud,
+advice — pulls its log toward those periods. A model summarising internal
+documents does not. That is a question for your compliance function, and the
+useful thing this gives them is that the answer is a configuration change rather
+than a re-architecture.
+
 **Left unset, the log grows until the disk does not have room.** That is
 deliberate — see above for why deleting evidence is opt-in — but it is a
 decision, not an accident, and startup warns when `max_bytes` is unset.

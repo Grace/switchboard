@@ -42,6 +42,10 @@ type Audit struct {
 	// than serving it unrecorded. For a deployment where the log is the point,
 	// this should be on.
 	Required bool `json:"required,omitempty"`
+	// ArchiveCommand ships a closed segment somewhere durable, with $SEGMENT
+	// set to its path. A segment is pruned only after this has succeeded, so
+	// the local disk becomes a buffer rather than the archive.
+	ArchiveCommand string `json:"archive_command,omitempty"`
 }
 
 // Art26Minimum is the retention floor the EU AI Act sets for deployers of
@@ -85,6 +89,10 @@ func (c *Config) validateIO() error {
 	}
 	if c.Audit.Required && !c.Audit.Enabled {
 		return fmt.Errorf("audit.required is set but audit.enabled is false")
+	}
+	if c.Audit.ArchiveCommand != "" && c.Audit.MaxBytes == 0 {
+		return fmt.Errorf("audit.archive_command is set but audit.max_bytes is not: " +
+			"segments are archived when they close, and without rotation none do")
 	}
 	if c.Audit.Retention > 0 && c.Audit.MaxBytes == 0 {
 		return fmt.Errorf("audit.retention is set but audit.max_bytes is not: " +

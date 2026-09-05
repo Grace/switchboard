@@ -81,15 +81,20 @@ func runServe(ctx context.Context, args []string) error {
 			return fmt.Errorf("audit log: %w", err)
 		}
 		lg = lg.WithRotation(audit.Rotation{
-			MaxBytes:  cfg.Audit.MaxBytes,
-			Retention: time.Duration(cfg.Audit.Retention),
+			MaxBytes:       cfg.Audit.MaxBytes,
+			Retention:      time.Duration(cfg.Audit.Retention),
+			ArchiveCommand: cfg.Audit.ArchiveCommand,
 		})
 		defer lg.Close()
 
-		if cfg.Audit.MaxBytes == 0 {
+		switch {
+		case cfg.Audit.MaxBytes == 0:
 			logger.Printf("warning: audit.max_bytes is unset, so %s will grow without "+
-				"bound. Set it, and set audit.retention, or plan for the disk",
-				cfg.Audit.Path)
+				"bound. Set it, with audit.archive_command to ship segments off this "+
+				"host, or plan for the disk", cfg.Audit.Path)
+		case cfg.Audit.ArchiveCommand == "":
+			logger.Printf("note: no audit.archive_command, so this host is the archive. " +
+				"Retention here deletes evidence rather than draining a buffer")
 		}
 		if !cfg.Audit.Required {
 			logger.Printf("note: audit.required is off — a completion whose entry " +

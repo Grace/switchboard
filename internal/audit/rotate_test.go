@@ -241,3 +241,180 @@ func TestNoRotationConfiguredMeansOneFile(t *testing.T) {
 		t.Errorf("without MaxBytes there should be one file, got %v", segs)
 	}
 }
+
+// --- archiving -----------------------------------------------------------
+
+func waitFor(t *testing.T, cond func() bool) bool {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if cond() {
+			return true
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	return false
+}
+
+func countArchived(t *testing.T, path string) (archived, plain int) {
+	t.Helper()
+	segs, _ := Segments(path)
+	for _, s := range segs {
+		if s == path {
+			continue
+		}
+		if strings.HasSuffix(s, archivedSuffix) {
+			archived++
+		} else {
+			plain++
+		}
+	}
+	return
+}
+
+func TestArchivedSegmentsAreMarked(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "audit.jsonl")
+	dest := filepath.Join(dir, "archive")
+	os.MkdirAll(dest, 0o755)
+
+	t.Setenv(keyEnv, "k")
+	l, err := Open(path, nil, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	l = l.WithRotation(Rotation{
+		MaxBytes:       250,
+		ArchiveCommand: "cp \"$SEGMENT\" " + dest + "/",
+	})
+	for i := 0; i < 20; i++ {
+		l.Write(Record{ID: "c", Model: "m", PromptTokens: i})
+	}
+	l.Close()
+
+	if !waitFor(t, func() bool {
+		a, p := countArchived(t, path)
+		return a > 0 && p == 0
+	}) {
+		a, p := countArchived(t, path)
+		t.Fatalf("segments archived=%d unarchived=%d; expected all marked", a, p)
+	}
+
+	copies, _ := filepath.Glob(filepath.Join(dest, "*.jsonl"))
+	if len(copies) == 0 {
+		t.Error("the archive command should have produced copies")
+	}
+
+	// Marking must not disturb the chain.
+	if rep, err := VerifyAll(path, []byte("k")); err != nil || rep.Break != nil {
+		t.Errorf("archiving broke verification: %v %v", err, rep.Break)
+	}
+}
+
+// The invariant that makes shipping-then-pruning safe: an unarchived segment is
+// never deleted, however old it is.
+func TestUnarchivedSegmentsAreNeverPruned(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "audit.jsonl")
+
+	t.Setenv(keyEnv, "k")
+	l, _ := Open(path, nil, false)
+	l = l.WithRotation(Rotation{
+		MaxBytes:       250,
+		Retention:      time.Nanosecond, // everything is instantly "old"
+		ArchiveCommand: "exit 1",        // and the shipper is broken
+	})
+	for i := 0; i < 20; i++ {
+		l.Write(Record{ID: "c", Model: "m", PromptTokens: i})
+	}
+	time.Sleep(200 * time.Millisecond)
+	l.prune()
+
+	a, p := countArchived(t, path)
+	if p == 0 {
+		t.Fatal("expected unarchived segments to still exist")
+	}
+	if a != 0 {
+		t.Errorf("a failing archive command must not mark anything, got %d marked", a)
+	}
+	l.Close()
+
+	if rep, err := VerifyAll(path, []byte("k")); err != nil || rep.Break != nil {
+		t.Errorf("nothing should have been lost: %v %v", err, rep.Break)
+	}
+}
+
+// A broken shipper is not an outage yet, but it is the start of one, and it is
+// silent unless reported.
+func TestFailingArchiveIsReportedAsUnhealthy(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "audit.jsonl")
+	t.Setenv(keyEnv, "k")
+	l, _ := Open(path, nil, false)
+	l = l.WithRotation(Rotation{MaxBytes: 250, ArchiveCommand: "echo nope >&2; exit 3"})
+
+	for i := 0; i < 20; i++ {
+		l.Write(Record{ID: "c", Model: "m", PromptTokens: i})
+	}
+	defer l.Close()
+
+	if !waitFor(t, func() bool {
+		_, err := l.Health()
+		return err != nil
+	}) {
+		t.Fatal("a failing archive command should show as unhealthy")
+	}
+	_, err := l.Health()
+	if !strings.Contains(err.Error(), "archiving") {
+		t.Errorf("the error should say what failed: %v", err)
+	}
+}
+
+// With retention and a working shipper, the buffer stays bounded.
+func TestArchivedSegmentsArePrunedSoTheBufferStaysBounded(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "audit.jsonl")
+	dest := filepath.Join(dir, "archive")
+	os.MkdirAll(dest, 0o755)
+
+	t.Setenv(keyEnv, "k")
+	l, _ := Open(path, nil, false)
+	l = l.WithRotation(Rotation{
+		MaxBytes:       250,
+		Retention:      time.Nanosecond,
+		ArchiveCommand: "cp \"$SEGMENT\" " + dest + "/",
+	})
+	for i := 0; i < 20; i++ {
+		l.Write(Record{ID: "c", Model: "m", PromptTokens: i})
+	}
+	l.Close()
+
+	if !waitFor(t, func() bool {
+		l.prune()
+		a, p := countArchived(t, path)
+		return a == 0 && p == 0
+	}) {
+		a, p := countArchived(t, path)
+		t.Fatalf("buffer not drained: archived=%d unarchived=%d", a, p)
+	}
+	copies, _ := filepath.Glob(filepath.Join(dest, "*.jsonl"))
+	if len(copies) == 0 {
+		t.Error("segments were pruned without ever being copied")
+	}
+}
+
+func TestNoArchiveCommandKeepsCurrentBehaviour(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "audit.jsonl")
+	l := rotatingLog(t, path, "k", 250, time.Nanosecond)
+	for i := 0; i < 20; i++ {
+		l.Write(Record{ID: "c", Model: "m", PromptTokens: i})
+	}
+	l.prune()
+	l.Close()
+
+	// Without a shipper configured, retention prunes as before: there is no
+	// archive to wait for.
+	segs, _ := Segments(path)
+	if len(segs) != 1 {
+		t.Errorf("expected retention to prune to the active file, got %v", segs)
+	}
+}

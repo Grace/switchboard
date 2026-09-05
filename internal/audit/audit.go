@@ -82,6 +82,11 @@ type Log struct {
 	// rather than only logged.
 	failures uint64
 	lastErr  error
+
+	// archiveCmd ships a closed segment somewhere durable. A segment is pruned
+	// only after it has run successfully.
+	archiveCmd string
+	archiveErr error
 }
 
 // Health reports whether writes are succeeding, and how many have failed since
@@ -96,7 +101,13 @@ func (l *Log) Health() (failures uint64, err error) {
 	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	return l.failures, l.lastErr
+	if l.lastErr != nil {
+		return l.failures, l.lastErr
+	}
+	// A shipper that has stopped working is not an outage yet — the segments
+	// are still here — but it is the beginning of one, and it is silent unless
+	// reported.
+	return l.failures, l.archiveErr
 }
 
 // Rotation configures when a segment is closed and how long closed segments
@@ -104,6 +115,9 @@ func (l *Log) Health() (failures uint64, err error) {
 type Rotation struct {
 	MaxBytes  int64
 	Retention time.Duration
+	// ArchiveCommand runs for each closed segment with $SEGMENT set to its
+	// path. A zero exit marks the segment archived and therefore prunable.
+	ArchiveCommand string
 }
 
 // Open opens or creates the log at path.
@@ -140,7 +154,7 @@ func Open(path string, red *redact.Redactor, content bool) (*Log, error) {
 // older than Retention. See rotate.go for why owning this matters.
 func (l *Log) WithRotation(r Rotation) *Log {
 	if l != nil {
-		l.maxBytes, l.retention = r.MaxBytes, r.Retention
+		l.maxBytes, l.retention, l.archiveCmd = r.MaxBytes, r.Retention, r.ArchiveCommand
 	}
 	return l
 }
