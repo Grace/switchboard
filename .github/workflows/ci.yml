@@ -30,7 +30,13 @@ jobs:
       # -coverpkg matters here. Per-package coverage attributes a helper only to
       # tests in its own package, so a type exercised entirely by another
       # package's tests reports 0.0% and looks untested when it is not.
+      # Compliance profiles that require FIPS 140-3 refuse to validate outside
+      # it, so their tests need the Go Cryptographic Module enabled. This tests
+      # the mode those profiles are meant to run in; it does not exercise the
+      # non-FIPS path, which is a gap worth knowing about.
       - name: test
+        env:
+          GODEBUG: fips140=on
         run: go test -race -coverpkg=./... -coverprofile=coverage.out ./...
 
       - name: coverage
