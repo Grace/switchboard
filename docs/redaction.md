@@ -263,6 +263,33 @@ returns which model answered, on whose behalf, the token counts, the stop
 reason, what was redacted on the way in, and — when content logging is on — the
 redacted prompt and completion.
 
+## When the log cannot be written
+
+A gateway that keeps answering while unable to record anything is worse than one
+that was never configured to audit: the first produces a gap nobody knows about,
+the second at least produces no false confidence.
+
+```json
+{ "audit": { "enabled": true, "required": true } }
+```
+
+With `required`, a completion whose entry cannot be written is refused with a
+503 before it is made — the same shape as every other control here. No record,
+no request. Without it the request is served and the failure is visible rather
+than fatal, which is the right default only where availability outranks
+evidence.
+
+Either way `/healthz` reports it:
+
+```json
+{ "status": "degraded", "audit": "no space left on device", "audit_failures": 214 }
+```
+
+That is a **200 with a degraded body, not a 503**, deliberately. A failing audit
+log should page someone; it should not make a liveness probe restart a process,
+which would lose the in-flight work and fix nothing — the disk is still full.
+Point readiness or an alert at the body.
+
 ## Rotation and retention
 
 A log that grows forever gets rotated by someone eventually, and the ordinary
@@ -299,6 +326,10 @@ ok  ~/.switchboard/audit.jsonl (signed)
 Which means **deleting a whole segment is detected**. That matters because
 removing a file is the tidy version of deleting history, and it is exactly what
 a retention script or a nervous administrator would reach for.
+
+**Left unset, the log grows until the disk does not have room.** That is
+deliberate — see above for why deleting evidence is opt-in — but it is a
+decision, not an accident, and startup warns when `max_bytes` is unset.
 
 `retention` deletes closed segments older than the period. The active file is
 never pruned. Zero — the default — keeps everything, because deleting evidence

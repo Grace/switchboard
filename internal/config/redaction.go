@@ -38,6 +38,10 @@ type Audit struct {
 	// which is the safe default: deleting evidence should be something you
 	// asked for.
 	Retention Duration `json:"retention,omitempty"`
+	// Required refuses a completion whose audit entry cannot be written, rather
+	// than serving it unrecorded. For a deployment where the log is the point,
+	// this should be on.
+	Required bool `json:"required,omitempty"`
 }
 
 // Art26Minimum is the retention floor the EU AI Act sets for deployers of
@@ -78,6 +82,9 @@ func (c *Config) validateIO() error {
 	}
 	if c.Audit.MaxBytes < 0 || c.Audit.Retention < 0 {
 		return fmt.Errorf("audit.max_bytes and audit.retention must not be negative")
+	}
+	if c.Audit.Required && !c.Audit.Enabled {
+		return fmt.Errorf("audit.required is set but audit.enabled is false")
 	}
 	if c.Audit.Retention > 0 && c.Audit.MaxBytes == 0 {
 		return fmt.Errorf("audit.retention is set but audit.max_bytes is not: " +

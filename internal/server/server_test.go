@@ -614,7 +614,7 @@ func TestAuditRecordsRedactedCompletion(t *testing.T) {
 	reg.SetDefault("test-model")
 	s := New(reg, log.New(io.Discard, "", 0)).
 		WithAttribution([]config.Team{{Name: "search", Keys: []string{"key-search-0123456789"}}}, false).
-		WithAudit(lg)
+		WithAudit(lg, false)
 	srv := httptest.NewServer(s.Handler())
 	t.Cleanup(srv.Close)
 
@@ -664,7 +664,7 @@ func TestAuditRecordsBackendErrors(t *testing.T) {
 	reg := switchboard.NewRegistry()
 	reg.Register(&fakeBackend{err: errors.New("upstream exploded")}, []string{"test-model"})
 	reg.SetDefault("test-model")
-	s := New(reg, log.New(io.Discard, "", 0)).WithAudit(lg)
+	s := New(reg, log.New(io.Discard, "", 0)).WithAudit(lg, false)
 	srv := httptest.NewServer(s.Handler())
 	t.Cleanup(srv.Close)
 
@@ -887,4 +887,102 @@ func TestSlotIsHeldForTheWholeStream(t *testing.T) {
 		t.Errorf("status = %d; the slot should still be held mid-completion", resp.StatusCode)
 	}
 	close(finish)
+}
+
+// --- audit availability --------------------------------------------------
+
+// failingLog is a Log whose underlying writer is broken, standing in for a full
+// disk or a read-only mount.
+type brokenWriter struct{}
+
+func (brokenWriter) Write([]byte) (int, error) { return 0, errors.New("no space left on device") }
+func (brokenWriter) Close() error              { return nil }
+
+func brokenAuditLog(t *testing.T) *audit.Log {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "audit.jsonl")
+	lg, err := audit.Open(path, nil, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lg.SetWriterForTest(brokenWriter{})
+	return lg
+}
+
+func auditServer(t *testing.T, lg *audit.Log, required bool) *httptest.Server {
+	t.Helper()
+	reg := switchboard.NewRegistry()
+	reg.Register(&fakeBackend{chunks: []string{"ok"}}, []string{"test-model"})
+	reg.SetDefault("test-model")
+	s := New(reg, log.New(io.Discard, "", 0)).WithAudit(lg, required)
+	srv := httptest.NewServer(s.Handler())
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+// The failure this exists to prevent: a gateway that keeps answering while
+// silently unable to record anything. With audit.required, no record means no
+// request.
+func TestRequiredAuditRefusesWhenTheLogIsBroken(t *testing.T) {
+	lg := brokenAuditLog(t)
+	srv := auditServer(t, lg, true)
+
+	// The first request discovers the failure while recording, and is served —
+	// the write is attempted after the completion.
+	post(t, srv.URL+"/v1/chat/completions", chatBody)
+
+	resp := post(t, srv.URL+"/v1/chat/completions", chatBody)
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503 once the log is known broken", resp.StatusCode)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	if !strings.Contains(string(body), "unrecorded") {
+		t.Errorf("the refusal should say why: %s", body)
+	}
+}
+
+// Without it, availability wins and the failure is visible instead of fatal.
+func TestUnrequiredAuditKeepsServing(t *testing.T) {
+	lg := brokenAuditLog(t)
+	srv := auditServer(t, lg, false)
+
+	for i := 0; i < 3; i++ {
+		if resp := post(t, srv.URL+"/v1/chat/completions", chatBody); resp.StatusCode != http.StatusOK {
+			t.Fatalf("request %d = %d; without audit.required the request should be served", i, resp.StatusCode)
+		}
+	}
+}
+
+// A broken log must be visible to monitoring that was already watching, and
+// must not make a liveness probe restart a process that restarting will not fix.
+func TestHealthzReportsDegradationWithout503(t *testing.T) {
+	lg := brokenAuditLog(t)
+	srv := auditServer(t, lg, false)
+	post(t, srv.URL+"/v1/chat/completions", chatBody)
+
+	resp, err := http.Get(srv.URL + "/healthz")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("status = %d; a failing audit log should not fail liveness", resp.StatusCode)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	if !strings.Contains(string(body), "degraded") || !strings.Contains(string(body), "no space left") {
+		t.Errorf("healthz should report the degradation and its cause: %s", body)
+	}
+}
+
+func TestHealthzIsPlainWhenHealthy(t *testing.T) {
+	srv := newTestServer(t, &fakeBackend{})
+	resp, err := http.Get(srv.URL + "/healthz")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	if strings.Contains(string(body), "degraded") {
+		t.Errorf("healthy server reported degraded: %s", body)
+	}
 }

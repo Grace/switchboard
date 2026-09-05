@@ -76,6 +76,27 @@ type Log struct {
 	bytes     int64
 	maxBytes  int64
 	retention time.Duration
+
+	// Health of the last write. An audit log that has stopped working is the
+	// one failure this system must not absorb quietly, so it is recorded
+	// rather than only logged.
+	failures uint64
+	lastErr  error
+}
+
+// Health reports whether writes are succeeding, and how many have failed since
+// the last one that did.
+//
+// A log that quietly stopped recording is worse than one that was never
+// configured: the first produces a gap nobody knows about, and the second at
+// least produces no false confidence.
+func (l *Log) Health() (failures uint64, err error) {
+	if l == nil {
+		return 0, nil
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.failures, l.lastErr
 }
 
 // Rotation configures when a segment is closed and how long closed segments
@@ -201,13 +222,16 @@ func (l *Log) Write(r Record) error {
 	line, err := json.Marshal(signed)
 	if err != nil {
 		l.seq--
+		l.fail(err)
 		return err
 	}
 	line = append(line, '\n')
 	if _, err := l.w.Write(line); err != nil {
 		l.seq--
+		l.fail(err)
 		return err
 	}
+	l.failures, l.lastErr = 0, nil
 	l.prev = signed.MAC
 	l.bytes += int64(len(line))
 
@@ -238,3 +262,18 @@ func (contentError) Error() string {
 }
 
 var errContentWithoutRedaction = contentError{}
+
+// fail records a write failure. The caller holds the lock.
+func (l *Log) fail(err error) {
+	l.failures++
+	l.lastErr = err
+}
+
+// SetWriterForTest replaces the underlying writer. It exists so a test can
+// simulate a full disk, which is the failure this package most needs to handle
+// and the one hardest to arrange honestly.
+func (l *Log) SetWriterForTest(w io.WriteCloser) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.w, l.enc, l.path = w, newEncoder(w), ""
+}

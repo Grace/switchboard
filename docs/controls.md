@@ -62,8 +62,9 @@ certification. switchboard is software you run; the controls are yours.
 | Objective | Frameworks | Status | Evidence |
 |---|---|---|---|
 | Graceful shutdown without losing work | SOC 2 A1.1 | ✅ | Draining shutdown; local models are unloaded and their processes stopped. |
-| Health checking | SOC 2 A1.1 · NIST SI-4 | ✅ | `GET /healthz`. |
+| Health checking | SOC 2 A1.1 · NIST SI-4 | ✅ | `GET /healthz`, reporting a failing audit log as degraded in the body rather than as a failed probe. |
 | Resource limits | SOC 2 A1.1 · NIST SC-5 · ATLAS AML.M0004 | ✅ | Per-team request rate, concurrency ceiling and token budget over a window, keyed on the caller identity attribution resolves. Refusals are 429 naming which limit was hit. Tokens are charged after a completion, so a team may overshoot by one request. |
+| Auditing cannot fail silently | SOC 2 CC7.2 · NIST AU-5 | ✅ | Write failures are counted and surfaced through `/healthz`. With `audit.required`, a completion that cannot be recorded is refused with 503 rather than served unrecorded. |
 | Failure is reported honestly | SOC 2 CC7.3 | ✅ | A mid-stream backend error becomes an error frame before `[DONE]` rather than a truncated response that reads as a short success. Backends that cannot forward tools refuse the request rather than silently dropping them. |
 
 ---

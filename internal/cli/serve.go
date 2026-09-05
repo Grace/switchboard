@@ -86,6 +86,15 @@ func runServe(ctx context.Context, args []string) error {
 		})
 		defer lg.Close()
 
+		if cfg.Audit.MaxBytes == 0 {
+			logger.Printf("warning: audit.max_bytes is unset, so %s will grow without "+
+				"bound. Set it, and set audit.retention, or plan for the disk",
+				cfg.Audit.Path)
+		}
+		if !cfg.Audit.Required {
+			logger.Printf("note: audit.required is off — a completion whose entry " +
+				"cannot be written will still be served. Turn it on where the record is the point")
+		}
 		if r := time.Duration(cfg.Audit.Retention); r > 0 && r < config.Art26Minimum {
 			logger.Printf("warning: audit.retention is %s. EU AI Act Article 26 asks "+
 				"deployers of high-risk systems to keep logs at least six months; "+
@@ -119,7 +128,7 @@ func runServe(ctx context.Context, args []string) error {
 		}
 		logger.Printf("audit log: %s (%s; %s; rules: %s)",
 			cfg.Audit.Path, what, chain, strings.Join(red.Rules(), ", "))
-		srv = srv.WithAudit(lg)
+		srv = srv.WithAudit(lg, cfg.Audit.Required)
 	}
 
 	if err := srv.ListenAndServe(ctx, cfg.Listen); err != nil {

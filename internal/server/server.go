@@ -38,6 +38,8 @@ type Server struct {
 
 	// audit records what was sent to which provider. Nil means no log.
 	audit *audit.Log
+	// auditRequired refuses a request whose audit entry could not be written.
+	auditRequired bool
 
 	// oidc verifies bearer tokens when an identity provider is configured.
 	oidc *oidc.Verifier
@@ -108,15 +110,15 @@ func (s *Server) WithOIDC(v *oidc.Verifier) *Server {
 // WithAudit gives the server a log to record completions in. Redaction is the
 // log's own concern: the server hands it raw content and the log decides what
 // survives, so no call site here can forget to redact.
-func (s *Server) WithAudit(l *audit.Log) *Server {
-	s.audit = l
+func (s *Server) WithAudit(l *audit.Log, required bool) *Server {
+	s.audit, s.auditRequired = l, required
 	return s
 }
 
 // record writes one completion to the audit log, if there is one.
-func (s *Server) record(ctx context.Context, r audit.Record) {
+func (s *Server) record(ctx context.Context, r audit.Record) error {
 	if s.audit == nil {
-		return
+		return nil
 	}
 	if c, ok := switchboard.CallerFrom(ctx); ok {
 		r.Team, r.Subject = c.Team, c.Subject
@@ -125,8 +127,32 @@ func (s *Server) record(ctx context.Context, r audit.Record) {
 		r.Conversation = c
 	}
 	if err := s.audit.Write(r); err != nil {
-		s.logger.Printf("audit: %v", err)
+		n, _ := s.audit.Health()
+		s.logger.Printf("audit: WRITE FAILED (%d consecutive): %v", n, err)
+		return err
 	}
+	return nil
+}
+
+// auditable reports whether the log is healthy enough to serve.
+//
+// With audit.required set, a completion that cannot be recorded is refused
+// before it is made. That is the same shape as every other control here: no
+// record, no request. Without it, the request proceeds and the failure is
+// visible through /healthz and the log — which is the right default only for
+// deployments where availability outranks evidence.
+func (s *Server) auditable(w http.ResponseWriter) bool {
+	if !s.auditRequired || s.audit == nil {
+		return true
+	}
+	if n, err := s.audit.Health(); err != nil {
+		s.logger.Printf("refusing: audit log unavailable (%d consecutive failures): %v", n, err)
+		writeError(w, http.StatusServiceUnavailable, "audit_unavailable",
+			"this gateway records every completion and cannot right now, so it is "+
+				"refusing rather than serving unrecorded requests")
+		return false
+	}
+	return true
 }
 
 // promptText flattens a request into the text an audit log should consider.
@@ -334,7 +360,24 @@ func (s *Server) adminTarget(w http.ResponseWriter, r *http.Request) (switchboar
 	return backend, model, true
 }
 
+// handleHealth reports liveness, and degradation in the body rather than the
+// status code. A failing audit log should page someone; it should not make a
+// liveness probe restart the process, which would lose nothing and fix nothing.
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
+	if s.audit != nil {
+		if n, err := s.audit.Health(); err != nil {
+			writeJSON(w, http.StatusOK, map[string]any{
+				"status":         "degraded",
+				"audit":          err.Error(),
+				"audit_failures": n,
+			})
+			return
+		}
+	}
+	s.handleHealthOK(w, r)
+}
+
+func (s *Server) handleHealthOK(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
 
@@ -374,6 +417,9 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if !s.auditable(w) {
+		return
+	}
 	release, ok := s.admit(w, r)
 	if !ok {
 		return
@@ -436,7 +482,7 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	result, err := backend.Chat(r.Context(), chatReq, func(switchboard.Chunk) error { return nil })
 	if err != nil {
 		s.logger.Printf("chat %s: %v", model, err)
-		s.record(r.Context(), audit.Record{
+		_ = s.record(r.Context(), audit.Record{
 			ID: id, Model: model, Backend: backend.Name(),
 			Prompt: promptText(chatReq), Error: err.Error(),
 		})
@@ -444,7 +490,7 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.charge(r.Context(), result.Usage)
-	s.record(r.Context(), audit.Record{
+	_ = s.record(r.Context(), audit.Record{
 		ID: id, Model: model, Backend: backend.Name(),
 		Prompt: promptText(chatReq), Completion: result.Text,
 		PromptTokens:     result.Usage.InputTokens,
@@ -501,7 +547,7 @@ func (s *Server) streamChat(w http.ResponseWriter, r *http.Request, backend swit
 		})
 	})
 	if err != nil {
-		s.record(r.Context(), audit.Record{
+		_ = s.record(r.Context(), audit.Record{
 			ID: id, Model: req.Model, Backend: backend.Name(), Streamed: true,
 			Prompt: promptText(req), Error: err.Error(),
 		})
@@ -520,7 +566,7 @@ func (s *Server) streamChat(w http.ResponseWriter, r *http.Request, backend swit
 	}
 
 	s.charge(r.Context(), result.Usage)
-	s.record(r.Context(), audit.Record{
+	_ = s.record(r.Context(), audit.Record{
 		ID: id, Model: req.Model, Backend: backend.Name(), Streamed: true,
 		Prompt: promptText(req), Completion: result.Text,
 		PromptTokens:     result.Usage.InputTokens,
