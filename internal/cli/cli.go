@@ -51,6 +51,7 @@ commands:
   audit      verify the audit chain, or reconstruct one decision
   agents     list the programs calling this gateway, as the traffic reveals them
   drift      compare the models the log saw against the models the config approves
+  reconcile  compare what the log recorded against what the provider billed
   controls   assess this config against the control objectives a review asks about
   evidence   package a period of the log for someone who does not trust you
   version    print the version
@@ -87,6 +88,8 @@ func Main(ctx context.Context, args []string) int {
 		err = runAgents(ctx, args[1:])
 	case "drift":
 		err = runDrift(ctx, args[1:])
+	case "reconcile":
+		err = runReconcile(ctx, args[1:])
 	case "controls":
 		err = runControls(ctx, args[1:])
 	case "evidence":

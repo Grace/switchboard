@@ -45,6 +45,29 @@ absent, and names the IAM permission to re-run with. That distinction is the
 same one the report is built on: a control nobody could ask about is not a
 control that is switched off.
 
+### The bill
+
+`scripts/aws-invoice.sh` is the same shape for a different question, and reads a
+different kind of source:
+
+```sh
+./scripts/aws-invoice.sh 2026-07 2026-09
+switchboard reconcile -invoice ./bedrock-invoice.csv -period 2026-07-01..2026-10-01
+```
+
+Everything else an adapter collects is a configuration — a statement of what the
+account is set up to do. This one collects an invoice, which is a record of what
+it did, written by somebody else. It is the only input in this repository that
+did not originate inside the organisation being assessed, and that is what makes
+it worth the trouble. See [reconciliation.md](reconciliation.md).
+
+It keeps the same distinction as the export above, and it matters more here:
+*asked, and this account billed nothing that month* and *could not ask* produce
+different notes, because a month the export failed on looks exactly like a month
+the provider charged nothing for, and one of those is a finding about your
+gateway. Cost Explorer also charges a cent per request — the only command here
+that is not free.
+
 ## By hand
 
 Four commands. Put the output in a directory and point `-aws` at it — files are

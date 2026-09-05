@@ -79,6 +79,9 @@ type Config struct {
 	Limits Limits `json:"limits,omitempty"`
 	// Pricing turns the token counts in the log into money. See pricing.go.
 	Pricing Pricing `json:"pricing,omitempty"`
+	// Reconciliation names the models on a provider's invoice, so the log can
+	// be set against it. See reconciliation.go.
+	Reconciliation Reconciliation `json:"reconciliation,omitempty"`
 	// Tools bounds which functions a model may actually be made to call.
 	Tools Tools `json:"tools,omitempty"`
 	// TLS secures the listener itself.
@@ -229,6 +232,9 @@ func (c *Config) validate(checkProfile bool) error {
 	// Rates are not checked against the model roster: a log outlives the
 	// configuration that produced it, and a price for a model retired last
 	// month is exactly what reading last month's entries needs.
+	if err := c.Reconciliation.validate(); err != nil {
+		return err
+	}
 	if err := c.Pricing.validate(); err != nil {
 		return err
 	}

@@ -101,7 +101,11 @@ Usage Report 2.0, and the way to split it by team is session tags on an assumed
 role — see [cost-attribution.md](cost-attribution.md). The rates here exist so
 the page can answer "what did this person's prompts cost" at the moment you are
 looking at them, without waiting a day for billing data and without leaving the
-log. They are two different questions and both are worth being able to answer.
+log. They are two different questions and both are worth being able to answer. Setting one against the other is a third
+question, and `switchboard reconcile` answers it — against tokens rather than
+money, because one model bills at different unit prices by service tier and by
+cross-region routing, so no rate card reproduces a bill. See
+[reconciliation.md](reconciliation.md).
 
 ## Rates and the model roster
 

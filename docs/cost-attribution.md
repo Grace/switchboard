@@ -93,6 +93,23 @@ confirm the `iamPrincipal/` tag splits the way you expect. If it does not, the
 usual causes are a missing `sts:TagSession`, an unactivated cost allocation tag,
 or looking before the 24–48 hour lag.
 
+`switchboard reconcile` is that check, run against the bill rather than by eye:
+
+```sh
+switchboard reconcile -invoice cur-2026-q3.csv -period 2026-Q3
+```
+
+Where the export carries the tag, it sets the bill's own split beside the split
+this gateway asserted, month by month. A team the log knows and the bill does
+not is one of the three failures above, and the report names them in the order
+they usually turn out to be. Where the model totals reconcile and the team split
+does not, it says so explicitly — that is a split landing in the wrong place
+rather than traffic that went missing, and the two have different fixes.
+
+Cost Explorer cannot group by IAM principal or session tag, so an export pulled
+from it reports the team split as **unknown** rather than absent. That needs a
+CUR 2.0 export. See [reconciliation.md](reconciliation.md).
+
 Redaction of request and response content — the blocker for sending traces off
 the box at all — is now implemented; see [redaction.md](redaction.md).
 
@@ -137,8 +154,10 @@ exceed its budget by a single request, and is refused from then until the window
 rolls.
 
 ## Still not built
-- **Chargeback reporting.** No rollup or export — the data is in CUR, not in
-  something finance can read without an engineer.
+- **Chargeback reporting.** `switchboard reconcile` will tell you whether the
+  bill splits the way this says it should, and `switchboard agents` will tell you
+  what each program cost at the rate card. Neither is a statement finance can
+  post — that is a rollup off CUR, and it is not here.
 
 If you are running Bedrock for several teams and solving this some other way, I
 would like to hear how. **grace@gracefulco.de**
