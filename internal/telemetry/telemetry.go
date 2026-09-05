@@ -51,7 +51,11 @@ type Config struct {
 	Insecure bool
 	// Interval bounds how stale an aggregate can be.
 	Interval time.Duration
-	Version  string
+	// IncludeSubject puts the calling identity on spans — never on metrics,
+	// where a label per person is unbounded. Off by default: it means an
+	// identity leaves the process.
+	IncludeSubject bool
+	Version        string
 }
 
 // New builds a meter exporting to an OTLP receiver.

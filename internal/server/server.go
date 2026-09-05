@@ -522,11 +522,11 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		chatReq.ToolChoice = choice
 	}
 
-	var team string
+	var team, subject string
 	if c, ok := switchboard.CallerFrom(r.Context()); ok {
-		team = c.Team
+		team, subject = c.Team, c.Subject
 	}
-	spanCtx, span := s.tracer.Start(r.Context(), model, team)
+	spanCtx, span := s.tracer.Start(r.Context(), model, team, subject)
 	r = r.WithContext(spanCtx)
 
 	id := fmt.Sprintf("chatcmpl-%d", s.now().UnixNano())

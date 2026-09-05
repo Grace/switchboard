@@ -30,9 +30,10 @@ import (
 
 // Tracer emits one span per completion.
 type Tracer struct {
-	tracer   trace.Tracer
-	prop     propagation.TextMapPropagator
-	shutdown func(context.Context) error
+	tracer         trace.Tracer
+	prop           propagation.TextMapPropagator
+	includeSubject bool
+	shutdown       func(context.Context) error
 }
 
 // NewTracer builds a tracer exporting to an OTLP receiver. An empty endpoint
@@ -67,9 +68,10 @@ func NewTracer(ctx context.Context, cfg Config) (*Tracer, error) {
 	otel.SetTextMapPropagator(prop)
 
 	return &Tracer{
-		tracer:   tp.Tracer("github.com/Grace/switchboard"),
-		prop:     prop,
-		shutdown: tp.Shutdown,
+		tracer:         tp.Tracer("github.com/Grace/switchboard"),
+		prop:           prop,
+		includeSubject: cfg.IncludeSubject,
+		shutdown:       tp.Shutdown,
 	}, nil
 }
 
@@ -82,15 +84,29 @@ func (t *Tracer) Extract(ctx context.Context, carrier propagation.TextMapCarrier
 }
 
 // Start opens a span for one completion.
-func (t *Tracer) Start(ctx context.Context, model, team string) (context.Context, trace.Span) {
+//
+// Subject goes here rather than on a metric, when it goes anywhere at all.
+// The two have different economics: a metric label per person creates an
+// unbounded number of time series and breaks the backend, while a span
+// attribute per person is ordinary — finding everything one user did is what a
+// tracing tool is for.
+//
+// It is still opt-in, because it means an identity leaves the process. Off, the
+// export identifies nobody; on, per-person investigation happens in the tool
+// the team already uses rather than only in the log.
+func (t *Tracer) Start(ctx context.Context, model, team, subject string) (context.Context, trace.Span) {
 	if t == nil {
 		return ctx, noopSpan{}
 	}
-	return t.tracer.Start(ctx, "chat.completion", trace.WithSpanKind(trace.SpanKindServer),
-		trace.WithAttributes(
-			attribute.String("gen_ai.request.model", model),
-			attribute.String("switchboard.team", or(team, "unattributed")),
-		))
+	attrs := []attribute.KeyValue{
+		attribute.String("gen_ai.request.model", model),
+		attribute.String("switchboard.team", or(team, "unattributed")),
+	}
+	if t.includeSubject && subject != "" {
+		attrs = append(attrs, attribute.String("enduser.id", subject))
+	}
+	return t.tracer.Start(ctx, "chat.completion",
+		trace.WithSpanKind(trace.SpanKindServer), trace.WithAttributes(attrs...))
 }
 
 // Finish records the outcome on a span.
