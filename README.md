@@ -109,7 +109,7 @@ AWS credentials come from the standard chain — environment, shared config, SSO
 | `GET /v1/models` | The routable roster, across every backend. |
 | `POST /v1/connect` | Load a local model into memory ahead of first use. |
 | `POST /v1/disconnect` | Unload it and reclaim the memory. |
-| `GET /healthz` | Liveness. |
+| `GET /health` | Liveness. |
 
 ## Commands
 

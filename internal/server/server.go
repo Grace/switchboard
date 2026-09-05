@@ -139,7 +139,7 @@ func (s *Server) record(ctx context.Context, r audit.Record) error {
 // With audit.required set, a completion that cannot be recorded is refused
 // before it is made. That is the same shape as every other control here: no
 // record, no request. Without it, the request proceeds and the failure is
-// visible through /healthz and the log — which is the right default only for
+// visible through /health and the log — which is the right default only for
 // deployments where availability outranks evidence.
 func (s *Server) auditable(w http.ResponseWriter) bool {
 	if !s.auditRequired || s.audit == nil {
@@ -274,7 +274,7 @@ func bearer(h string) (string, bool) {
 // Handler returns the routed handler.
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
-	mux.HandleFunc("GET /healthz", s.handleHealth)
+	mux.HandleFunc("GET /health", s.handleHealth)
 	mux.HandleFunc("GET /v1/models", s.handleModels)
 	mux.HandleFunc("POST /v1/chat/completions", s.handleChat)
 	mux.HandleFunc("POST /v1/connect", s.handleConnect)

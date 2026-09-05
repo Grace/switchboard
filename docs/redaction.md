@@ -263,7 +263,7 @@ harder to locate later. Without it, the same finding is a loud warning and the
 gateway serves.
 
 `audit.verify_interval` re-walks it on a timer, and a break found there is
-reported and surfaces through `/healthz` like any other degradation. Reading
+reported and surfaces through `/health` like any other degradation. Reading
 every segment is real I/O on a large log, which is an argument for an hour
 rather than a minute — and another argument for archiving segments off the box
 so the local buffer stays small.
@@ -307,7 +307,7 @@ no request. Without it the request is served and the failure is visible rather
 than fatal, which is the right default only where availability outranks
 evidence.
 
-Either way `/healthz` reports it:
+Either way `/health` reports it:
 
 ```json
 { "status": "degraded", "audit": "no space left on device", "audit_failures": 214 }
@@ -379,7 +379,7 @@ have — S3, rsync, a SIEM shipper, a tape robot.
 is what makes short local retention safe: a week on disk is fine when the
 durable copy is elsewhere, and a broken shipper means segments accumulate rather
 than disappear. It runs off the request path, so a slow or wedged archiver never
-becomes a slow gateway, and a failing one shows up in `/healthz` — not an outage
+becomes a slow gateway, and a failing one shows up in `/health` — not an outage
 yet, but the beginning of one, and silent otherwise.
 
 Archived segments are renamed with an `.archived` suffix rather than tracked in

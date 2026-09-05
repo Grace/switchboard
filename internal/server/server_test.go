@@ -960,7 +960,7 @@ func TestHealthzReportsDegradationWithout503(t *testing.T) {
 	srv := auditServer(t, lg, false)
 	post(t, srv.URL+"/v1/chat/completions", chatBody)
 
-	resp, err := http.Get(srv.URL + "/healthz")
+	resp, err := http.Get(srv.URL + "/health")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -970,13 +970,13 @@ func TestHealthzReportsDegradationWithout503(t *testing.T) {
 	}
 	body, _ := io.ReadAll(resp.Body)
 	if !strings.Contains(string(body), "degraded") || !strings.Contains(string(body), "no space left") {
-		t.Errorf("healthz should report the degradation and its cause: %s", body)
+		t.Errorf("health should report the degradation and its cause: %s", body)
 	}
 }
 
 func TestHealthzIsPlainWhenHealthy(t *testing.T) {
 	srv := newTestServer(t, &fakeBackend{})
-	resp, err := http.Get(srv.URL + "/healthz")
+	resp, err := http.Get(srv.URL + "/health")
 	if err != nil {
 		t.Fatal(err)
 	}
