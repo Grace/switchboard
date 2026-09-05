@@ -67,9 +67,24 @@ func runServe(ctx context.Context, args []string) error {
 			cfg.Telemetry.Endpoint, time.Duration(cfg.Telemetry.Interval))
 	}
 
+	tracer, err := telemetry.NewTracer(ctx, cfg.Telemetry.Options(Version))
+	if err != nil {
+		return fmt.Errorf("tracing: %w", err)
+	}
+	if tracer != nil {
+		defer func() {
+			shutCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			if err := tracer.Shutdown(shutCtx); err != nil {
+				logger.Printf("tracing: flushing on shutdown: %v", err)
+			}
+		}()
+	}
+
 	srv := server.New(reg, logger).
 		WithAttribution(cfg.Teams, cfg.Attribution.RequireCaller).
-		WithMetrics(meter)
+		WithMetrics(meter).
+		WithTracer(tracer)
 
 	if lim := cfg.Limiter(); lim != nil {
 		srv = srv.WithLimits(lim)

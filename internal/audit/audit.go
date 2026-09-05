@@ -30,9 +30,14 @@ type Record struct {
 	Time         time.Time `json:"time"`
 	ID           string    `json:"id"`
 	Conversation string    `json:"conversation,omitempty"`
-	Team         string    `json:"team,omitempty"`
-	Subject      string    `json:"subject,omitempty"`
-	Model        string    `json:"model"`
+	// TraceID and SpanID come from the caller's W3C trace context, when it sent
+	// one. They are what joins this record to the caller's own traces: without
+	// them the log is a system beside your observability rather than inside it.
+	TraceID string `json:"trace_id,omitempty"`
+	SpanID  string `json:"span_id,omitempty"`
+	Team    string `json:"team,omitempty"`
+	Subject string `json:"subject,omitempty"`
+	Model   string `json:"model"`
 	// Policy is the fingerprint of the configuration in force. Without it the
 	// log says what happened but not what the rules were, and "was this allowed
 	// under the policy at the time" is unanswerable.

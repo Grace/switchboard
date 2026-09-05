@@ -1,6 +1,7 @@
 package config
 
 import (
+	"crypto/fips140"
 	"fmt"
 	"sort"
 	"strings"
@@ -32,6 +33,8 @@ const (
 	ProfileHIPAA   Profile = "hipaa"
 	ProfileFINRA   Profile = "finra"
 	ProfileEUAIAct Profile = "eu-ai-act"
+	Profile800171  Profile = "nist-800-171"
+	ProfileFedRAMP Profile = "fedramp-moderate"
 )
 
 // Retention floors, as durations rather than the calendar arithmetic the
@@ -52,6 +55,18 @@ const (
 	// readily accessible. switchboard checks the six; "readily accessible" is a
 	// property of where archive_command puts the segment, which it cannot see.
 	finraMinimum = 6 * 365 * 24 * time.Hour
+
+	// federalMinimum is a switchboard default, not a statute, and the regimes
+	// using it say so.
+	//
+	// NIST 800-53 AU-11 and 800-171 3.3.1 both make the retention period
+	// organization-defined: there is no federal number to enforce the way there
+	// is for HIPAA or FINRA. One year sits above the FedRAMP baseline parameter
+	// and comfortably above the 90 days DFARS 252.204-7012 requires media be
+	// preserved after an incident report. Set your own if your SSP says
+	// otherwise — the point is that the value is a decision, not a default
+	// nobody made.
+	federalMinimum = 365 * 24 * time.Hour
 )
 
 // regime is what a profile actually asserts.
@@ -66,6 +81,14 @@ type regime struct {
 	// RequiredRules are built-in redaction rules that must be enabled whenever
 	// content is being logged.
 	RequiredRules []string
+	// RetentionIsParameter marks a floor switchboard chose rather than one a
+	// regulation states, so errors and reports can say which it is.
+	RetentionIsParameter bool
+	// RequireFIPS demands the binary be running under the FIPS 140-3 Go
+	// Cryptographic Module.
+	RequireFIPS bool
+	// RequireTLS refuses a plaintext listener, loopback included.
+	RequireTLS bool
 	// RequirePerson means a shared team key is not sufficient to attribute an
 	// entry — the caller must resolve to a person.
 	RequirePerson bool
@@ -117,6 +140,57 @@ var regimes = map[Profile]regime{
 				"acceptable in its place, is a property of where archive_command " +
 				"ships segments. switchboard makes alteration detectable; it cannot " +
 				"make storage immutable.",
+		},
+	},
+	Profile800171: {
+		Title:                "NIST SP 800-171 Rev 2 (CUI) / CMMC Level 2",
+		RetentionFloor:       federalMinimum,
+		RetentionCite:        "800-171 3.3.1 (organization-defined; 1 year is switchboard's default)",
+		RetentionIsParameter: true,
+		RequiredRules:        []string{"us_ssn", "email"},
+		RequirePerson:        true,
+		PersonCite:           "800-171 3.1.1 / 3.3.2 — trace actions to individual users",
+		RequireFIPS:          true,
+		RequireTLS:           true,
+		Unaddressed: []string{
+			"CUI is defined by your contract, not by a pattern. Redaction catches " +
+				"structured identifiers; whether a prompt contains CUI is a judgement " +
+				"about content switchboard is not equipped to make. Treat the gateway " +
+				"as bounding where CUI may go, not as deciding what it is.",
+			"DFARS 252.204-7012 requires reporting a cyber incident to DIBNet " +
+				"within 72 hours and preserving media for at least 90 days. The audit " +
+				"log is evidence for that report; the reporting is yours.",
+			"CMMC Phase II third-party assessment was suspended in July 2026, but " +
+				"Phase I self-assessment against 800-171 Rev 2 remains contractually " +
+				"required and flows down to subcontractors. `switchboard controls " +
+				"-json` is evidence for a self-assessment, not a substitute for one.",
+			"Physical and personnel controls, incident response, and awareness " +
+				"training are families of 800-171 no gateway touches.",
+		},
+	},
+	ProfileFedRAMP: {
+		Title:                "FedRAMP Moderate (NIST 800-53 Rev 5)",
+		RetentionFloor:       federalMinimum,
+		RetentionCite:        "AU-11 (organization-defined; FedRAMP baseline is at least one year)",
+		RetentionIsParameter: true,
+		RequiredRules:        []string{"us_ssn", "email"},
+		RequirePerson:        true,
+		PersonCite:           "NIST 800-53 IA-2 / AU-3 — uniquely identify individual users",
+		RequireFIPS:          true,
+		RequireTLS:           true,
+		Unaddressed: []string{
+			"switchboard is not FedRAMP authorized and does not need to be. " +
+				"FedRAMP authorizes cloud service offerings; this is a self-hosted " +
+				"binary that runs inside an authorization boundary you already have, " +
+				"inheriting its controls rather than establishing new ones. What that " +
+				"means practically: no third-party ATO to wait on, and no vendor in " +
+				"your data path to assess.",
+			"Inherited controls are only inherited if your SSP says so. The rows " +
+				"above are evidence for a control implementation statement; writing " +
+				"that statement, and having it assessed, is yours.",
+			"Bedrock in a commercial region is not a GovCloud or IL-level " +
+				"boundary. Where the models run is a question about your AWS account, " +
+				"not about this gateway.",
 		},
 	},
 	ProfileEUAIAct: {
@@ -187,7 +261,7 @@ func (p Profile) validate(c *Config) error {
 	if got := c.Audit.Retention.Duration(); got > 0 && got < r.RetentionFloor {
 		return fmt.Errorf("profile %q: audit.retention is %s but %s asks for at "+
 			"least %s. Raise it, or set it to 0 to keep everything",
-			p, got, r.RetentionCite, roughly(r.RetentionFloor))
+			p, roughly(got), r.RetentionCite, roughly(r.RetentionFloor))
 	}
 
 	// Retention beyond the point where segments leave this host needs somewhere
@@ -211,6 +285,25 @@ func (p Profile) validate(c *Config) error {
 		return fmt.Errorf("profile %q requires oidc.enabled: %s wants the record to "+
 			"identify a person, and a shared team key identifies a team",
 			p, r.PersonCite)
+	}
+
+	// FIPS is a property of the binary rather than of the file, which is
+	// precisely why it belongs here: a config that is correct in every other
+	// respect, running on a build with non-validated cryptography, is the
+	// failure most likely to survive all the way to an assessor.
+	if r.RequireFIPS && !fips140.Enabled() {
+		return fmt.Errorf("profile %q requires FIPS 140-3 mode, and this binary is "+
+			"not running under the Go Cryptographic Module. Build with GOFIPS140=v1.0.0 "+
+			"or run with GODEBUG=fips140=on (see docs/profiles.md)", p)
+	}
+
+	// Loopback is exempt everywhere else in switchboard because a plaintext
+	// bind that cannot leave the host is a reasonable default. Under these
+	// regimes it is not: SC-8 and 3.13.8 are about the channel, and an
+	// assessor reads a config, not a routing table.
+	if r.RequireTLS && c.TLS.CertFile == "" {
+		return fmt.Errorf("profile %q requires tls.cert_file and tls.key_file: "+
+			"%s treats transmission confidentiality as unconditional, loopback included", p, r.Title)
 	}
 
 	// Required rules bind only when content is actually being written down.

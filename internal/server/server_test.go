@@ -23,6 +23,7 @@ import (
 	"github.com/Grace/switchboard/internal/oidc"
 	"github.com/Grace/switchboard/internal/redact"
 	"github.com/Grace/switchboard/internal/switchboard"
+	"github.com/Grace/switchboard/internal/telemetry"
 	"github.com/Grace/switchboard/internal/wire"
 )
 
@@ -984,5 +985,89 @@ func TestHealthzIsPlainWhenHealthy(t *testing.T) {
 	body, _ := io.ReadAll(resp.Body)
 	if strings.Contains(string(body), "degraded") {
 		t.Errorf("healthy server reported degraded: %s", body)
+	}
+}
+
+// --- trace context -------------------------------------------------------
+
+// The link that makes this record joinable: a request arriving with a
+// traceparent belongs to a trace that started in the caller's application, and
+// carrying that id onto the entry lets an investigation move between their
+// observability and this log without matching timestamps by hand.
+func TestCallersTraceIDReachesTheAuditRecord(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "audit.jsonl")
+	lg, err := audit.Open(path, nil, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tracer, err := telemetry.NewTracer(context.Background(), telemetry.Config{
+		Endpoint: "127.0.0.1:1", Insecure: true, // never reached; spans are batched
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { tracer.Shutdown(context.Background()) })
+
+	reg := switchboard.NewRegistry()
+	reg.Register(&fakeBackend{chunks: []string{"ok"}}, []string{"test-model"})
+	reg.SetDefault("test-model")
+	s := New(reg, log.New(io.Discard, "", 0)).WithAudit(lg, false).WithTracer(tracer)
+	srv := httptest.NewServer(s.Handler())
+	t.Cleanup(srv.Close)
+
+	const traceID = "4bf92f3577b34da6a3ce929d0e0e4736"
+	req, _ := http.NewRequest(http.MethodPost, srv.URL+"/v1/chat/completions", strings.NewReader(chatBody))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("traceparent", "00-"+traceID+"-00f067aa0ba902b7-01")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if err := lg.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	raw, _ := os.ReadFile(path)
+	var rec audit.Record
+	if err := json.Unmarshal(bytes.TrimSpace(raw), &rec); err != nil {
+		t.Fatalf("decode %q: %v", raw, err)
+	}
+	if rec.TraceID != traceID {
+		t.Errorf("trace_id = %q, want the caller's %q", rec.TraceID, traceID)
+	}
+	if rec.SpanID == "" {
+		t.Error("the entry should carry the span this completion ran in")
+	}
+	// Our span is a child of theirs, not theirs.
+	if rec.SpanID == "00f067aa0ba902b7" {
+		t.Error("span_id should be our own span, not the caller's")
+	}
+}
+
+// A caller that sends no trace context must still be served, with the fields
+// simply absent.
+func TestNoTraceContextIsFine(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "audit.jsonl")
+	lg, _ := audit.Open(path, nil, false)
+
+	reg := switchboard.NewRegistry()
+	reg.Register(&fakeBackend{chunks: []string{"ok"}}, []string{"test-model"})
+	reg.SetDefault("test-model")
+	s := New(reg, log.New(io.Discard, "", 0)).WithAudit(lg, false)
+	srv := httptest.NewServer(s.Handler())
+	t.Cleanup(srv.Close)
+
+	if resp := post(t, srv.URL+"/v1/chat/completions", chatBody); resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d", resp.StatusCode)
+	}
+	lg.Close()
+
+	raw, _ := os.ReadFile(path)
+	var rec audit.Record
+	json.Unmarshal(bytes.TrimSpace(raw), &rec)
+	if rec.TraceID != "" {
+		t.Errorf("trace_id = %q with no tracer configured", rec.TraceID)
 	}
 }

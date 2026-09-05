@@ -78,10 +78,7 @@ func New(ctx context.Context, cfg Config) (*Meter, error) {
 	// Schemaless deliberately: merging a versioned resource with the SDK's
 	// default fails whenever the two semconv versions differ, which is a
 	// dependency-bump away at any time. The attribute names are the stable part.
-	res, err := resource.Merge(resource.Default(), resource.NewSchemaless(
-		attribute.String("service.name", "switchboard"),
-		attribute.String("service.version", cfg.Version),
-	))
+	res, err := resourceFor(cfg.Version)
 	if err != nil {
 		return nil, err
 	}
@@ -173,4 +170,16 @@ func or(s, fallback string) string {
 		return fallback
 	}
 	return s
+}
+
+// resourceFor identifies this process to a receiver.
+//
+// Schemaless deliberately: merging a versioned resource with the SDK's default
+// fails whenever the two semconv versions differ, which is a dependency bump
+// away at any time. The attribute names are the stable part.
+func resourceFor(version string) (*resource.Resource, error) {
+	return resource.Merge(resource.Default(), resource.NewSchemaless(
+		attribute.String("service.name", "switchboard"),
+		attribute.String("service.version", version),
+	))
 }

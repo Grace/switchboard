@@ -21,6 +21,9 @@ import (
 	"github.com/Grace/switchboard/internal/limit"
 	"github.com/Grace/switchboard/internal/oidc"
 	"github.com/Grace/switchboard/internal/switchboard"
+	"go.opentelemetry.io/otel/propagation"
+	"go.opentelemetry.io/otel/trace"
+
 	"github.com/Grace/switchboard/internal/telemetry"
 	"github.com/Grace/switchboard/internal/wire"
 )
@@ -51,6 +54,14 @@ type Server struct {
 	// metrics answers the aggregate question the audit log cannot. Nil means
 	// the endpoint is not served.
 	metrics *telemetry.Meter
+	// tracer joins this record to the caller's own traces.
+	tracer *telemetry.Tracer
+}
+
+// WithTracer adopts the caller's trace context and emits a span per completion.
+func (s *Server) WithTracer(t *telemetry.Tracer) *Server {
+	s.tracer = t
+	return s
 }
 
 // WithMetrics records completions, refusals and redactions.
@@ -157,6 +168,9 @@ func (s *Server) record(ctx context.Context, r audit.Record) error {
 	if c, ok := conversationFrom(ctx); ok {
 		r.Conversation = c
 	}
+	// The caller's trace id, so this entry can be found from their traces and
+	// their traces from this entry.
+	r.TraceID, r.SpanID = telemetry.IDs(ctx)
 	if err := s.audit.Write(r); err != nil {
 		n, _ := s.audit.Health()
 		s.logger.Printf("audit: WRITE FAILED (%d consecutive): %v", n, err)
@@ -427,6 +441,10 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
+	// Adopt the caller's trace context first, so everything below — the span,
+	// the audit entry, the metrics — hangs off the trace their request started.
+	r = r.WithContext(s.tracer.Extract(r.Context(), propagation.HeaderCarrier(r.Header)))
+
 	if id := sanitiseConversation(r.Header.Get(conversationHeader)); id != "" {
 		r = r.WithContext(context.WithValue(r.Context(), conversationKey{}, id))
 	}
@@ -504,14 +522,22 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		chatReq.ToolChoice = choice
 	}
 
+	var team string
+	if c, ok := switchboard.CallerFrom(r.Context()); ok {
+		team = c.Team
+	}
+	spanCtx, span := s.tracer.Start(r.Context(), model, team)
+	r = r.WithContext(spanCtx)
+
 	id := fmt.Sprintf("chatcmpl-%d", s.now().UnixNano())
 	if req.Stream {
-		s.streamChat(w, r, backend, chatReq, id)
+		s.streamChat(w, r, backend, chatReq, id, span)
 		return
 	}
 
 	result, err := backend.Chat(r.Context(), chatReq, func(switchboard.Chunk) error { return nil })
 	if err != nil {
+		telemetry.Finish(span, id, 0, 0, "", err)
 		s.logger.Printf("chat %s: %v", model, err)
 		s.observe(r.Context(), model, backend.Name(), "error", switchboard.Usage{})
 		_ = s.record(r.Context(), audit.Record{
@@ -521,6 +547,7 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadGateway, "backend_error", err.Error())
 		return
 	}
+	telemetry.Finish(span, id, result.Usage.InputTokens, result.Usage.OutputTokens, result.StopReason, nil)
 	s.charge(r.Context(), result.Usage)
 	s.observe(r.Context(), model, backend.Name(), "ok", result.Usage)
 	_ = s.record(r.Context(), audit.Record{
@@ -534,7 +561,7 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 }
 
 // streamChat writes the completion as server-sent events.
-func (s *Server) streamChat(w http.ResponseWriter, r *http.Request, backend switchboard.Backend, req *switchboard.ChatRequest, id string) {
+func (s *Server) streamChat(w http.ResponseWriter, r *http.Request, backend switchboard.Backend, req *switchboard.ChatRequest, id string, span trace.Span) {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		writeError(w, http.StatusInternalServerError, "server_error", "streaming unsupported by this server")
@@ -580,6 +607,7 @@ func (s *Server) streamChat(w http.ResponseWriter, r *http.Request, backend swit
 		})
 	})
 	if err != nil {
+		telemetry.Finish(span, id, 0, 0, "", err)
 		s.observe(r.Context(), req.Model, backend.Name(), "error", switchboard.Usage{})
 		_ = s.record(r.Context(), audit.Record{
 			ID: id, Model: req.Model, Backend: backend.Name(), Streamed: true,
@@ -599,6 +627,7 @@ func (s *Server) streamChat(w http.ResponseWriter, r *http.Request, backend swit
 		return
 	}
 
+	telemetry.Finish(span, id, result.Usage.InputTokens, result.Usage.OutputTokens, result.StopReason, nil)
 	s.charge(r.Context(), result.Usage)
 	s.observe(r.Context(), req.Model, backend.Name(), "ok", result.Usage)
 	_ = s.record(r.Context(), audit.Record{

@@ -186,6 +186,11 @@ be the same person who administers the gateway.
   all of it. That is what makes an incident reconstructable from a single
   entry, and it means a twenty-turn conversation writes its history twenty
   times. Fine for ordinary traffic; watch it for long agent loops.
+- **A caller's trace context is adopted when sent.** A request arriving with a
+  W3C `traceparent` has its trace and span ids recorded on the entry, so an
+  investigation can move between the caller's own traces and this log without
+  matching timestamps by hand. A span is emitted per completion, as a child of
+  theirs.
 - **Conversations are linked only if the client says so.** Nothing here can
   infer that two requests belong to one thread. Send `X-Conversation-Id` and it
   is recorded; otherwise entries are correlated by subject and time.
