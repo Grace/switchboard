@@ -87,6 +87,9 @@ type Log struct {
 	// only after it has run successfully.
 	archiveCmd string
 	archiveErr error
+
+	// chain is the last self-verification result. See watch.go.
+	chain *ChainState
 }
 
 // Health reports whether writes are succeeding, and how many have failed since
@@ -103,6 +106,11 @@ func (l *Log) Health() (failures uint64, err error) {
 	defer l.mu.Unlock()
 	if l.lastErr != nil {
 		return l.failures, l.lastErr
+	}
+	// A broken chain outranks a stalled shipper: one is a lost copy, the other
+	// is a record that no longer says what it said.
+	if err := l.chain.chainError(); err != nil {
+		return l.failures, err
 	}
 	// A shipper that has stopped working is not an outage yet — the segments
 	// are still here — but it is the beginning of one, and it is silent unless

@@ -110,6 +110,31 @@ func runServe(ctx context.Context, args []string) error {
 				"check what applies to you before shortening it further", r)
 		}
 
+		// The window when this process is not running is exactly when a file
+		// would be edited, so the chain is walked before anything is served.
+		if st, err := lg.Verify(); err != nil {
+			logger.Printf("warning: could not verify the audit chain: %v", err)
+		} else if st != nil && st.Break != nil {
+			msg := fmt.Sprintf("audit chain broken at line %d (seq %d): %s — %d entries verify before it",
+				st.Break.Line, st.Break.Seq, st.Break.Reason, st.Entries)
+			if cfg.Audit.Required {
+				return fmt.Errorf("%s\n\nrefusing to start: audit.required is set, and "+
+					"appending to a chain that does not verify would bury the break", msg)
+			}
+			logger.Printf("WARNING: %s", msg)
+		} else if st != nil {
+			seg := ""
+			if st.Segments > 1 {
+				seg = fmt.Sprintf(" across %d segments", st.Segments)
+			}
+			logger.Printf("audit chain verified: %d entries%s", st.Entries, seg)
+		}
+
+		if v := time.Duration(cfg.Audit.VerifyInterval); v > 0 {
+			go lg.Watch(ctx, v, logger.Printf)
+			logger.Printf("audit: re-verifying the chain every %s", v)
+		}
+
 		if cfg.Vault.Enabled {
 			pub, err := vault.LoadPublicKey(config.ExpandPath(cfg.Vault.PublicKey))
 			if err != nil {

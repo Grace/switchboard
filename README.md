@@ -172,7 +172,7 @@ is the right place for questions and design arguments.
 it in front of, what broke, and what you needed that is not there. Especially if
 you are hitting the cost-attribution problem above.
 
-**hello@gracefulco.de**
+**grace@gracefulco.de**
 
 ## License
 

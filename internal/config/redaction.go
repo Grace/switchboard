@@ -46,6 +46,10 @@ type Audit struct {
 	// set to its path. A segment is pruned only after this has succeeded, so
 	// the local disk becomes a buffer rather than the archive.
 	ArchiveCommand string `json:"archive_command,omitempty"`
+	// VerifyInterval re-walks the chain on a timer. Verification always runs
+	// once at startup; this decides whether it runs again. Reading every
+	// segment is real I/O on a large log, so an hour is a reasonable floor.
+	VerifyInterval Duration `json:"verify_interval,omitempty"`
 }
 
 // Art26Minimum is the retention floor the EU AI Act sets for deployers of
@@ -93,6 +97,10 @@ func (c *Config) validateIO() error {
 	if c.Audit.ArchiveCommand != "" && c.Audit.MaxBytes == 0 {
 		return fmt.Errorf("audit.archive_command is set but audit.max_bytes is not: " +
 			"segments are archived when they close, and without rotation none do")
+	}
+	if v := time.Duration(c.Audit.VerifyInterval); v != 0 && v < time.Minute {
+		return fmt.Errorf("audit.verify_interval of %s is too short: verification "+
+			"reads every segment", v)
 	}
 	if c.Audit.Retention > 0 && c.Audit.MaxBytes == 0 {
 		return fmt.Errorf("audit.retention is set but audit.max_bytes is not: " +

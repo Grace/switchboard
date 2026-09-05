@@ -141,4 +141,4 @@ rolls.
   something finance can read without an engineer.
 
 If you are running Bedrock for several teams and solving this some other way, I
-would like to hear how. **hello@gracefulco.de**
+would like to hear how. **grace@gracefulco.de**
