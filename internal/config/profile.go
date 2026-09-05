@@ -28,10 +28,10 @@ type Profile string
 
 // The regimes with a table below. Unrecognised values are rejected at load.
 const (
-	ProfileNone     Profile = ""
-	ProfileHIPAA    Profile = "hipaa"
-	ProfileFINRA    Profile = "finra"
-	ProfileEUAIAct  Profile = "eu-ai-act"
+	ProfileNone    Profile = ""
+	ProfileHIPAA   Profile = "hipaa"
+	ProfileFINRA   Profile = "finra"
+	ProfileEUAIAct Profile = "eu-ai-act"
 )
 
 // Retention floors, as durations rather than the calendar arithmetic the
