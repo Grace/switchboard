@@ -602,20 +602,25 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	result, err := backend.Chat(r.Context(), chatReq, func(switchboard.Chunk) error { return nil })
 	if err != nil {
 		telemetry.Tools(span, auditToolsOffered(chatReq.Tools), nil)
-		telemetry.Finish(span, id, 0, 0, "", err)
 		s.logger.Printf("chat %s: %v", model, err)
 		s.observe(r.Context(), model, backend.Name(), "error", switchboard.Usage{})
-		_ = s.record(r.Context(), audit.Record{
+		recErr := s.record(r.Context(), audit.Record{
 			ID: id, Model: model, Backend: backend.Name(),
 			Prompt: promptText(chatReq), Error: err.Error(),
 			ToolsOffered: auditToolsOffered(chatReq.Tools),
 		})
+		// After the record, so switchboard.audit.recorded is an observation
+		// rather than an intention. A request that happened and was not written
+		// down is the gap this whole design is about, and it belongs in the
+		// tool people actually watch.
+		telemetry.Finish(span, telemetry.Outcome{
+			AuditID: id, Backend: backend.Name(), Recorded: recErr == nil,
+		}, err)
 		writeError(w, http.StatusBadGateway, "backend_error", err.Error())
 		return
 	}
 	calls, toolErr := s.checkTools(teamOf(r.Context()), chatReq.Tools, result.ToolCalls)
-	telemetry.Tools(span, auditToolsOffered(chatReq.Tools), traceTools(result.ToolCalls))
-	telemetry.Finish(span, id, result.Usage.InputTokens, result.Usage.OutputTokens, result.StopReason, toolErr)
+	telemetry.Tools(span, auditToolsOffered(chatReq.Tools), traceTools(calls))
 	s.charge(r.Context(), result.Usage)
 	s.observe(r.Context(), model, backend.Name(), okOrRefused(toolErr), result.Usage)
 	rec := audit.Record{
@@ -633,7 +638,14 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	if toolErr != nil {
 		rec.Error = toolErr.Error()
 	}
-	_ = s.record(r.Context(), rec)
+	recErr := s.record(r.Context(), rec)
+	telemetry.Finish(span, telemetry.Outcome{
+		AuditID: id, Backend: backend.Name(),
+		ModelID: result.ModelID, ProviderModel: result.ProviderModel,
+		PromptTokens: result.Usage.InputTokens, ReplyTokens: result.Usage.OutputTokens,
+		CacheWriteTokens: result.Usage.CacheWriteTokens, CacheReadTokens: result.Usage.CacheReadTokens,
+		StopReason: result.StopReason, Recorded: recErr == nil,
+	}, toolErr)
 	// The record is written before the refusal is returned. An attempted
 	// escalation that was stopped is exactly the event this log exists for,
 	// and failing the request first would risk losing it.
@@ -693,13 +705,15 @@ func (s *Server) streamChat(w http.ResponseWriter, r *http.Request, backend swit
 	})
 	if err != nil {
 		telemetry.Tools(span, auditToolsOffered(req.Tools), nil)
-		telemetry.Finish(span, id, 0, 0, "", err)
 		s.observe(r.Context(), req.Model, backend.Name(), "error", switchboard.Usage{})
-		_ = s.record(r.Context(), audit.Record{
+		recErr := s.record(r.Context(), audit.Record{
 			ID: id, Model: req.Model, Backend: backend.Name(), Streamed: true,
 			Prompt: promptText(req), Error: err.Error(),
 			ToolsOffered: auditToolsOffered(req.Tools),
 		})
+		telemetry.Finish(span, telemetry.Outcome{
+			AuditID: id, Backend: backend.Name(), Streamed: true, Recorded: recErr == nil,
+		}, err)
 		// The headers are long gone, so the only honest way to report a
 		// mid-stream failure is an error frame before [DONE].
 		if r.Context().Err() == nil {
@@ -715,8 +729,7 @@ func (s *Server) streamChat(w http.ResponseWriter, r *http.Request, backend swit
 	}
 
 	calls, toolErr := s.checkTools(teamOf(r.Context()), req.Tools, result.ToolCalls)
-	telemetry.Tools(span, auditToolsOffered(req.Tools), traceTools(result.ToolCalls))
-	telemetry.Finish(span, id, result.Usage.InputTokens, result.Usage.OutputTokens, result.StopReason, toolErr)
+	telemetry.Tools(span, auditToolsOffered(req.Tools), traceTools(calls))
 	s.charge(r.Context(), result.Usage)
 	s.observe(r.Context(), req.Model, backend.Name(), okOrRefused(toolErr), result.Usage)
 	rec := audit.Record{
@@ -733,7 +746,14 @@ func (s *Server) streamChat(w http.ResponseWriter, r *http.Request, backend swit
 	if toolErr != nil {
 		rec.Error = toolErr.Error()
 	}
-	_ = s.record(r.Context(), rec)
+	recErr := s.record(r.Context(), rec)
+	telemetry.Finish(span, telemetry.Outcome{
+		AuditID: id, Backend: backend.Name(),
+		ModelID: result.ModelID, ProviderModel: result.ProviderModel,
+		PromptTokens: result.Usage.InputTokens, ReplyTokens: result.Usage.OutputTokens,
+		CacheWriteTokens: result.Usage.CacheWriteTokens, CacheReadTokens: result.Usage.CacheReadTokens,
+		StopReason: result.StopReason, Streamed: true, Recorded: recErr == nil,
+	}, toolErr)
 
 	// A refusal on the streaming path is weaker than on the non-streaming one,
 	// and pretending otherwise would be the worst thing this code could do.
@@ -1048,13 +1068,19 @@ func okOrRefused(err error) string {
 // traceTools is the same information stripped of arguments, for the span. The
 // two conversions are separate rather than one shared shape precisely so that
 // adding an argument to the trace has to be a deliberate act.
-func traceTools(calls []switchboard.ToolCall) []telemetry.Invocation {
+//
+// It reads the checked calls rather than the model's raw ones, because that is
+// where the refusal lives. A trace showing only what the model asked for cannot
+// show that the gateway said no, and the refusal is the reason to be looking.
+func traceTools(calls []audit.ToolCall) []telemetry.Invocation {
 	if len(calls) == 0 {
 		return nil
 	}
 	out := make([]telemetry.Invocation, 0, len(calls))
 	for _, c := range calls {
-		out = append(out, telemetry.Invocation{Name: c.Name, ID: c.ID})
+		out = append(out, telemetry.Invocation{
+			Name: c.Name, ID: c.ID, Refused: c.Refused, Reason: c.Reason,
+		})
 	}
 	return out
 }

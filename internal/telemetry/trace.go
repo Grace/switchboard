@@ -33,6 +33,7 @@ type Tracer struct {
 	tracer         trace.Tracer
 	prop           propagation.TextMapPropagator
 	includeSubject bool
+	policy         string
 	shutdown       func(context.Context) error
 }
 
@@ -45,6 +46,9 @@ func NewTracer(ctx context.Context, cfg Config) (*Tracer, error) {
 	opts := []otlptracehttp.Option{otlptracehttp.WithEndpoint(cfg.Endpoint)}
 	if cfg.Insecure {
 		opts = append(opts, otlptracehttp.WithInsecure())
+	}
+	if len(cfg.Headers) > 0 {
+		opts = append(opts, otlptracehttp.WithHeaders(cfg.Headers))
 	}
 	exp, err := otlptracehttp.New(ctx, opts...)
 	if err != nil {
@@ -71,6 +75,7 @@ func NewTracer(ctx context.Context, cfg Config) (*Tracer, error) {
 		tracer:         tp.Tracer("github.com/Grace/switchboard"),
 		prop:           prop,
 		includeSubject: cfg.IncludeSubject,
+		policy:         cfg.Policy,
 		shutdown:       tp.Shutdown,
 	}, nil
 }
@@ -105,8 +110,45 @@ func (t *Tracer) Start(ctx context.Context, model, team, subject string) (contex
 	if t.includeSubject && subject != "" {
 		attrs = append(attrs, attribute.String("enduser.id", subject))
 	}
+	// The rules this request was judged under. An exported event lives in a
+	// backend that samples and expires; the fingerprint is what lets one that
+	// survives be resolved against the archived configuration, months after the
+	// event itself is gone.
+	if t.policy != "" {
+		attrs = append(attrs, attribute.String("switchboard.policy", t.policy))
+	}
 	return t.tracer.Start(ctx, "chat.completion",
 		trace.WithSpanKind(trace.SpanKindServer), trace.WithAttributes(attrs...))
+}
+
+// Outcome is what a completion produced, minus content.
+//
+// A struct rather than a longer argument list because this is the wide event —
+// Honeycomb's model, and the one this design already suited: one rich row per
+// unit of work, sliced afterwards on whichever field turns out to matter. Every
+// field here is on the audit record too. The difference is not what is
+// exported but what is guaranteed about it: this copy is sampled and expires,
+// and the record is neither.
+type Outcome struct {
+	AuditID string
+	Backend string
+	// ModelID is what this gateway sent; ProviderModel is what the provider
+	// said served it. Two different claims, kept apart here as in the log.
+	ModelID       string
+	ProviderModel string
+
+	PromptTokens     int
+	ReplyTokens      int
+	CacheWriteTokens int
+	CacheReadTokens  int
+
+	StopReason string
+	Streamed   bool
+	// Recorded reports whether this completion reached the audit log. False is
+	// the interesting value: a request that happened and was not recorded is
+	// precisely the gap the evidence tier exists to close, and it should be
+	// visible in the tool people actually watch.
+	Recorded bool
 }
 
 // Finish records the outcome on a span.
@@ -115,17 +157,43 @@ func (t *Tracer) Start(ctx context.Context, model, team, subject string) (contex
 // so these land in the same fields as everything else emitting LLM telemetry.
 // Those conventions are still marked Development, which is worth knowing rather
 // than discovering: the names may move.
-func Finish(span trace.Span, auditID string, promptTokens, replyTokens int, stopReason string, err error) {
+func Finish(span trace.Span, o Outcome, err error) {
 	if span == nil {
 		return
 	}
 	span.SetAttributes(
-		attribute.Int("gen_ai.usage.input_tokens", promptTokens),
-		attribute.Int("gen_ai.usage.output_tokens", replyTokens),
-		attribute.String("switchboard.audit.id", auditID),
+		attribute.Int("gen_ai.usage.input_tokens", o.PromptTokens),
+		attribute.Int("gen_ai.usage.output_tokens", o.ReplyTokens),
+		attribute.String("switchboard.audit.id", o.AuditID),
+		attribute.Bool("switchboard.audit.recorded", o.Recorded),
 	)
-	if stopReason != "" {
-		span.SetAttributes(attribute.String("gen_ai.response.finish_reason", stopReason))
+	// Cached tokens are their own fields, not folded into input. They are
+	// billed at a different rate by up to an order of magnitude, so a chart
+	// that sums them is a cost chart that is wrong for exactly the deployments
+	// with a large stable prompt.
+	if o.CacheWriteTokens > 0 {
+		span.SetAttributes(attribute.Int("gen_ai.usage.cache_write_tokens", o.CacheWriteTokens))
+	}
+	if o.CacheReadTokens > 0 {
+		span.SetAttributes(attribute.Int("gen_ai.usage.cache_read_tokens", o.CacheReadTokens))
+	}
+	if o.Backend != "" {
+		span.SetAttributes(attribute.String("switchboard.backend", o.Backend))
+	}
+	if o.ModelID != "" {
+		span.SetAttributes(attribute.String("switchboard.model_id", o.ModelID))
+	}
+	// The provider's own answer, under the convention's response-model field,
+	// and only where a provider gives one. Filling it from our own routing
+	// would turn a configuration value into an attestation from somebody else.
+	if o.ProviderModel != "" {
+		span.SetAttributes(attribute.String("gen_ai.response.model", o.ProviderModel))
+	}
+	if o.Streamed {
+		span.SetAttributes(attribute.Bool("switchboard.streamed", true))
+	}
+	if o.StopReason != "" {
+		span.SetAttributes(attribute.String("gen_ai.response.finish_reason", o.StopReason))
 	}
 	if err != nil {
 		span.RecordError(err)
@@ -138,6 +206,12 @@ func Finish(span trace.Span, auditID string, promptTokens, replyTokens int, stop
 type Invocation struct {
 	Name string
 	ID   string
+	// Refused marks a call the gateway would not pass back, and Reason says
+	// why. A refusal is the highest-signal thing on this span: it is either an
+	// attack that was stopped or a permission somebody needs and lacks, and a
+	// trace showing only the calls that succeeded is silent about both.
+	Refused bool
+	Reason  string
 }
 
 // Tools records what the model was permitted to do and what it did.
@@ -159,11 +233,29 @@ func Tools(span trace.Span, offered []string, called []Invocation) {
 	if len(offered) > 0 {
 		span.SetAttributes(attribute.StringSlice("switchboard.tools.offered", offered))
 	}
+	refused := 0
+	for _, c := range called {
+		if c.Refused {
+			refused++
+		}
+	}
 	span.SetAttributes(attribute.Int("gen_ai.tool.call_count", len(called)))
+	if refused > 0 {
+		// Its own attribute rather than something to be derived from the
+		// events: this is the field somebody builds an alert on, and a count
+		// that has to be computed from a nested list will not be.
+		span.SetAttributes(attribute.Int("switchboard.tools.refused", refused))
+	}
 	for _, c := range called {
 		attrs := []attribute.KeyValue{attribute.String("gen_ai.tool.name", c.Name)}
 		if c.ID != "" {
 			attrs = append(attrs, attribute.String("gen_ai.tool.call.id", c.ID))
+		}
+		if c.Refused {
+			attrs = append(attrs, attribute.Bool("switchboard.tool.refused", true))
+			if c.Reason != "" {
+				attrs = append(attrs, attribute.String("switchboard.tool.refusal_reason", c.Reason))
+			}
 		}
 		// One event per call rather than one attribute listing them: a tool
 		// called twice in a turn is two things that happened, and an attribute

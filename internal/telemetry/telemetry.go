@@ -56,6 +56,18 @@ type Config struct {
 	// identity leaves the process.
 	IncludeSubject bool
 	Version        string
+	// Headers go on every OTLP request. A hosted backend authenticates this
+	// way — Honeycomb wants x-honeycomb-team — and without them switchboard
+	// can reach a local collector and nothing else.
+	//
+	// Resolved before they get here, so this package never reads the
+	// environment: a secret should enter the process at one place that can
+	// fail loudly, not wherever it happens to be needed.
+	Headers map[string]string
+	// Policy is the fingerprint of the configuration in force. It goes on every
+	// span, which is what lets an event in a sampled, expiring backend be
+	// resolved against the archived configuration that produced it.
+	Policy string
 }
 
 // New builds a meter exporting to an OTLP receiver.
@@ -73,6 +85,9 @@ func New(ctx context.Context, cfg Config) (*Meter, error) {
 	opts := []otlpmetrichttp.Option{otlpmetrichttp.WithEndpoint(cfg.Endpoint)}
 	if cfg.Insecure {
 		opts = append(opts, otlpmetrichttp.WithInsecure())
+	}
+	if len(cfg.Headers) > 0 {
+		opts = append(opts, otlpmetrichttp.WithHeaders(cfg.Headers))
 	}
 	exp, err := otlpmetrichttp.New(ctx, opts...)
 	if err != nil {

@@ -69,7 +69,15 @@ func runServe(ctx context.Context, args []string) error {
 		logger.Printf("  (no models configured — see 'switchboard init')")
 	}
 
-	meter, err := telemetry.New(ctx, cfg.Telemetry.Options(Version))
+	// Resolved once, before either exporter is built, so a missing credential
+	// stops startup rather than producing a dashboard that is quietly empty.
+	otlpHeaders, err := cfg.Telemetry.ResolveHeaders()
+	if err != nil {
+		return err
+	}
+	otlp := cfg.Telemetry.Options(Version, otlpHeaders, cfg.PolicyFingerprint())
+
+	meter, err := telemetry.New(ctx, otlp)
 	if err != nil {
 		return fmt.Errorf("telemetry: %w", err)
 	}
@@ -85,7 +93,7 @@ func runServe(ctx context.Context, args []string) error {
 			cfg.Telemetry.Endpoint, time.Duration(cfg.Telemetry.Interval))
 	}
 
-	tracer, err := telemetry.NewTracer(ctx, cfg.Telemetry.Options(Version))
+	tracer, err := telemetry.NewTracer(ctx, otlp)
 	if err != nil {
 		return fmt.Errorf("tracing: %w", err)
 	}

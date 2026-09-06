@@ -16,9 +16,10 @@ import (
 // collector stands in for an OTLP/HTTP receiver, recording what arrives.
 type collector struct {
 	*httptest.Server
-	mu   sync.Mutex
-	hits int
-	body []byte
+	mu      sync.Mutex
+	hits    int
+	body    []byte
+	headers http.Header
 }
 
 func newCollector(t *testing.T) *collector {
@@ -29,6 +30,7 @@ func newCollector(t *testing.T) *collector {
 		c.mu.Lock()
 		c.hits++
 		c.body = b
+		c.headers = r.Header.Clone()
 		c.mu.Unlock()
 		w.WriteHeader(http.StatusOK)
 	}))
