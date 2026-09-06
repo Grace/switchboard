@@ -22,7 +22,32 @@ secrets to do it. A missing or empty variable stops startup, because an
 unauthenticated export fails in a log nobody reads and the first sign of trouble
 is a dashboard that was quietly empty for a week.
 
-## Why both
+## What this is actually for
+
+The obvious framing is "your observability tool cannot hold evidence, so add a
+second thing." That is true and it is the wrong way round, because it reads as
+extra work.
+
+Here is the useful way round. **In a regulated environment, the unresolved
+compliance question is what stops the observability tool being adopted at all.**
+The conversation goes the same way every time: a team wants to run agents in
+production, they want real observability for it, and someone in risk or audit
+asks whether that platform is the system of record for what the models did.
+The honest answer is no — it samples, and it keeps sixty days. At which point
+the project either stalls, or the team is told to build a bespoke archive
+first, or somebody buys a heavyweight "AI governance" suite that does mediocre
+observability as a side effect.
+
+None of those outcomes is good for anybody, and all three are caused by asking
+one system to answer two questions it was never designed to answer together.
+
+Separate the tiers and the objection goes away. The observability platform gets
+to be excellent at observability without pretending to be a system of record,
+and the compliance question is answered by something built for it. **This does
+not compete with your observability vendor. It removes the reason you could not
+buy one.**
+
+## Why the split is structural
 
 Honeycomb has written the clearest statement of this that exists, and it is
 theirs rather than mine —
@@ -40,7 +65,9 @@ correct choices for debugging and both are disqualifying for evidence, where
 completeness is the whole claim and the obligations run from six months
 (EU AI Act Art. 19) to six years (HIPAA, FINRA).
 
-So switchboard does not compete with that. It emits into it:
+Nobody should want those choices reversed. A platform that kept everything for
+seven years to satisfy an auditor would be slower and more expensive at the job
+it is actually for.
 
 | | Honeycomb | The audit log |
 |---|---|---|
@@ -51,7 +78,9 @@ So switchboard does not compete with that. It emits into it:
 | Content | never | redacted, behind a retention policy |
 
 **One instrumentation point.** The gateway is already in the request path, so
-neither tier needs an SDK, a wrapper, or a change to any application.
+neither tier needs an SDK, a wrapper, or a change to any application. The cost
+of adding the evidence tier is a config block, which is the other half of why
+this is not extra work.
 
 ## What is on the event
 
