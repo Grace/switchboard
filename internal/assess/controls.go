@@ -374,6 +374,58 @@ func Assess(d Deployment) ControlReport {
 		unknown(agency, callObj, callRefs, "tool calls are recorded")
 	}
 
+	// ---- Change management ----
+	const change = "Change management"
+	authRefs := refs("SOC 2", "CC8.1", "NIST 800-53", "CM-3", "ISO 27001", "A.8.32")
+	const changeObj = "Configuration changes are authorised before deployment"
+	switch {
+	case d.Change.Authorised == Yes:
+		ev := "A configuration is served only where somebody who is not this process " +
+			"signed for it."
+		if d.Change.AuthorisedDetail != "" {
+			ev = d.Change.AuthorisedDetail
+		}
+		if d.Change.Enforced == No {
+			ev += " Unauthorised configurations are served and reported rather than " +
+				"refused, which makes this detective and not preventive."
+		}
+		if d.Change.Minimum == 1 && d.Change.Approvers > 0 {
+			// Worth saying on a Met row. One signature is a real control and it
+			// does not survive the person who holds the key also holding the
+			// configuration file.
+			ev += " One signature is required, so a single person who can edit the " +
+				"configuration and sign for it approves their own change."
+		}
+		add(change, changeObj, authRefs, StatusMet, ev)
+	case d.Change.Authorised == No:
+		add(change, changeObj, authRefs, StatusUnmet,
+			"Nothing records who authorised the rules in force. A model, a prompt, a tool "+
+				"grant or a redaction rule can be changed by anyone who can write the "+
+				"configuration file, and the record will show what the rules became "+
+				"without showing that anybody agreed to them.")
+	default:
+		unknown(change, changeObj, authRefs, "a configuration is authorised before it is served")
+	}
+
+	const policyObj = "The rules in force at the time of a decision are recoverable"
+	recoverRefs := refs("SOC 2", "CC8.1", "SOC 2", "CC7.2", "EU AI Act", "Art. 12")
+	switch d.Change.Recoverable {
+	case Yes:
+		add(change, policyObj, recoverRefs, StatusMet,
+			"Each entry cites the fingerprint of the configuration it was served under, and "+
+				"that configuration is archived under the same fingerprint. A stored document "+
+				"hashes to its own name, so the rules and the entries citing them can be "+
+				"checked against each other by anyone holding both. Archiving is not "+
+				"retroactive: entries written before it began cite rules nobody kept.")
+	case No:
+		add(change, policyObj, recoverRefs, StatusUnmet,
+			"Entries record that the rules changed and not what they were. A decision "+
+				"questioned months later cannot be read against the configuration that "+
+				"produced it, which is the moment this is always needed.")
+	default:
+		unknown(change, policyObj, recoverRefs, "the configuration behind a recorded fingerprint is kept")
+	}
+
 	// ---- Availability ----
 	const avail = "Availability and operations"
 	limitRefs := refs("SOC 2", "A1.1", "NIST 800-53", "SC-5", "MITRE ATLAS", "AML.M0004")

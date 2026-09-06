@@ -52,6 +52,7 @@ commands:
   agents     list the programs calling this gateway, as the traffic reveals them
   drift      compare the models the log saw against the models the config approves
   reconcile  compare what the log recorded against what the provider billed
+  policy     who authorised the configuration this gateway runs
   controls   assess this config against the control objectives a review asks about
   evidence   package a period of the log for someone who does not trust you
   version    print the version
@@ -90,6 +91,8 @@ func Main(ctx context.Context, args []string) int {
 		err = runDrift(ctx, args[1:])
 	case "reconcile":
 		err = runReconcile(ctx, args[1:])
+	case "policy":
+		err = runPolicy(ctx, args[1:])
 	case "controls":
 		err = runControls(ctx, args[1:])
 	case "evidence":

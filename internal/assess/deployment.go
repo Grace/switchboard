@@ -64,6 +64,7 @@ type Deployment struct {
 	Audit     Audit     `json:"audit"`
 	Data      Data      `json:"data"`
 	Agency    Agency    `json:"agency"`
+	Change    Change    `json:"change"`
 	Runtime   Runtime   `json:"runtime"`
 }
 
@@ -76,6 +77,36 @@ type Deployment struct {
 // completion log is worst at showing after the fact, because the harm is not in
 // the text — it is in the action the text caused, and by the time anyone reads
 // the entry the action has happened.
+// Change is whether the configuration this system runs is under control.
+//
+// A model roster, a prompt, a tool grant and a redaction rule all decide what a
+// deployment does in production, and they are usually outside the change
+// process that covers application code — changed through a console, by one
+// person, with nothing forcing a review. That gap is the common finding and it
+// is invisible to any check that only reads the configuration, because a
+// configuration cannot say who agreed to it.
+type Change struct {
+	// Authorised means a configuration carries a signature from somebody who is
+	// not the process running it.
+	Authorised Support `json:"authorised"`
+	// AuthorisedDetail is the mechanism in the adapter's own terms.
+	AuthorisedDetail string `json:"authorised_detail,omitempty"`
+	// Enforced separates a preventive control from a detective one: whether an
+	// unauthorised configuration is refused, or served and reported.
+	Enforced Support `json:"enforced"`
+	// Approvers is how many people may authorise; Minimum how many must. One is
+	// materially weaker than two and the report should not flatten them: a
+	// single approver who can also edit the configuration is approving their
+	// own change.
+	Approvers int `json:"approvers,omitempty"`
+	Minimum   int `json:"minimum,omitempty"`
+	// Recoverable means the configuration behind a recorded fingerprint is
+	// kept, not only its digest. A digest names a document; without the
+	// document, a decision questioned later cannot be read against the rules
+	// that produced it.
+	Recoverable Support `json:"recoverable"`
+}
+
 type Agency struct {
 	// ToolsOffered is whether callers can put tools in front of a model here at
 	// all. Where they cannot, the objectives below are not gaps in the

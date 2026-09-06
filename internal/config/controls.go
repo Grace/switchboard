@@ -66,6 +66,26 @@ func (c *Config) Deployment() assess.Deployment {
 			Listen:                c.Listen,
 			SealedRecovery:        assess.Bool(c.Vault.Enabled),
 		},
+		Change: assess.Change{
+			// Authorised is about the mechanism being in force, not about
+			// whether today's configuration happens to be signed: that is a
+			// per-policy fact and "switchboard policy history" answers it over
+			// a period, which is what the control actually asks.
+			Authorised: assess.Bool(c.ChangeControl.Enabled),
+			AuthorisedDetail: "Each configuration is served only where an Ed25519 signature " +
+				"over its policy fingerprint verifies against a configured approver. The " +
+				"gateway holds public keys only, so the serving process cannot sign for " +
+				"itself, and the approver roster is inside the fingerprint — adding an " +
+				"approver is a change that needs approving. Whether every policy in a given " +
+				"period was signed, and signed before it served, is what " +
+				"'switchboard policy history' reports.",
+			Enforced:  assess.Bool(c.ChangeControl.Enabled && c.ChangeControl.Required),
+			Approvers: len(c.ChangeControl.Approvers),
+			Minimum:   c.ChangeControl.Threshold(),
+			// The archive is written beside the log, so it exists exactly when
+			// the log does.
+			Recoverable: assess.Bool(c.Audit.Enabled),
+		},
 		Assurance: assess.Assurance{
 			// switchboard cannot know whether anyone red-teamed the models
 			// behind it, and guessing either way would invent a finding.

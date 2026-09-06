@@ -82,6 +82,9 @@ type Config struct {
 	// Reconciliation names the models on a provider's invoice, so the log can
 	// be set against it. See reconciliation.go.
 	Reconciliation Reconciliation `json:"reconciliation,omitempty"`
+	// ChangeControl requires that somebody authorised this configuration before
+	// the gateway runs it. See changecontrol.go.
+	ChangeControl ChangeControl `json:"change_control,omitempty"`
 	// Tools bounds which functions a model may actually be made to call.
 	Tools Tools `json:"tools,omitempty"`
 	// TLS secures the listener itself.
@@ -233,6 +236,9 @@ func (c *Config) validate(checkProfile bool) error {
 	// configuration that produced it, and a price for a model retired last
 	// month is exactly what reading last month's entries needs.
 	if err := c.Reconciliation.validate(); err != nil {
+		return err
+	}
+	if err := c.ChangeControl.validate(); err != nil {
 		return err
 	}
 	if err := c.Pricing.validate(); err != nil {

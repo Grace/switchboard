@@ -33,6 +33,12 @@ type policyView struct {
 	Vault       vaultView   `json:"vault"`
 	Limits      Limits      `json:"limits"`
 	MutualTLS   bool        `json:"mutual_tls"`
+	// ChangeControl is in here for a specific reason: it makes the approver
+	// roster part of what an approval covers. Adding yourself as an approver
+	// moves the fingerprint, so that change needs a signature from whoever
+	// could already sign — rather than being the one edit that authorises
+	// every edit after it. The keys are inline for the same reason.
+	ChangeControl ChangeControl `json:"change_control"`
 }
 
 // teamView omits the keys themselves. A rotated key is not a policy change, and
@@ -109,9 +115,10 @@ func (c *Config) PolicyDocument() ([]byte, string) {
 			VerifyInterval: c.Audit.VerifyInterval,
 			Archived:       c.Audit.ArchiveCommand != "",
 		},
-		Vault:     vaultView{Enabled: c.Vault.Enabled},
-		Limits:    c.Limits,
-		MutualTLS: c.TLS.ClientCAFile != "",
+		Vault:         vaultView{Enabled: c.Vault.Enabled},
+		Limits:        c.Limits,
+		MutualTLS:     c.TLS.ClientCAFile != "",
+		ChangeControl: c.ChangeControl,
 	}
 
 	// Go marshals struct fields in declaration order and map keys sorted, so

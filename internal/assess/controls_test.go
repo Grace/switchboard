@@ -212,3 +212,60 @@ func TestTamperEvidenceUsesTheAdaptersMechanism(t *testing.T) {
 		t.Errorf("adapter detail was not used: %q", got)
 	}
 }
+
+// An adapter that says nothing about change control must produce Unknown, not
+// Unmet. The same mistake in the other direction once told a Bedrock account it
+// was hash-chained; here it would invent a finding about somebody else's
+// deployment from a field their adapter does not populate.
+func TestChangeControlIsUnknownWhereAnAdapterIsSilent(t *testing.T) {
+	var d Deployment
+	d.Source = "some-other-gateway"
+	rep := Assess(d)
+
+	for _, want := range []string{"authorised before deployment", "at the time of a decision"} {
+		row := findRow(t, rep, want)
+		if row.Status != StatusUnknown {
+			t.Errorf("%q is %s for an adapter that never set the field; want %s",
+				row.Objective, row.Status, StatusUnknown)
+		}
+	}
+}
+
+// One signature is a real control that does not survive the signer also holding
+// the configuration file, and a Met row has to say so rather than reading as
+// though the question is closed.
+func TestASingleApproverIsMetAndSaysWhatItIsNot(t *testing.T) {
+	d := Deployment{Source: "switchboard"}
+	d.Change = Change{Authorised: Yes, Enforced: Yes, Approvers: 1, Minimum: 1, Recoverable: Yes}
+	row := findRow(t, Assess(d), "authorised before deployment")
+	if row.Status != StatusMet {
+		t.Fatalf("status = %s", row.Status)
+	}
+	if !strings.Contains(row.Evidence, "own change") {
+		t.Errorf("a single-approver deployment should be told what one signature does not cover: %q",
+			row.Evidence)
+	}
+}
+
+// Serving an unapproved configuration and reporting it is a detective control,
+// which is a different claim from refusing it.
+func TestDetectiveChangeControlSaysItIsNotPreventive(t *testing.T) {
+	d := Deployment{Source: "switchboard"}
+	d.Change = Change{Authorised: Yes, Enforced: No, Approvers: 2, Minimum: 2, Recoverable: Yes}
+	row := findRow(t, Assess(d), "authorised before deployment")
+	if !strings.Contains(row.Evidence, "detective") {
+		t.Errorf("evidence should distinguish detective from preventive: %q", row.Evidence)
+	}
+}
+
+// findRow locates a control row by a fragment of its objective.
+func findRow(t *testing.T, rep ControlReport, fragment string) Control {
+	t.Helper()
+	for _, c := range rep.Controls {
+		if strings.Contains(c.Objective, fragment) {
+			return c
+		}
+	}
+	t.Fatalf("no control matching %q in %d rows", fragment, len(rep.Controls))
+	return Control{}
+}

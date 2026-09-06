@@ -39,6 +39,23 @@ func runServe(ctx context.Context, args []string) error {
 	defer reg.Close()
 
 	logger := log.New(os.Stderr, "switchboard: ", log.LstdFlags)
+
+	// Change control, before anything else is announced. Printing "serving N
+	// models" and then refusing reads as a crash; refusing first reads as the
+	// control it is. Approvals live beside the log, so a deployment with no
+	// audit path has nowhere one could have been stored — and change control
+	// without a log to attach it to is not a thing this can enforce.
+	if cfg.Audit.Enabled && cfg.Audit.Path != "" {
+		dir := policy.DirFor(config.ExpandPath(cfg.Audit.Path))
+		if err := checkApproval(logger, cfg, dir); err != nil {
+			return err
+		}
+	} else if cfg.ChangeControl.Enabled {
+		return fmt.Errorf("change_control is enabled and no audit log is configured. " +
+			"Approvals are stored beside the log and are about what it records, so there " +
+			"is nowhere to keep them and nothing to attach them to: set audit.path")
+	}
+
 	models := reg.Models(ctx)
 	proto := "http"
 	if cfg.TLS.CertFile != "" {

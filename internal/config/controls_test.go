@@ -167,6 +167,14 @@ func TestControlsFullyConfiguredHasNoUnmet(t *testing.T) {
 		Declare: map[string]ToolDecl{"lookup": {Bundle: "support"}},
 		Grants:  map[string]ToolGrant{"clinic": {Tools: []string{"lookup"}}},
 	}
+	// Same reasoning: a deployment whose rules anybody can change without a
+	// signature has a gap, and the row exists to make somebody close it. Two
+	// approvers, because one person who can edit the configuration and sign for
+	// it is approving their own change.
+	c.ChangeControl = ChangeControl{
+		Enabled: true, Required: true, Minimum: 2,
+		Approvers: []Approver{approver(t, "grace"), approver(t, "sam")},
+	}
 
 	rep := c.Controls()
 	for _, ctl := range rep.Controls {
