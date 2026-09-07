@@ -413,9 +413,12 @@ Resources:
     Metadata:
       com.aws.cloudformation.Context:
         why: Terminates TLS for sidecars, which refuse plain HTTP to non-loopback hosts.
-        must: [Internal only. The control plane must never be internet facing.]
+        must:
+          - Internal only. The control plane must never be internet facing.
+          - Do not give this an explicit Name. Load balancer names are capped at 32
+            characters, so a stack name over 24 fails here after the VPC, NAT and
+            database have already been built.
     Properties:
-      Name: !Sub '${AWS::StackName}-control'
       Scheme: internal
       Type: application
       Subnets: [!Ref PrivateSubnetA, !Ref PrivateSubnetB]
@@ -423,8 +426,13 @@ Resources:
 
   TargetGroup:
     Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: Health-checks the control plane behind the load balancer.
+        must:
+          - Do not give this an explicit Name, for the same 32 character reason as
+            the load balancer above.
     Properties:
-      Name: !Sub '${AWS::StackName}-control'
       VpcId: !Ref Vpc
       Port: 8000
       Protocol: HTTP
@@ -865,6 +873,11 @@ Outputs:
   LoadBalancerDNSName:
     Description: The load balancer's own name, for diagnostics.
     Value: !GetAtt LoadBalancer.DNSName
+  TargetGroupArn:
+    Description: >-
+      Exported so tooling can find the target group without guessing a name.
+      Guessing one is what hid a name-length defect until a real deployment.
+    Value: !Ref TargetGroup
   PolicySigningSeedSecretArn:
     Description: Secret holding the signing seed. Read the public key from the control plane, never this.
     Value: !Ref PolicySigningSeedSecret
