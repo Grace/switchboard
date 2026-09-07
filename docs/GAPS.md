@@ -1,0 +1,14 @@
+# Remaining production gates
+
+This implementation should enter staging before customer production traffic. The archive filename reflects the requested deliverable, not a claim of certification.
+
+1. **Unexecuted integrations:** real Postgres API/RLS/migration tests, real socket tests, Docker builds/scans, Terraform provider validation/plans, live-provider streaming, load/soak tests, SIGTERM under load and AWS deployment were not executable in the restricted build session. CI defines the main automated checks; it has not run remotely.
+2. **Telemetry loss:** nonblocking inference and bounded buffering mean memory-queue loss on crash and drops under saturation. Default Fargate task replacement loses its local spool. Stable persistent single-writer EFS deployment is described but not provisioned or proven here. OTLP is best effort and has no disk spool.
+3. **Portable API subset:** text chat only. No tool calls/results, images, audio, structured output, Responses API, streaming usage chunks, provider reasoning controls or Bedrock. Unknown features are rejected. Model equivalence, regional/data-retention suitability and model-specific `max_tokens` compatibility need explicit customer validation.
+4. **Idempotency:** no exactly-once generations, replay cache or distributed application-operation ledger. Transport uncertainty never triggers automatic failover, but even 429/503 retry cannot prove absence of upstream billing/execution. Disable client auto-retries.
+5. **Security operations:** bearer RBAC is implemented; SSO, MFA, human-user lifecycle, external authorization, hardware-backed signing and automated policy/key renewal are not. Emergency gateway trust-key removal requires rollout. Database RLS is defense against query mistakes, not a compromised shared DB session.
+6. **Infrastructure integration:** modules require existing VPC, IAM roles, KMS policies, ALB/certificate/target group, state backend, edge throttling and operational alarms. Deployment defaults and resource sizes need capacity review. RDS CA material and a restricted runtime DB login must be provisioned separately.
+7. **Supply chain:** primary Python dependencies are version pinned; transitive dependency hashes, action commit pins, build-image digests, SBOM/signature generation and Go vulnerability scanning are release work. CI's Python audit must pass; no audit result is claimed.
+8. **Scale/operations:** rate limits and circuits are per process. No fleet-wide quota, automatic data retention/partitioning, telemetry batching, production dashboard, SLO configuration, audit export or restore drill is included. Spool delivery sends individual events, capped at 100 per tick; benchmark against workload volume.
+
+See `VALIDATION.md` for the precise tests run here. Do not infer that a defined CI job has passed.

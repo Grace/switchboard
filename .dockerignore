@@ -1,0 +1,13 @@
+.git
+.env
+.env.*
+!*.example
+.local
+data
+*.zip
+*.bundle
+**/__pycache__
+.pytest_cache
+*.pem
+*.key
+config.json

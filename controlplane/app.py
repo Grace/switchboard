@@ -1,0 +1,208 @@
+import base64
+import asyncio
+from contextlib import asynccontextmanager
+from datetime import datetime, timezone
+import hashlib
+import json
+import logging
+import os
+import time
+import uuid
+from typing import Literal
+
+from fastapi import Depends, FastAPI, Header, HTTPException, Request
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel, ConfigDict, Field
+from psycopg.rows import dict_row
+from psycopg.conninfo import conninfo_to_dict
+from psycopg.types.json import Jsonb
+from psycopg_pool import ConnectionPool
+from controlplane.policy import sign, validate_policy, ID
+
+log = logging.getLogger("switchboard")
+log.setLevel(logging.INFO)
+if not log.handlers:
+    handler = logging.StreamHandler()
+    handler.setFormatter(logging.Formatter("%(message)s"))
+    log.addHandler(handler)
+    log.propagate = False
+
+class Strict(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+class NewPrincipal(Strict):
+    # Caller generates and stores a random 256-bit token; only its SHA-256 enters this API.
+    token_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
+    role: Literal["admin", "publisher", "viewer", "agent"]
+    expires_at: int
+
+class Event(Strict):
+    id: str = Field(pattern=r"^[0-9a-f]{32}$")
+    request_id: str = Field(pattern=r"^[0-9a-f]{32}$")
+    trace_id: str = Field(pattern=r"^[0-9a-f]{32}$")
+    span_id: str = Field(pattern=r"^[0-9a-f]{16}$")
+    parent_id: str | None = Field(default=None, pattern=r"^[0-9a-f]{16}$")
+    provider: Literal["", "openai", "anthropic", "gemini"]
+    status: int = Field(ge=100, le=599)
+    attempts: int = Field(ge=0, le=3)
+    start_ns: int = Field(ge=1)
+    end_ns: int = Field(ge=1)
+
+def require(principal: dict, *roles):
+    if principal["role"] not in roles:
+        raise HTTPException(403, "forbidden")
+
+def create_app(pool=None, seed=None, key_id=None):
+    @asynccontextmanager
+    async def lifespan(app):
+        owned = pool is None
+        if owned:
+            dsn = os.environ["DATABASE_URL"]
+            if os.getenv("ALLOW_LOCAL_HTTP") != "true" and conninfo_to_dict(dsn).get("sslmode") != "verify-full":
+                raise RuntimeError("DATABASE_URL must specify sslmode=verify-full")
+            app.state.pool = ConnectionPool(dsn, min_size=1, max_size=10, timeout=3, max_waiting=32,
+                                            kwargs={"row_factory": dict_row, "connect_timeout": 5}, open=False)
+            app.state.pool.open(wait=True, timeout=10)
+        else:
+            app.state.pool = pool
+        app.state.seed = seed if seed is not None else base64.b64decode(os.environ["POLICY_SIGNING_SEED"], validate=True)
+        app.state.key_id = key_id or os.environ["POLICY_KEY_ID"]
+        if len(app.state.seed) != 32 or not ID.fullmatch(app.state.key_id):
+            raise RuntimeError("invalid signing configuration")
+        app.state.ready = True
+        yield
+        app.state.ready = False
+        if owned:
+            app.state.pool.close()
+
+    app = FastAPI(title="Switchboard control plane", version="1.0.0", lifespan=lifespan,
+                  docs_url=None, redoc_url=None, openapi_url=None)
+
+    @app.middleware("http")
+    async def guard(request: Request, call_next):
+        rid = uuid.uuid4().hex
+        started = time.monotonic()
+        # Bound bodies even for chunked uploads; never log body or auth header.
+        size = 0
+        chunks = []
+        try:
+            async with asyncio.timeout(10):
+                async for chunk in request.stream():
+                    size += len(chunk)
+                    if size > 65536:
+                        return JSONResponse({"detail": "body too large"}, status_code=413)
+                    chunks.append(chunk)
+        except TimeoutError:
+            return JSONResponse({"detail": "request timeout"}, status_code=408)
+        request._body = b"".join(chunks)
+        try:
+            response = await call_next(request)
+        except Exception:
+            log.error(json.dumps({"event": "request_failed", "request_id": rid}))
+            response = JSONResponse({"detail": "service unavailable"}, status_code=503)
+        response.headers["X-Request-ID"] = rid
+        log.info(json.dumps({"event": "request", "request_id": rid, "method": request.method,
+                             "status": response.status_code, "duration_ms": int((time.monotonic()-started)*1000)}))
+        return response
+
+    @app.exception_handler(RequestValidationError)
+    async def validation_error(request, exc):
+        return JSONResponse({"detail": "invalid request schema"}, status_code=422)
+
+    def session(request: Request, authorization: str = Header(default="")):
+        if not authorization.startswith("Bearer ") or not 32 <= len(authorization[7:]) <= 512:
+            raise HTTPException(401, "unauthorized")
+        digest = hashlib.sha256(authorization[7:].encode()).hexdigest()
+        with request.app.state.pool.connection() as db, db.transaction():
+            db.execute("SET LOCAL statement_timeout='3000ms'")
+            db.execute("SET LOCAL lock_timeout='1000ms'")
+            p = db.execute("SELECT * FROM authenticate(%s)", (digest,)).fetchone()
+            if p is None:
+                raise HTTPException(401, "unauthorized")
+            db.execute("SELECT set_config('app.tenant',%s,true),set_config('app.role',%s,true)", (p["tenant_id"], p["role"]))
+            yield db, p
+
+    def audit(db, p, action, detail):
+        db.execute("INSERT INTO audit(tenant_id,principal_id,action,detail) VALUES(%s,%s,%s,%s)",
+                   (p["tenant_id"], p["id"], action, Jsonb(detail)))
+
+    @app.get("/healthz")
+    def health():
+        return {"ok": True}
+
+    @app.get("/readyz")
+    def ready(request: Request):
+        with request.app.state.pool.connection() as db:
+            db.execute("SELECT 1").fetchone()
+        return {"ready": request.app.state.ready}
+
+    @app.get("/v1/policy")
+    def policy(s=Depends(session, scope="function")):
+        db, p = s
+        row = db.execute("SELECT envelope FROM policies WHERE tenant_id=%s ORDER BY version DESC LIMIT 1", (p["tenant_id"],)).fetchone()
+        if row is None:
+            raise HTTPException(404, "no policy")
+        return row["envelope"]
+
+    @app.put("/v1/policy")
+    def publish(body: dict, request: Request, s=Depends(session, scope="function")):
+        db, p = s
+        require(p, "admin", "publisher")
+        try:
+            validate_policy(body, p["tenant_id"])
+        except (ValueError, TypeError, KeyError):
+            raise HTTPException(422, "invalid policy")
+        # Serializes first publication and subsequent versions per tenant.
+        db.execute("SELECT pg_advisory_xact_lock(hashtextextended(%s,0))", (p["tenant_id"],))
+        row = db.execute("SELECT max(version) AS version FROM policies WHERE tenant_id=%s", (p["tenant_id"],)).fetchone()
+        if row["version"] is not None and body["version"] <= row["version"]:
+            raise HTTPException(409, "version must increase")
+        envelope = sign(body, request.app.state.key_id, request.app.state.seed)
+        db.execute("INSERT INTO policies(tenant_id,version,envelope) VALUES(%s,%s,%s)", (p["tenant_id"], body["version"], Jsonb(envelope)))
+        audit(db, p, "policy.publish", {"version": body["version"], "key_id": envelope["key_id"]})
+        return envelope
+
+    @app.post("/v1/telemetry")
+    def telemetry(body: Event, s=Depends(session, scope="function")):
+        db, p = s
+        require(p, "agent")
+        if body.end_ns < body.start_ns or body.end_ns > time.time_ns() + 60_000_000_000:
+            raise HTTPException(422, "invalid event timestamps")
+        db.execute("INSERT INTO telemetry(tenant_id,id,event) VALUES(%s,%s,%s) ON CONFLICT DO NOTHING",
+                   (p["tenant_id"], body.id, Jsonb(body.model_dump(exclude_none=True))))
+        return {"id": body.id}
+
+    @app.get("/v1/telemetry")
+    def telemetry_list(s=Depends(session, scope="function")):
+        db, p = s
+        require(p, "admin", "publisher", "viewer")
+        return db.execute("SELECT event,received_at FROM telemetry WHERE tenant_id=%s ORDER BY received_at DESC LIMIT 100", (p["tenant_id"],)).fetchall()
+
+    @app.get("/v1/audit")
+    def audit_list(s=Depends(session, scope="function")):
+        db, p = s
+        require(p, "admin", "viewer")
+        return db.execute("SELECT id,action,detail,created_at FROM audit WHERE tenant_id=%s ORDER BY id DESC LIMIT 100", (p["tenant_id"],)).fetchall()
+
+    @app.post("/v1/principals", status_code=201)
+    def add(body: NewPrincipal, s=Depends(session, scope="function")):
+        db, p = s
+        require(p, "admin")
+        if not time.time() < body.expires_at <= time.time() + 90*86400:
+            raise HTTPException(422, "expiry must be within 90 days")
+        pid = uuid.uuid4()
+        db.execute("SELECT add_principal(%s,%s,%s,%s)", (pid, body.token_hash, body.role, datetime.fromtimestamp(body.expires_at, timezone.utc)))
+        audit(db, p, "principal.create", {"id": str(pid), "role": body.role})
+        return {"id": str(pid)}
+
+    @app.delete("/v1/principals/{pid}", status_code=204)
+    def revoke(pid: uuid.UUID, s=Depends(session, scope="function")):
+        db, p = s
+        require(p, "admin")
+        db.execute("SELECT revoke_principal(%s)", (pid,))
+        audit(db, p, "principal.revoke", {"id": str(pid)})
+
+    return app
+
+app = create_app()

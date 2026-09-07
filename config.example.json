@@ -1,0 +1,24 @@
+{
+  "listen": "127.0.0.1:8080",
+  "tenant": "acme-prod",
+  "data_dir": "/data",
+  "control_url": "https://control.example.com",
+  "control_token_env": "CONTROL_TOKEN",
+  "local_token_env": "LOCAL_TOKEN",
+  "trusted_keys": {"key-2026-09": "REPLACE_WITH_BASE64_ED25519_PUBLIC_KEY"},
+  "providers": {
+    "openai": {"url": "https://api.openai.com", "key_env": "OPENAI_API_KEY"},
+    "anthropic": {"url": "https://api.anthropic.com", "key_env": "ANTHROPIC_API_KEY"},
+    "gemini": {"url": "https://generativelanguage.googleapis.com", "key_env": "GEMINI_API_KEY"}
+  },
+  "concurrency": 32,
+  "rate": 50,
+  "burst": 100,
+  "retry_rate": 5,
+  "max_attempts": 3,
+  "timeout_seconds": 60,
+  "queue_size": 4096,
+  "spool_bytes": 67108864,
+  "otlp_url": "",
+  "allow_local_http": false
+}

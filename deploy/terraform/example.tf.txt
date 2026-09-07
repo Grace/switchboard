@@ -1,0 +1,38 @@
+# Copy into a separate root module. Existing VPC/cluster/IAM/network resources are inputs.
+module "switchboard" {
+  source = "./terraform"
+  name = "customer-api"
+  region = var.region
+  image = var.gateway_image_digest
+  log_kms_key_arn = var.log_kms_key_arn
+  secret_arns = {
+    LOCAL_TOKEN = "${var.tenant_secret_arn}:local_token::"
+    CONTROL_TOKEN = "${var.tenant_secret_arn}:control_token::"
+    OPENAI_API_KEY = "${var.providers_secret_arn}:openai::"
+  }
+}
+resource "aws_ecs_task_definition" "customer" {
+  family = "customer-api"
+  network_mode = "awsvpc"
+  requires_compatibilities = ["FARGATE"]
+  cpu = "1024"
+  memory = "2048"
+  execution_role_arn = var.execution_role_arn
+  task_role_arn = var.task_role_arn
+  volume { name = "switchboard-data" }
+  container_definitions = jsonencode([
+    var.init_container,
+    module.switchboard.container_definition,
+    merge(var.application_container, {
+      dependsOn = [module.switchboard.application_dependency]
+    })
+  ])
+}
+# var.init_container must be an immutable, reviewed image that runs:
+# chown 65532:65532 /data && chmod 0700 /data
+# It mounts switchboard-data at /data, runs as root, essential=false,
+# and drops all capabilities except CHOWN and FOWNER. See task-definition.json.
+# Your ECS execution role needs SecretsManager GetSecretValue on exactly
+# module.switchboard.execution_role_secret_resources, plus kms:Decrypt on its key,
+# ECR pull and CloudWatch Logs write permissions. Runtime task role needs none
+# for the gateway when using ECS secret injection and ephemeral storage.

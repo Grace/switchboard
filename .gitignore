@@ -1,10 +1,22 @@
-# Build output
-/switchboard
-/dist/
-
-# Local config and models
-switchboard.json
-*.gguf
+.env
+.env.*
+!.env.example
+.local/
+data/
+config.json
+*.pem
+*.key
+*.tfstate*
+*.tfvars
+.terraform/
+**/__pycache__/
+.pytest_cache/
+.venv/
+bin/
+*.zip
+*.bundle
+coverage.out
+/gateway
 
 .DS_Store
 

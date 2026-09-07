@@ -1,0 +1,164 @@
+{
+  "terraform": {
+    "required_version": ">= 1.6, < 2.0",
+    "required_providers": {
+      "aws": {
+        "source": "hashicorp/aws",
+        "version": "~> 6.0"
+      }
+    }
+  },
+  "variable": {
+    "name": {
+      "type": "string"
+    },
+    "image": {
+      "type": "string",
+      "validation": {
+        "condition": "${can(regex(\"@sha256:[0-9a-f]{64}$\", var.image))}",
+        "error_message": "Image must be pinned by digest."
+      }
+    },
+    "cluster_arn": {
+      "type": "string"
+    },
+    "execution_role_arn": {
+      "type": "string"
+    },
+    "task_role_arn": {
+      "type": "string"
+    },
+    "private_subnet_ids": {
+      "type": "list(string)"
+    },
+    "security_group_ids": {
+      "type": "list(string)"
+    },
+    "target_group_arn": {
+      "type": "string"
+    },
+    "region": {
+      "type": "string"
+    },
+    "log_kms_key_arn": {
+      "type": "string"
+    },
+    "secret_arns": {
+      "type": "map(string)",
+      "validation": {
+        "condition": "${alltrue([for arn in values(var.secret_arns) : can(regex(\"^arn:[^:]+:secretsmanager:\", arn))]) && contains(keys(var.secret_arns), \"DATABASE_URL\") && contains(keys(var.secret_arns), \"POLICY_SIGNING_SEED\")}",
+        "error_message": "Supply DATABASE_URL and POLICY_SIGNING_SEED as Secrets Manager ARN references."
+      }
+    },
+    "policy_key_id": {
+      "type": "string"
+    }
+  },
+  "resource": {
+    "aws_cloudwatch_log_group": {
+      "control": {
+        "name": "/ecs/${var.name}/control",
+        "retention_in_days": 30,
+        "kms_key_id": "${var.log_kms_key_arn}"
+      }
+    },
+    "aws_ecs_task_definition": {
+      "control": {
+        "family": "${var.name}-control",
+        "network_mode": "awsvpc",
+        "requires_compatibilities": [
+          "FARGATE"
+        ],
+        "cpu": "512",
+        "memory": "1024",
+        "execution_role_arn": "${var.execution_role_arn}",
+        "task_role_arn": "${var.task_role_arn}",
+        "container_definitions": "${jsonencode([local.container])}"
+      }
+    },
+    "aws_ecs_service": {
+      "control": {
+        "name": "${var.name}-control",
+        "cluster": "${var.cluster_arn}",
+        "task_definition": "${aws_ecs_task_definition.control.arn}",
+        "desired_count": 2,
+        "launch_type": "FARGATE",
+        "platform_version": "1.4.0",
+        "deployment_circuit_breaker": {
+          "enable": true,
+          "rollback": true
+        },
+        "network_configuration": {
+          "subnets": "${var.private_subnet_ids}",
+          "security_groups": "${var.security_group_ids}",
+          "assign_public_ip": false
+        },
+        "load_balancer": {
+          "target_group_arn": "${var.target_group_arn}",
+          "container_name": "control",
+          "container_port": 8000
+        },
+        "health_check_grace_period_seconds": 60
+      }
+    }
+  },
+  "output": {
+    "task_definition_arn": {
+      "value": "${aws_ecs_task_definition.control.arn}"
+    }
+  },
+  "locals": {
+    "container": {
+      "name": "control",
+      "image": "${var.image}",
+      "essential": true,
+      "cpu": 512,
+      "memory": 1024,
+      "user": "65532:65532",
+      "readonlyRootFilesystem": true,
+      "stopTimeout": 60,
+      "linuxParameters": {
+        "capabilities": {
+          "drop": [
+            "ALL"
+          ]
+        }
+      },
+      "portMappings": [
+        {
+          "containerPort": 8000,
+          "protocol": "tcp"
+        }
+      ],
+      "environment": [
+        {
+          "name": "POLICY_KEY_ID",
+          "value": "${var.policy_key_id}"
+        }
+      ],
+      "secrets": "${[for name, arn in var.secret_arns : {name = name, valueFrom = arn}]}",
+      "healthCheck": {
+        "command": [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/readyz',timeout=3)"
+        ],
+        "interval": 15,
+        "timeout": 5,
+        "retries": 3,
+        "startPeriod": 60
+      },
+      "logConfiguration": {
+        "logDriver": "awslogs",
+        "options": {
+          "awslogs-group": "${aws_cloudwatch_log_group.control.name}",
+          "awslogs-region": "${var.region}",
+          "awslogs-stream-prefix": "control",
+          "mode": "non-blocking",
+          "max-buffer-size": "4m"
+        }
+      }
+    }
+  }
+}

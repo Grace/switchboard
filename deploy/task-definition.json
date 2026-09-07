@@ -1,0 +1,140 @@
+{
+  "family": "customer-api",
+  "networkMode": "awsvpc",
+  "requiresCompatibilities": [
+    "FARGATE"
+  ],
+  "cpu": "1024",
+  "memory": "2048",
+  "executionRoleArn": "REPLACE_EXECUTION_ROLE_ARN",
+  "taskRoleArn": "REPLACE_TASK_ROLE_ARN",
+  "runtimePlatform": {
+    "cpuArchitecture": "X86_64",
+    "operatingSystemFamily": "LINUX"
+  },
+  "volumes": [
+    {
+      "name": "switchboard-data"
+    }
+  ],
+  "containerDefinitions": [
+    {
+      "name": "switchboard-init",
+      "image": "REPLACE_REVIEWED_BUSYBOX_IMAGE_AT_SHA256",
+      "essential": false,
+      "user": "0:0",
+      "readonlyRootFilesystem": true,
+      "command": [
+        "sh",
+        "-c",
+        "chown 65532:65532 /data && chmod 0700 /data"
+      ],
+      "linuxParameters": {
+        "capabilities": {
+          "drop": [
+            "ALL"
+          ],
+          "add": [
+            "CHOWN",
+            "FOWNER"
+          ]
+        }
+      },
+      "mountPoints": [
+        {
+          "sourceVolume": "switchboard-data",
+          "containerPath": "/data",
+          "readOnly": false
+        }
+      ]
+    },
+    {
+      "name": "switchboard",
+      "image": "REPLACE_CONFIGURED_GATEWAY_IMAGE_AT_SHA256",
+      "essential": true,
+      "cpu": 256,
+      "memory": 256,
+      "user": "65532:65532",
+      "readonlyRootFilesystem": true,
+      "stopTimeout": 120,
+      "dependsOn": [
+        {
+          "containerName": "switchboard-init",
+          "condition": "SUCCESS"
+        }
+      ],
+      "linuxParameters": {
+        "capabilities": {
+          "drop": [
+            "ALL"
+          ]
+        }
+      },
+      "mountPoints": [
+        {
+          "sourceVolume": "switchboard-data",
+          "containerPath": "/data",
+          "readOnly": false
+        }
+      ],
+      "healthCheck": {
+        "command": [
+          "CMD",
+          "/gateway",
+          "--healthcheck"
+        ],
+        "interval": 15,
+        "timeout": 5,
+        "retries": 3,
+        "startPeriod": 60
+      },
+      "secrets": [
+        {
+          "name": "CONTROL_TOKEN",
+          "valueFrom": "arn:aws:secretsmanager:us-east-1:123456789012:secret:REPLACE-tenant:control_token::"
+        },
+        {
+          "name": "LOCAL_TOKEN",
+          "valueFrom": "arn:aws:secretsmanager:us-east-1:123456789012:secret:REPLACE-tenant:local_token::"
+        },
+        {
+          "name": "OPENAI_API_KEY",
+          "valueFrom": "arn:aws:secretsmanager:us-east-1:123456789012:secret:REPLACE-providers:openai::"
+        }
+      ],
+      "logConfiguration": {
+        "logDriver": "awslogs",
+        "options": {
+          "awslogs-group": "/ecs/customer-api/switchboard",
+          "awslogs-region": "us-east-1",
+          "awslogs-stream-prefix": "gateway",
+          "mode": "non-blocking",
+          "max-buffer-size": "4m"
+        }
+      }
+    },
+    {
+      "name": "customer-app",
+      "image": "REPLACE_APP_IMAGE_AT_SHA256",
+      "essential": true,
+      "dependsOn": [
+        {
+          "containerName": "switchboard",
+          "condition": "HEALTHY"
+        }
+      ],
+      "environment": [
+        {
+          "name": "OPENAI_BASE_URL",
+          "value": "http://127.0.0.1:8080/v1"
+        }
+      ],
+      "secrets": [
+        {
+          "name": "OPENAI_API_KEY",
+          "valueFrom": "arn:aws:secretsmanager:us-east-1:123456789012:secret:REPLACE-tenant:local_token::"
+        }
+      ]
+    }
+  ]
+}

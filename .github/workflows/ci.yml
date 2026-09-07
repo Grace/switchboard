@@ -1,62 +1,57 @@
-name: ci
-
-on:
-  push:
-    branches: [main]
-  pull_request:
-
+name: verify
+on: [push, pull_request]
 permissions:
   contents: read
-
 jobs:
-  test:
+  go:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
-          go-version: '1.25'
-          cache: true
-
-      - name: gofmt
-        run: |
-          unformatted=$(gofmt -l .)
-          if [ -n "$unformatted" ]; then
-            echo "not gofmt'd:"; echo "$unformatted"; exit 1
-          fi
-
+          go-version: '1.26.x'
+      - run: test -z "$(gofmt -l cmd internal)"
       - run: go vet ./...
-
-      # -coverpkg matters here. Per-package coverage attributes a helper only to
-      # tests in its own package, so a type exercised entirely by another
-      # package's tests reports 0.0% and looks untested when it is not.
-      - name: test
-        run: go test -race -coverpkg=./... -coverprofile=coverage.out ./...
-
-      # Profiles requiring FIPS 140-3 skip when the Go Cryptographic Module is
-      # not enabled, so the run above covers the ordinary path and this one
-      # reaches the branch it skips. Running the whole suite under FIPS instead
-      # would cover that branch and lose the other.
-      - name: test under FIPS
+      - run: go test -race -coverprofile=coverage.out ./...
+      - run: CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath ./cmd/gateway
+      - run: CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -trimpath ./cmd/gateway
+  control:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17
         env:
-          GODEBUG: fips140=on
-        run: go test -race -count=1 ./internal/config/
-
-      - name: coverage
-        run: |
-          go tool cover -func=coverage.out | tail -1
-          echo "### Coverage" >> "$GITHUB_STEP_SUMMARY"
-          echo '```' >> "$GITHUB_STEP_SUMMARY"
-          go tool cover -func=coverage.out | grep -vE "\s100\.0%$" | tail -25 >> "$GITHUB_STEP_SUMMARY"
-          echo '```' >> "$GITHUB_STEP_SUMMARY"
-
-      - run: go build ./...
-
-  docker:
+          POSTGRES_USER: postgres
+          POSTGRES_DB: switchboard_test
+          POSTGRES_HOST_AUTH_METHOD: trust
+        ports: ['5432:5432']
+        options: --health-cmd pg_isready --health-interval 5s --health-timeout 5s --health-retries 10
+    env:
+      TEST_DATABASE_URL: postgresql://postgres@localhost:5432/switchboard_test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install -r controlplane/requirements-dev.txt
+      - run: python -m pytest controlplane/tests -v
+      - run: pip install pip-audit
+      - run: pip-audit -r controlplane/requirements.txt
+  containers:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: build image
-        run: docker build -t switchboard:ci .
-      - name: it starts
-        run: docker run --rm switchboard:ci --help
+      - run: docker build -f Dockerfile.gateway -t switchboard-gateway:ci .
+      - run: docker build -f Dockerfile.controlplane -t switchboard-control:ci .
+  terraform:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+      - run: terraform -chdir=deploy/terraform fmt -recursive
+      - run: terraform -chdir=deploy/terraform init -backend=false
+      - run: terraform -chdir=deploy/terraform validate
+      - run: terraform -chdir=deploy/terraform/controlplane init -backend=false
+      - run: terraform -chdir=deploy/terraform/controlplane validate
+      - run: terraform -chdir=deploy/terraform/postgres init -backend=false
+      - run: terraform -chdir=deploy/terraform/postgres validate
