@@ -142,7 +142,10 @@ SUBNETS=$(aws cloudformation describe-stack-resources --stack-name "$STACK" \
   --output text | tr '\t' ',')
 SG=$(aws cloudformation describe-stack-resources --stack-name "$STACK" \
   --query 'StackResources[?LogicalResourceId==`ControlPlaneSecurityGroup`].PhysicalResourceId' --output text)
-probe="import urllib.request;r=urllib.request.urlopen(\"https://$HOSTNAME/readyz\",timeout=20);print(\"TLS_OK status=%d body=%s\"%(r.status,r.read().decode()[:60]))"
+# Single-quoted inside Python so the string carries no double quotes of its
+# own: it is embedded in the JSON --overrides argument, where a stray quote
+# silently produces invalid JSON and run-task simply refuses the task.
+probe="import urllib.request;r=urllib.request.urlopen('https://$HOSTNAME/readyz',timeout=20);print('TLS_OK status=%d body=%s'%(r.status,r.read().decode()[:60]))"
 TASK=$(aws ecs run-task --cluster "$STACK-cluster" --task-definition "$STACK-bootstrap" \
   --launch-type FARGATE \
   --network-configuration "awsvpcConfiguration={subnets=[$SUBNETS],securityGroups=[$SG],assignPublicIp=DISABLED}" \
