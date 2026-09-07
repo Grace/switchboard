@@ -48,7 +48,19 @@ Each of these is backed by a run recorded in `docs/VALIDATION.md`.
     findings**, and is 7 MB smaller. perl and util-linux, which accounted for 13
     of the 19 and were never used by the application, are simply no longer
     present.
-13. **Circuit-breaker recovery — explained, and it is not a defect.** The
+13. **Rate limits no longer trip the circuit breaker.** A 429 and a 503 both fed
+    the breaker, so three rate limits withheld a healthy provider for fifteen
+    seconds. A 429 is now a cooldown: it fails over, honours any `Retry-After`
+    the provider sent, and records no failure. Measured with identical injection
+    and load, five 429s cost five failed requests where they previously cost
+    about 1,803 over 45 seconds; five 503s still cost 1,796, deliberately
+    unchanged, which is the control showing the breaker was not weakened.
+14. **Deployment, teardown and TLS.** The quickstart deploys, the bootstrap
+    custom resource applies migrations and creates a runtime login distinct from
+    the migration owner, and `/readyz` answers over TLS through the internal load
+    balancer on a real certificate. Teardown removes everything billable and is
+    guarded against running before a stack has finished deleting.
+15. **Circuit-breaker recovery — explained, and it is not a defect.** The
     observed 45-second recovery is the breaker working as written: it trips at
     three failures, and each *failed* half-open probe re-arms a fresh full 15
     seconds. The provider under test failed five times, so three cycles elapsed
@@ -59,10 +71,12 @@ Each of these is backed by a run recorded in `docs/VALIDATION.md`.
 
 ## Still open
 
-1. **No real deployment.** Nothing has ever been provisioned. The templates are
-   validated, not executed. The bootstrap custom resource, which runs migrations
-   through a one-off ECS task, is the least proven part and the most likely to
-   need iteration against a live account.
+1. **Deployment is proven for the quickstart only.** `quickstart.yaml` has been
+   deployed, verified and torn down in one account, in us-east-1, with one
+   certificate, on Postgres 17.11. **`controlplane.yaml` has never been
+   deployed**, no other region has been tried, and the Postgres 18.6 default now
+   in the template has never been deployed either — that default and the derived
+   parameter-group expression remain unexercised.
 2. **No live provider traffic.** All three adapters have only ever been exercised
    against the local mock and in-repo test handlers. Model equivalence, real
    streaming behavior, regional availability and data-retention suitability

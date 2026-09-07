@@ -185,6 +185,64 @@ makes it impossible to build the binary with a standard library carrying known
 vulnerabilities. `govulncheck` under the local toolchain now reports no
 vulnerabilities, where 1.24.1 reported 29.
 
+## 2026-09-07 — first real deployment, and the routing change it preceded
+
+### Deployment
+
+The quickstart was deployed into a real account twice. The first attempt **failed**, at the resource
+most likely to: `BootstrapRun`, the custom resource that applies migrations through a one-off ECS
+task.
+
+```
+ResourceInitializationError: unable to pull secrets or registry auth:
+failed to fetch secret arn:aws:secretsmanager:...:secret:rds!db-983da65c-...
+```
+
+The execution role enumerated the three secrets the template creates but not the master password
+secret, which RDS creates and owns, and which the bootstrap task uses to connect as the migration
+owner. Neither `cfn-lint` nor `validate-template` can catch this: the secret does not exist until
+RDS makes it.
+
+The second attempt reached `CREATE_COMPLETE` with every resource healthy. Verified:
+
+- `dbinit: migrations applied; switchboard_rt granted switchboard_app` — migrations ran and the
+  runtime login was created as a principal distinct from the migration owner, so row level security
+  is exercised rather than bypassed
+- ECS service `ACTIVE`, 2/2 running, rollout `COMPLETED`, both load balancer targets healthy
+- `TLS_OK status=200 body={"ready":true}` from a task inside the VPC — real certificate, real
+  internal load balancer. This is the one thing local testing structurally cannot prove.
+- The signing seed is valid 32 bytes, proven by the control plane booting at all, since
+  `controlplane/app.py` refuses to start otherwise. The secret was never read.
+
+Three further defects came out of the same exercise. Postgres 17.4 did not exist in the region and
+was caught by preflight before any spend. The KMS alias was deleted while its key was retained, so
+the teardown script could not find the key it existed to remove. And teardown run against a
+half-deleted stack did partial work and stopped on a raw AWS error, leaving the key unscheduled; it
+now refuses to run until the stack is gone, and will not schedule the key while any snapshot
+survives, since the key is what makes that snapshot readable.
+
+Teardown was then verified end to end: snapshot deleted, secrets and log group removed, KMS key
+scheduled, and no stacks, instances, snapshots, NAT gateways, load balancers, elastic IPs or secrets
+left in the account.
+
+### Rate limits are no longer treated as unhealthiness
+
+A 429 and a 503 both fed the circuit breaker, so three rate limits opened the circuit for fifteen
+seconds against a provider that was working. Measured with the same injection count and load,
+before and after:
+
+| Injected | Behaviour before | Behaviour after |
+|---|---|---|
+| 429 x5 then healthy | ~1,803 failures over ~45s, three breaker cycles | **5 failures**, 1,193/1,199 succeeded, 0.50% error rate |
+| 503 x5 then healthy | 1,803 failures, 595 successes | **1,796 failures, 594 successes** — deliberately unchanged |
+
+The 503 row is the control: the breaker still engages for genuine unhealthiness. Only the meaning of
+a 429 changed.
+
+`switchboard_rate_limited_total` recorded exactly 5. Note it is orthogonal to `errors_total` rather
+than exclusive of it: with a single configured provider there was nowhere to fail over to, so those
+requests counted as both a rate limit and a failed request.
+
 ### Not run here
 
 Full quickstart deployment, live provider requests, real Marketplace
