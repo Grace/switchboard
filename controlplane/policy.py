@@ -20,13 +20,13 @@ def validate_policy(p: dict, tenant: str, now: int | None = None) -> dict:
     if not 1 <= p["issued_at"] <= now + 60 or not max(now, p["issued_at"]) < p["expires_at"] <= p["issued_at"] + 604800:
         raise ValueError("invalid policy lifetime (maximum seven days)")
     routes = p["routes"]
-    if type(routes) is not list or not 1 <= len(routes) <= 3:
-        raise ValueError("one to three routes required")
+    if type(routes) is not list or not 1 <= len(routes) <= 4:
+        raise ValueError("one to four routes required")
     seen = set()
     for route in routes:
         if type(route) is not dict or set(route) != {"provider", "model"}:
             raise ValueError("invalid route fields")
-        if route["provider"] not in ("openai", "anthropic", "gemini") or route["provider"] in seen:
+        if route["provider"] not in ("openai", "anthropic", "gemini", "bedrock") or route["provider"] in seen:
             raise ValueError("invalid or repeated provider")
         if not isinstance(route["model"], str) or not ID.fullmatch(route["model"]):
             raise ValueError("invalid model identifier")

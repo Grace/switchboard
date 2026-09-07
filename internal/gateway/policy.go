@@ -90,12 +90,12 @@ func (s *PolicyStore) verify(raw []byte, now time.Time, allowExpired bool) (*Pol
 	if strictJSON(b, &p) != nil || !bytes.Equal(b, Canonical(p)) {
 		return nil, errors.New("noncanonical policy")
 	}
-	if p.Schema != 1 || p.Tenant != s.Tenant || !identifier.MatchString(p.Tenant) || p.Version < 1 || p.Version > 9007199254740991 || p.IssuedAt > now.Unix()+60 || p.IssuedAt < 1 || (!allowExpired && p.ExpiresAt <= now.Unix()) || p.ExpiresAt <= p.IssuedAt || p.ExpiresAt-p.IssuedAt > 604800 || len(p.Routes) < 1 || len(p.Routes) > 3 {
+	if p.Schema != 1 || p.Tenant != s.Tenant || !identifier.MatchString(p.Tenant) || p.Version < 1 || p.Version > 9007199254740991 || p.IssuedAt > now.Unix()+60 || p.IssuedAt < 1 || (!allowExpired && p.ExpiresAt <= now.Unix()) || p.ExpiresAt <= p.IssuedAt || p.ExpiresAt-p.IssuedAt > 604800 || len(p.Routes) < 1 || len(p.Routes) > 4 {
 		return nil, errors.New("invalid policy constraints")
 	}
 	seen := map[string]bool{}
 	for _, r := range p.Routes {
-		if (r.Provider != "openai" && r.Provider != "anthropic" && r.Provider != "gemini") || !identifier.MatchString(r.Model) || seen[r.Provider] {
+		if (r.Provider != "openai" && r.Provider != "anthropic" && r.Provider != "gemini" && r.Provider != "bedrock") || !identifier.MatchString(r.Model) || seen[r.Provider] {
 			return nil, errors.New("invalid route")
 		}
 		seen[r.Provider] = true

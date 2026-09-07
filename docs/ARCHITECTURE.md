@@ -16,7 +16,7 @@ flowchart LR
 
 Each sidecar owns one tenant, one pinned public-key set, a private writable data directory, a local application credential and a separate control-plane `agent` credential. Provider credentials are available only to that sidecar. The shared task network namespace allows localhost access without an inbound gateway security-group rule.
 
-Configuration fixes provider base URLs independently of signed policies. A policy can reorder only three known adapters and choose model identifiers. It cannot send credentials or prompts to a new host. HTTP redirects and implicit proxy environment variables are disabled for outbound gateway traffic.
+Configuration fixes provider base URLs independently of signed policies. A policy can reorder only four known adapters and choose model identifiers. Bedrock authenticates with SigV4 against the task's IAM role rather than a static key, so that route has no long-lived credential to store or rotate. It cannot send credentials or prompts to a new host. HTTP redirects and implicit proxy environment variables are disabled for outbound gateway traffic.
 
 Startup restores and authenticates the last policy. Expired policies retain their version high-water mark but cannot route requests. A background poll starts immediately, then repeats every 15 seconds with a five-second request deadline. Valid updates are fsynced and renamed before activation. Invalid updates leave the last verified policy untouched. The seven-day maximum policy lifetime bounds stale authorization; an outage continuing beyond policy expiry fails readiness and inference closed.
 

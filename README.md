@@ -16,7 +16,7 @@ signed policy it cannot itself edit.
 
 ## What is implemented
 
-- Loopback-only, single-tenant Go data plane; text chat normalization for OpenAI, Anthropic and Gemini, streaming and nonstreaming.
+- Loopback-only, single-tenant Go data plane; text chat normalization for OpenAI, Anthropic, Gemini and Amazon Bedrock. Streaming for the first three; Bedrock is nonstreaming, and a streaming request skips a Bedrock route rather than failing.
 - Postgres persistence, migrations, hashed bearer credentials, tenant-scoped RBAC, row-level security, revocation and audit records.
 - Ed25519 policy signatures, restricted canonical JSON, pinned overlapping verification keys, expiry, version rollback/equivocation protection and atomic disk cache.
 - Inference uses only local policy and direct provider connections. Control-plane polling and telemetry delivery are background work.

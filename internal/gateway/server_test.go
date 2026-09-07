@@ -49,7 +49,7 @@ func TestFailoverAndControlDown(t *testing.T) {
 		io.WriteString(w, `{"content":[{"type":"text","text":"rescued"}],"stop_reason":"end_turn"}`)
 	}))
 	defer b.Close()
-	s := testServer(t, map[string]ProviderConfig{"openai": {a.URL, "PROVIDER_KEY"}, "anthropic": {b.URL, "PROVIDER_KEY"}})
+	s := testServer(t, map[string]ProviderConfig{"openai": {URL: a.URL, KeyEnv: "PROVIDER_KEY"}, "anthropic": {URL: b.URL, KeyEnv: "PROVIDER_KEY"}})
 	s.syncOnce(context.Background())
 	w := call(s, chat)
 	if w.Code != 200 || !strings.Contains(w.Body.String(), "rescued") || first.Load() != 1 || second.Load() != 1 {
@@ -70,7 +70,7 @@ func TestNoReplayAfterAcceptanceOrAmbiguity(t *testing.T) {
 			defer a.Close()
 			b := testHTTP(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { fallback.Add(1) }))
 			defer b.Close()
-			s := testServer(t, map[string]ProviderConfig{"openai": {a.URL, "PROVIDER_KEY"}, "anthropic": {b.URL, "PROVIDER_KEY"}})
+			s := testServer(t, map[string]ProviderConfig{"openai": {URL: a.URL, KeyEnv: "PROVIDER_KEY"}, "anthropic": {URL: b.URL, KeyEnv: "PROVIDER_KEY"}})
 			w := call(s, chat)
 			if w.Code < 400 || fallback.Load() != 0 {
 				t.Fatal("unsafe replay")
@@ -85,7 +85,7 @@ func TestLimitsAndAuth(t *testing.T) {
 	if w.Code != 401 {
 		t.Fatal(w.Code)
 	}
-	s.C.Providers = map[string]ProviderConfig{"openai": {"http://127.0.0.1:1", "PROVIDER_KEY"}}
+	s.C.Providers = map[string]ProviderConfig{"openai": {URL: "http://127.0.0.1:1", KeyEnv: "PROVIDER_KEY"}}
 	s.slots <- struct{}{}
 	s.slots <- struct{}{}
 	if w := call(s, chat); w.Code != 429 {
@@ -131,7 +131,7 @@ func TestRetryBudget(t *testing.T) {
 	var calls atomic.Int64
 	a := testHTTP(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { calls.Add(1); w.WriteHeader(429) }))
 	defer a.Close()
-	s := testServer(t, map[string]ProviderConfig{"openai": {a.URL, "PROVIDER_KEY"}, "anthropic": {a.URL, "PROVIDER_KEY"}})
+	s := testServer(t, map[string]ProviderConfig{"openai": {URL: a.URL, KeyEnv: "PROVIDER_KEY"}, "anthropic": {URL: a.URL, KeyEnv: "PROVIDER_KEY"}})
 	s.retry = newBucket(1, 1)
 	s.retry.allow()
 	if call(s, chat).Code != 503 || calls.Load() != 1 {
@@ -139,7 +139,7 @@ func TestRetryBudget(t *testing.T) {
 	}
 }
 func TestIdempotencyRejected(t *testing.T) {
-	s := testServer(t, map[string]ProviderConfig{"openai": {"http://127.0.0.1:1", "PROVIDER_KEY"}})
+	s := testServer(t, map[string]ProviderConfig{"openai": {URL: "http://127.0.0.1:1", KeyEnv: "PROVIDER_KEY"}})
 	r := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(chat))
 	r.Header.Set("Authorization", "Bearer "+strings.Repeat("x", 32))
 	r.Header.Set("Idempotency-Key", "abc")

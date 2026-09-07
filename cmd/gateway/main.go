@@ -87,6 +87,20 @@ func main() {
 		}
 		slog.Info("marketplace usage registered", "product_code", c.Marketplace.ProductCode)
 	}
+	// Resolved once at startup, and only when a bedrock provider is configured,
+	// so a deployment without one never touches AWS credential resolution.
+	var bedrock *gateway.BedrockSigner
+	if p, ok := c.Providers["bedrock"]; ok {
+		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+		bedrock, e = gateway.NewBedrockSigner(ctx, p.Region)
+		cancel()
+		if e != nil {
+			slog.Error("bedrock is configured but unusable", "error", e)
+			os.Exit(1)
+		}
+		slog.Info("bedrock signer ready", "region", p.Region)
+	}
+
 	m := &gateway.Metrics{LogDropped: &logs.Dropped}
 	t, e := gateway.NewTelemetry(c, m)
 	if e != nil {
@@ -95,6 +109,7 @@ func main() {
 	}
 	background, stop := context.WithCancel(context.Background())
 	s := gateway.New(c, p, m, t)
+	s.Bedrock = bedrock
 	t.Start(background)
 	go s.Sync(background)
 	srv := &http.Server{Addr: c.Listen, Handler: s.Handler(), ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 15 * time.Second, WriteTimeout: 100 * time.Second, IdleTimeout: 60 * time.Second, MaxHeaderBytes: 16384}

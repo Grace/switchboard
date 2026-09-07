@@ -120,6 +120,7 @@ type Server struct {
 	Metrics     *Metrics
 	Telemetry   *Telemetry
 	HTTP        *http.Client
+	Bedrock     *BedrockSigner
 	slots       chan struct{}
 	rate, retry *bucket
 	circuits    map[string]*circuit
@@ -127,7 +128,7 @@ type Server struct {
 }
 
 func New(c Config, p *PolicyStore, m *Metrics, t *Telemetry) *Server {
-	return &Server{C: c, Policies: p, Metrics: m, Telemetry: t, HTTP: client(time.Duration(c.TimeoutSeconds) * time.Second), slots: make(chan struct{}, c.Concurrency), rate: newBucket(c.Rate, c.Burst), retry: newBucket(c.RetryRate, c.RetryRate), circuits: map[string]*circuit{"openai": {}, "anthropic": {}, "gemini": {}}}
+	return &Server{C: c, Policies: p, Metrics: m, Telemetry: t, HTTP: client(time.Duration(c.TimeoutSeconds) * time.Second), slots: make(chan struct{}, c.Concurrency), rate: newBucket(c.Rate, c.Burst), retry: newBucket(c.RetryRate, c.RetryRate), circuits: map[string]*circuit{"openai": {}, "anthropic": {}, "gemini": {}, "bedrock": {}}}
 }
 func (s *Server) ready() bool {
 	p := s.Policies.Current()
@@ -267,6 +268,9 @@ func (s *Server) chat(w http.ResponseWriter, r *http.Request) {
 		if event.Attempts >= s.C.MaxAttempts {
 			break
 		}
+		if c.Stream && !streams(route.Provider) {
+			continue
+		}
 		if !s.circuits[route.Provider].allow() {
 			continue
 		}
@@ -288,7 +292,7 @@ func (s *Server) chat(w http.ResponseWriter, r *http.Request) {
 		}
 		event.Attempts++
 		event.Provider = route.Provider
-		req, e := upstream(ctx, c, route, pc)
+		req, e := upstream(ctx, c, route, pc, s.Bedrock)
 		if e != nil {
 			s.circuits[route.Provider].release()
 			fail(500, "adapter configuration")

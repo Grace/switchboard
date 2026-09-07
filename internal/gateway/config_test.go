@@ -9,7 +9,7 @@ import (
 
 func TestConfigValidation(t *testing.T) {
 	pub, _, _ := ed25519.GenerateKey(rand.Reader)
-	s := testServer(t, map[string]ProviderConfig{"openai": {"https://api.openai.com", "PROVIDER_KEY"}})
+	s := testServer(t, map[string]ProviderConfig{"openai": {URL: "https://api.openai.com", KeyEnv: "PROVIDER_KEY"}})
 	c := s.C
 	c.TrustedKeys = map[string]string{"test": base64.StdEncoding.EncodeToString(pub)}
 	if e := c.Validate(); e != nil {

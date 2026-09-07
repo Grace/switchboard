@@ -77,31 +77,38 @@ Each of these is backed by a run recorded in `docs/VALIDATION.md`.
    deployed**, no other region has been tried, and the Postgres 18.6 default now
    in the template has never been deployed either — that default and the derived
    parameter-group expression remain unexercised.
-2. **No live provider traffic.** All three adapters have only ever been exercised
-   against the local mock and in-repo test handlers. Model equivalence, real
-   streaming behavior, regional availability and data-retention suitability
-   remain unverified.
-3. **Soak duration.** The longest run is 60 seconds. Nothing addresses memory
+2. **Live provider traffic, mostly still unverified.** Bedrock has now been
+   exercised against the real service: a SigV4-signed Converse request returned
+   a real completion which normalized correctly. **OpenAI, Anthropic and Gemini
+   have still only ever seen the local mock and in-repo test handlers**, so
+   model equivalence, real streaming behaviour, regional availability and
+   data-retention suitability remain unverified for those three.
+3. **Bedrock does not stream.** Bedrock returns AWS event-stream framing rather
+   than server-sent events, and that decode path is not built. A streaming
+   request skips a bedrock route at selection time and tries the next provider,
+   so a policy with another route still serves it; a policy whose only route is
+   bedrock returns the ordinary 503. Nonstreaming Bedrock is complete.
+4. **Soak duration.** The longest run is 60 seconds. Nothing addresses memory
    growth, file-descriptor leaks, spool behavior over hours, or policy rotation
    mid-flight.
-4. **No idempotency.** There is no exactly-once guarantee, replay cache or
+5. **No idempotency.** There is no exactly-once guarantee, replay cache or
    ledger. A 429 or 503 retry cannot prove the absence of upstream billing.
    Clients must disable automatic retries.
-5. **Security operations.** Bearer RBAC exists; SSO, MFA, human-user lifecycle,
+6. **Security operations.** Bearer RBAC exists; SSO, MFA, human-user lifecycle,
    external authorization, hardware-backed signing and automated key renewal do
    not. Row level security defends against query mistakes, not against a
    compromised shared database session.
-6. **Scale and operations.** Rate limits and circuit state are per process, not
+7. **Scale and operations.** Rate limits and circuit state are per process, not
    fleet-wide. There is no retention policy, partitioning, dashboard, SLO, audit
    export or restore drill. The spool caps at 100 events per tick.
-7. **Supply chain, remaining.** No SBOM generation and no image signing, and
+8. **Supply chain, remaining.** No SBOM generation and no image signing, and
    there is no release workflow at all — images are built and pushed by hand.
    Python and Go dependency graphs are pinned and scanned, GitHub Actions are
    pinned by commit SHA, and both images report zero scan findings. Signing and
    SBOM are what a buyer's security review asks for rather than a listing
    requirement; the enforced requirement is freedom from known vulnerabilities,
    which is met.
-8. **Infrastructure assumptions.** `controlplane.yaml` requires an existing VPC,
+9. **Infrastructure assumptions.** `controlplane.yaml` requires an existing VPC,
     subnets, IAM roles, KMS keys, ECS cluster and load balancer target group.
     `quickstart.yaml` removes all of those except the certificate.
 

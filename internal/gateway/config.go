@@ -16,6 +16,9 @@ import (
 type ProviderConfig struct {
 	URL    string `json:"url"`
 	KeyEnv string `json:"key_env"`
+	// Bedrock only. SigV4 binds a signature to a region, so it cannot be
+	// inferred safely from the URL.
+	Region string `json:"region,omitempty"`
 }
 type Config struct {
 	Listen          string                    `json:"listen"`
@@ -81,10 +84,22 @@ func (c Config) Validate() error {
 		}
 	}
 	for name, p := range c.Providers {
-		if name != "openai" && name != "anthropic" && name != "gemini" {
+		if name != "openai" && name != "anthropic" && name != "gemini" && name != "bedrock" {
 			return errors.New("unknown provider")
 		}
-		if !secureURL(p.URL, c.AllowLocalHTTP) || p.KeyEnv == "" || os.Getenv(p.KeyEnv) == "" {
+		if !secureURL(p.URL, c.AllowLocalHTTP) {
+			return errors.New("invalid provider configuration")
+		}
+		if name == "bedrock" {
+			// Authenticated by the task's IAM role, so there is no key to
+			// require. A region is mandatory instead: SigV4 binds a signature
+			// to one, and guessing it produces a signature the service rejects.
+			if !identifier.MatchString(p.Region) {
+				return errors.New("bedrock requires a region")
+			}
+			continue
+		}
+		if p.KeyEnv == "" || os.Getenv(p.KeyEnv) == "" {
 			return errors.New("invalid provider configuration")
 		}
 	}

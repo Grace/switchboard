@@ -5,11 +5,27 @@
   "control_url": "https://control.example.com",
   "control_token_env": "CONTROL_TOKEN",
   "local_token_env": "LOCAL_TOKEN",
-  "trusted_keys": {"key-2026-09": "REPLACE_WITH_BASE64_ED25519_PUBLIC_KEY"},
+  "trusted_keys": {
+    "key-2026-09": "REPLACE_WITH_BASE64_ED25519_PUBLIC_KEY"
+  },
   "providers": {
-    "openai": {"url": "https://api.openai.com", "key_env": "OPENAI_API_KEY"},
-    "anthropic": {"url": "https://api.anthropic.com", "key_env": "ANTHROPIC_API_KEY"},
-    "gemini": {"url": "https://generativelanguage.googleapis.com", "key_env": "GEMINI_API_KEY"}
+    "openai": {
+      "url": "https://api.openai.com",
+      "key_env": "OPENAI_API_KEY"
+    },
+    "anthropic": {
+      "url": "https://api.anthropic.com",
+      "key_env": "ANTHROPIC_API_KEY"
+    },
+    "gemini": {
+      "url": "https://generativelanguage.googleapis.com",
+      "key_env": "GEMINI_API_KEY"
+    },
+    "bedrock": {
+      "url": "https://bedrock-runtime.us-east-1.amazonaws.com",
+      "region": "us-east-1",
+      "key_env": ""
+    }
   },
   "concurrency": 32,
   "rate": 50,

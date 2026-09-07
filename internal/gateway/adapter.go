@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"strings"
 )
@@ -49,7 +50,7 @@ func ParseChat(b []byte) (Chat, error) {
 	}
 	return c, nil
 }
-func upstream(ctx context.Context, c Chat, r Route, p ProviderConfig) (*http.Request, error) {
+func upstream(ctx context.Context, c Chat, r Route, p ProviderConfig, signer *BedrockSigner) (*http.Request, error) {
 	var body any
 	path := ""
 	system := ""
@@ -98,10 +99,20 @@ func upstream(ctx context.Context, c Chat, r Route, p ProviderConfig) (*http.Req
 		if c.Stream {
 			path = "/v1beta/models/" + r.Model + ":streamGenerateContent?alt=sse"
 		}
+	case "bedrock":
+		// Streaming is AWS event-stream framing rather than SSE and the
+		// incremental decode path is not built yet. Refusing here is honest:
+		// the alternative is accepting the request and mishandling the frames.
+		if c.Stream {
+			return nil, errStreamUnsupported
+		}
+		body = bedrockBody(c, system, msgs)
+		path = "/model/" + url.PathEscape(r.Model) + "/converse"
 	default:
 		return nil, errors.New("unknown adapter")
 	}
-	req, e := http.NewRequestWithContext(ctx, "POST", trimURL(p.URL)+path, bytes.NewReader(jsonBytes(body)))
+	raw := jsonBytes(body)
+	req, e := http.NewRequestWithContext(ctx, "POST", trimURL(p.URL)+path, bytes.NewReader(raw))
 	if e != nil {
 		return nil, e
 	}
@@ -117,6 +128,15 @@ func upstream(ctx context.Context, c Chat, r Route, p ProviderConfig) (*http.Req
 		req.Header.Set("anthropic-version", "2023-06-01")
 	case "gemini":
 		req.Header.Set("x-goog-api-key", os.Getenv(p.KeyEnv))
+	case "bedrock":
+		// No key: the task's IAM role authenticates, so nothing long-lived is
+		// stored or pasted by a customer.
+		if signer == nil {
+			return nil, errors.New("bedrock configured but no signer available")
+		}
+		if e := signer.sign(ctx, req, raw); e != nil {
+			return nil, e
+		}
 	}
 	return req, nil
 }
@@ -198,6 +218,12 @@ type wire struct {
 }
 
 func normalize(provider string, b []byte, stream bool) (normalized, bool, error) {
+	if provider == "bedrock" {
+		// Only the complete-response shape reaches here: the streaming path is
+		// refused in upstream() until event-stream decoding is wired.
+		n, e := normalizeBedrock(b)
+		return n, true, e
+	}
 	var w wire
 	var n normalized
 	if json.Unmarshal(b, &w) != nil {

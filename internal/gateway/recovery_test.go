@@ -43,7 +43,7 @@ func (f *failingTransport) RoundTrip(r *http.Request) (*http.Response, error) {
 	return nil, errors.New("ambiguous failure")
 }
 func TestTransportAmbiguityNotReplayed(t *testing.T) {
-	s := testServer(t, map[string]ProviderConfig{"openai": {"https://api.openai.com", "PROVIDER_KEY"}, "anthropic": {"https://api.anthropic.com", "PROVIDER_KEY"}})
+	s := testServer(t, map[string]ProviderConfig{"openai": {URL: "https://api.openai.com", KeyEnv: "PROVIDER_KEY"}, "anthropic": {URL: "https://api.anthropic.com", KeyEnv: "PROVIDER_KEY"}})
 	f := &failingTransport{}
 	s.HTTP.Transport = f
 	if call(s, chat).Code != 502 || f.calls != 1 {
@@ -51,7 +51,7 @@ func TestTransportAmbiguityNotReplayed(t *testing.T) {
 	}
 }
 func TestCancelledRequestNotReplayed(t *testing.T) {
-	s := testServer(t, map[string]ProviderConfig{"openai": {"https://api.openai.com", "PROVIDER_KEY"}})
+	s := testServer(t, map[string]ProviderConfig{"openai": {URL: "https://api.openai.com", KeyEnv: "PROVIDER_KEY"}})
 	f := &failingTransport{}
 	s.HTTP.Transport = f
 	ctx, cancel := context.WithCancel(context.Background())

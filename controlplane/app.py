@@ -43,7 +43,7 @@ class Event(Strict):
     trace_id: str = Field(pattern=r"^[0-9a-f]{32}$")
     span_id: str = Field(pattern=r"^[0-9a-f]{16}$")
     parent_id: str | None = Field(default=None, pattern=r"^[0-9a-f]{16}$")
-    provider: Literal["", "openai", "anthropic", "gemini"]
+    provider: Literal["", "openai", "anthropic", "gemini", "bedrock"]
     status: int = Field(ge=100, le=599)
     attempts: int = Field(ge=0, le=3)
     start_ns: int = Field(ge=1)
