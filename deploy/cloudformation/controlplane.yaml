@@ -259,6 +259,27 @@ Resources:
       VPCSecurityGroups: [!GetAtt DBSecurityGroup.GroupId]
       DBParameterGroupName: !Ref DBParameterGroup
 
+  # RegisterUsage is called by the sidecar inside the customer's application
+  # task, not by the control plane, so the permission cannot be attached to a
+  # role this stack owns. Published here for the customer to attach to whichever
+  # task role runs the sidecar. Unnamed deliberately: an explicit name would
+  # force CAPABILITY_NAMED_IAM on the deployer.
+  SidecarMeteringPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: Minimum permission a metered Switchboard Sidecar task role requires.
+        must:
+          - RegisterUsage only. Do not widen to other Marketplace actions.
+    Properties:
+      Description: Allows a Switchboard Sidecar task to register Marketplace usage.
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action: 'aws-marketplace:RegisterUsage'
+            Resource: '*'
+
   LogGroup:
     Type: AWS::Logs::LogGroup
     DeletionPolicy: Retain
@@ -375,3 +396,9 @@ Outputs:
     Value: !GetAtt DBSecurityGroup.GroupId
   TaskDefinitionArn:
     Value: !Ref TaskDefinition
+  SidecarMeteringPolicyArn:
+    Description: >-
+      Attach to the task role running the Switchboard Sidecar. Required only for
+      a metered Marketplace subscription; free and BYOL listings do not call
+      RegisterUsage at all.
+    Value: !Ref SidecarMeteringPolicy

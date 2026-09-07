@@ -91,10 +91,12 @@ its scope. A clean scan is a much smaller attack surface, not a guarantee.
 | Template | Required parameters | Capabilities |
 |---|---|---|
 | `quickstart.yaml` | `CertificateArn`, `ControlPlaneImage` | `CAPABILITY_IAM` |
-| `controlplane.yaml` | 23, all pre-existing infrastructure | none |
+| `controlplane.yaml` | 22, all pre-existing infrastructure | `CAPABILITY_IAM` |
 
-`quickstart.yaml` creates IAM roles, so a deploying buyer must acknowledge
-`CAPABILITY_IAM`. Every other quickstart parameter has a default.
+Both templates create IAM resources, so a deploying buyer must acknowledge
+`CAPABILITY_IAM`. `controlplane.yaml` creates only the sidecar metering policy;
+`quickstart.yaml` additionally creates the execution and task roles. Every
+quickstart parameter except the certificate, hostname and image has a default.
 
 The certificate cannot be created by either template: the sidecar refuses plain
 HTTP to anything but loopback and trusts only the system roots, so reaching the

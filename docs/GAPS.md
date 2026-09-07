@@ -94,10 +94,13 @@ Each of these is backed by a run recorded in `docs/VALIDATION.md`.
 6. **Scale and operations.** Rate limits and circuit state are per process, not
    fleet-wide. There is no retention policy, partitioning, dashboard, SLO, audit
    export or restore drill. The spool caps at 100 events per tick.
-7. **Supply chain, remaining.** No SBOM generation, no image signing, and GitHub
-   Actions are pinned by tag rather than commit. Python and Go dependency
-   graphs are pinned and scanned; container images and release artifacts are not
-   yet signed.
+7. **Supply chain, remaining.** No SBOM generation and no image signing, and
+   there is no release workflow at all — images are built and pushed by hand.
+   Python and Go dependency graphs are pinned and scanned, GitHub Actions are
+   pinned by commit SHA, and both images report zero scan findings. Signing and
+   SBOM are what a buyer's security review asks for rather than a listing
+   requirement; the enforced requirement is freedom from known vulnerabilities,
+   which is met.
 8. **Infrastructure assumptions.** `controlplane.yaml` requires an existing VPC,
     subnets, IAM roles, KMS keys, ECS cluster and load balancer target group.
     `quickstart.yaml` removes all of those except the certificate.
