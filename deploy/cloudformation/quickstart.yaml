@@ -262,6 +262,8 @@ Resources:
     Properties:
       Description: !Sub 'Switchboard encryption key for ${AWS::StackName}'
       EnableKeyRotation: true
+      Tags:
+        - {Key: SwitchboardStack, Value: !Ref 'AWS::StackName'}
       KeyPolicy:
         Version: '2012-10-17'
         Statement:
@@ -281,6 +283,10 @@ Resources:
 
   KeyAlias:
     Type: AWS::KMS::Alias
+    # Retained with the key it names. Without this the key survives the stack
+    # with no alias, and the teardown script cannot find it to offer deletion.
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
     Properties:
       AliasName: !Sub 'alias/${AWS::StackName}-switchboard'
       TargetKeyId: !Ref EncryptionKey

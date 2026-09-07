@@ -47,8 +47,21 @@ LOGS=$(aws logs describe-log-groups --log-group-name-prefix "/ecs/${STACK}/" \
   --query 'logGroups[].logGroupName' --output text 2>/dev/null || true)
 
 # --- KMS key ----------------------------------------------------------------
+# By alias first. Older stacks deleted the alias while retaining the key, so
+# fall back to the stack tag, which survives either way.
 KEY=$(aws kms describe-key --key-id "alias/${STACK}-switchboard" \
   --query 'KeyMetadata.KeyId' --output text 2>/dev/null || true)
+if [ -z "${KEY:-}" ] || [ "$KEY" = "None" ]; then
+  for k in $(aws kms list-keys --query 'Keys[].KeyId' --output text 2>/dev/null); do
+    state=$(aws kms describe-key --key-id "$k" \
+      --query 'KeyMetadata.[KeyManager,KeyState]' --output text 2>/dev/null || true)
+    case "$state" in CUSTOMER*Enabled*) ;; *) continue ;; esac
+    tagged=$(aws kms list-resource-tags --key-id "$k" \
+      --query "Tags[?TagKey=='SwitchboardStack'&&TagValue=='${STACK}'].TagValue" \
+      --output text 2>/dev/null || true)
+    if [ -n "$tagged" ]; then KEY="$k"; break; fi
+  done
+fi
 
 found=0
 if [ -n "${SNAPSHOTS:-}" ]; then
