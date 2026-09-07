@@ -1,0 +1,779 @@
+AWSTemplateFormatVersion: '2010-09-09'
+
+Description: >-
+  Switchboard quickstart. Creates its own VPC, subnets, NAT, load balancer, ECS
+  cluster, IAM roles, KMS key, Postgres database and secrets, then runs the
+  control plane. Intended for evaluation and for accounts with no existing
+  footprint to attach to. For deployment into established networking, use
+  controlplane.yaml instead, which creates nothing and takes everything as
+  parameters.
+
+Metadata:
+  AWSToolsMetrics:
+    AWSAgentToolkit: aws-cloudformation@2
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label: {default: Required}
+        Parameters: [NamePrefix, CertificateArn, ControlPlaneImage]
+      - Label: {default: 'Optional: sizing and cost'}
+        Parameters: [DBInstanceClass, MultiAZ, VpcCidr, PolicyKeyId, EngineVersion, DBParameterGroupFamily]
+
+Parameters:
+  NamePrefix:
+    Type: String
+    Default: switchboard
+    Description: Short name distinguishing this deployment.
+    AllowedPattern: '^[a-z][a-z0-9-]{1,30}$'
+    ConstraintDescription: lowercase letters, digits and hyphens, starting with a letter.
+
+  CertificateArn:
+    Type: String
+    Description: >-
+      ACM certificate for the name your sidecars will use to reach the control
+      plane. Required because the sidecar refuses plain HTTP to anything but
+      loopback and trusts only system roots, so this stack cannot mint its own.
+      After deploy, point that DNS name at the load balancer address in Outputs.
+    AllowedPattern: '^arn:[^:]+:acm:[a-z0-9-]+:\d{12}:certificate/.+$'
+
+  ControlPlaneImage:
+    Type: String
+    Description: >-
+      Control plane image pinned by digest, from the AWS Marketplace ECR path in
+      this listing's usage instructions.
+    AllowedPattern: '^.+@sha256:[0-9a-f]{64}$'
+    ConstraintDescription: 'must be pinned by digest, ending @sha256: followed by 64 hex characters.'
+
+  PolicyKeyId:
+    Type: String
+    Default: quickstart-key
+    Description: Identifier for the policy signing key. Sidecars pin the matching public key.
+    AllowedPattern: '^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$'
+
+  VpcCidr:
+    Type: String
+    Default: 10.20.0.0/16
+    Description: Address range for the VPC this stack creates.
+    AllowedPattern: '^(\d{1,3}\.){3}\d{1,3}/\d{1,2}$'
+
+  DBInstanceClass:
+    Type: String
+    Default: db.t4g.medium
+    Description: Review against expected load before production use.
+  MultiAZ:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: Multi-AZ roughly doubles database cost. Leave true for production.
+  EngineVersion:
+    Type: String
+    Default: '17.4'
+  DBParameterGroupFamily:
+    Type: String
+    Default: postgres17
+    Description: Must match the major version of EngineVersion.
+
+Conditions:
+  IsMultiAZ: !Equals [!Ref MultiAZ, 'true']
+
+Resources:
+
+  # ---------------------------------------------------------------- networking
+
+  Vpc:
+    Type: AWS::EC2::VPC
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: Isolated network for the control plane and database.
+        must: [DNS support and hostnames are required for the load balancer name to resolve.]
+    Properties:
+      CidrBlock: !Ref VpcCidr
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags: [{Key: Name, Value: !Sub '${AWS::StackName}-vpc'}]
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags: [{Key: Name, Value: !Sub '${AWS::StackName}-igw'}]
+  GatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties: {VpcId: !Ref Vpc, InternetGatewayId: !Ref InternetGateway}
+
+  PublicSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      AvailabilityZone: !Select [0, !GetAZs '']
+      CidrBlock: !Select [0, !Cidr [!Ref VpcCidr, 4, 8]]
+      Tags: [{Key: Name, Value: !Sub '${AWS::StackName}-public-a'}]
+  PublicSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      AvailabilityZone: !Select [1, !GetAZs '']
+      CidrBlock: !Select [1, !Cidr [!Ref VpcCidr, 4, 8]]
+      Tags: [{Key: Name, Value: !Sub '${AWS::StackName}-public-b'}]
+  PrivateSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      AvailabilityZone: !Select [0, !GetAZs '']
+      CidrBlock: !Select [2, !Cidr [!Ref VpcCidr, 4, 8]]
+      Tags: [{Key: Name, Value: !Sub '${AWS::StackName}-private-a'}]
+  PrivateSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      AvailabilityZone: !Select [1, !GetAZs '']
+      CidrBlock: !Select [3, !Cidr [!Ref VpcCidr, 4, 8]]
+      Tags: [{Key: Name, Value: !Sub '${AWS::StackName}-private-b'}]
+
+  NatEip:
+    Type: AWS::EC2::EIP
+    DependsOn: GatewayAttachment
+    Properties: {Domain: vpc}
+  NatGateway:
+    Type: AWS::EC2::NatGateway
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: Lets private tasks reach ECR, Secrets Manager and the model providers.
+        must: [A single NAT is a cost and availability tradeoff. Add a second for production.]
+    Properties:
+      AllocationId: !GetAtt NatEip.AllocationId
+      SubnetId: !Ref PublicSubnetA
+      Tags: [{Key: Name, Value: !Sub '${AWS::StackName}-nat'}]
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties: {VpcId: !Ref Vpc}
+  PublicDefaultRoute:
+    Type: AWS::EC2::Route
+    DependsOn: GatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+  PublicSubnetARoute:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: {SubnetId: !Ref PublicSubnetA, RouteTableId: !Ref PublicRouteTable}
+  PublicSubnetBRoute:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: {SubnetId: !Ref PublicSubnetB, RouteTableId: !Ref PublicRouteTable}
+
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties: {VpcId: !Ref Vpc}
+  PrivateDefaultRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGateway
+  PrivateSubnetARoute:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: {SubnetId: !Ref PrivateSubnetA, RouteTableId: !Ref PrivateRouteTable}
+  PrivateSubnetBRoute:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: {SubnetId: !Ref PrivateSubnetB, RouteTableId: !Ref PrivateRouteTable}
+
+  # ----------------------------------------------------------- security groups
+
+  LoadBalancerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: Accepts HTTPS from inside the VPC only. The load balancer is internal.
+        must: [Never widen ingress beyond the VPC CIDR.]
+    Properties:
+      GroupDescription: !Sub 'Internal HTTPS to the Switchboard control plane (${NamePrefix})'
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: !Ref VpcCidr
+          Description: HTTPS from within the VPC.
+
+  ControlPlaneSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: !Sub 'Switchboard control plane tasks (${NamePrefix})'
+      VpcId: !Ref Vpc
+  ControlPlaneIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !GetAtt ControlPlaneSecurityGroup.GroupId
+      IpProtocol: tcp
+      FromPort: 8000
+      ToPort: 8000
+      SourceSecurityGroupId: !GetAtt LoadBalancerSecurityGroup.GroupId
+      Description: Control plane port, from the load balancer only.
+
+  DBSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: Postgres reachable only from the control plane and the bootstrap task.
+        must: [Never widen ingress to a CIDR. Reference security groups only.]
+    Properties:
+      GroupDescription: !Sub 'Switchboard Postgres (${NamePrefix})'
+      VpcId: !Ref Vpc
+  DBIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !GetAtt DBSecurityGroup.GroupId
+      IpProtocol: tcp
+      FromPort: 5432
+      ToPort: 5432
+      SourceSecurityGroupId: !GetAtt ControlPlaneSecurityGroup.GroupId
+      Description: Postgres from the control plane and bootstrap tasks.
+
+  # -------------------------------------------------------------- KMS and logs
+
+  EncryptionKey:
+    Type: AWS::KMS::Key
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: Encrypts database storage, the managed master password and the log group.
+        must: [Retained on stack delete. Deleting it would render retained backups unreadable.]
+    Properties:
+      Description: !Sub 'Switchboard encryption key for ${AWS::StackName}'
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: EnableAccountRoot
+            Effect: Allow
+            Principal: {AWS: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:root'}
+            Action: 'kms:*'
+            Resource: '*'
+          - Sid: AllowCloudWatchLogs
+            Effect: Allow
+            Principal: {Service: !Sub 'logs.${AWS::Region}.amazonaws.com'}
+            Action: ['kms:Encrypt*', 'kms:Decrypt*', 'kms:ReEncrypt*', 'kms:GenerateDataKey*', 'kms:Describe*']
+            Resource: '*'
+            Condition:
+              ArnLike:
+                'kms:EncryptionContext:aws:logs:arn': !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:*'
+
+  KeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: !Sub 'alias/${AWS::StackName}-switchboard'
+      TargetKeyId: !Ref EncryptionKey
+
+  LogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      LogGroupName: !Sub '/ecs/${AWS::StackName}/control'
+      RetentionInDays: 30
+      KmsKeyId: !GetAtt EncryptionKey.Arn
+
+  # ------------------------------------------------------------------- secrets
+
+  # Any 32 random bytes is a valid Ed25519 seed, but Secrets Manager's generator
+  # produces password-shaped text that will not base64-decode to exactly 32
+  # bytes, which the control plane requires. A custom resource fills it instead.
+  PolicySigningSeedSecret:
+    Type: AWS::SecretsManager::Secret
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: Private Ed25519 seed the control plane signs routing policy with.
+        must:
+          - Losing this invalidates every sidecar's pinned public key.
+          - Never log or output this value.
+    Properties:
+      Name: !Sub '${AWS::StackName}/policy-signing-seed'
+      Description: Base64 Ed25519 seed for Switchboard policy signing.
+      KmsKeyId: !Ref EncryptionKey
+
+  AppDbPasswordSecret:
+    Type: AWS::SecretsManager::Secret
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      Name: !Sub '${AWS::StackName}/runtime-db-password'
+      Description: Password for the least-privileged Switchboard runtime database login.
+      KmsKeyId: !Ref EncryptionKey
+      GenerateSecretString:
+        PasswordLength: 40
+        ExcludePunctuation: true
+
+  # Populated by the bootstrap task once the database endpoint and runtime login
+  # exist. The control plane reads it as DATABASE_URL.
+  DatabaseUrlSecret:
+    Type: AWS::SecretsManager::Secret
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      Name: !Sub '${AWS::StackName}/database-url'
+      Description: Runtime DATABASE_URL for the Switchboard control plane.
+      KmsKeyId: !Ref EncryptionKey
+
+  # -------------------------------------------------------------------- database
+
+  DBSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: !Sub 'Switchboard Postgres subnets (${NamePrefix})'
+      SubnetIds: [!Ref PrivateSubnetA, !Ref PrivateSubnetB]
+
+  DBParameterGroup:
+    Type: AWS::RDS::DBParameterGroup
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: Forces TLS on every database connection.
+        must: [rds.force_ssl must remain 1.]
+    Properties:
+      Description: !Sub 'Switchboard Postgres parameters (${NamePrefix})'
+      Family: !Ref DBParameterGroupFamily
+      Parameters:
+        rds.force_ssl: '1'
+
+  Database:
+    Type: AWS::RDS::DBInstance
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: Stores policies, principals, telemetry and audit records.
+        must:
+          - RDS manages the master password. Never add a MasterUserPassword parameter.
+          - Must not be publicly accessible.
+    Properties:
+      DBInstanceIdentifier: !Sub '${AWS::StackName}-postgres'
+      Engine: postgres
+      EngineVersion: !Ref EngineVersion
+      DBInstanceClass: !Ref DBInstanceClass
+      AllocatedStorage: 50
+      MaxAllocatedStorage: 500
+      StorageType: gp3
+      StorageEncrypted: true
+      KmsKeyId: !GetAtt EncryptionKey.Arn
+      DBName: switchboard
+      MasterUsername: switchboard_owner
+      ManageMasterUserPassword: true
+      MasterUserSecret:
+        KmsKeyId: !GetAtt EncryptionKey.Arn
+      MultiAZ: !If [IsMultiAZ, true, false]
+      PubliclyAccessible: false
+      BackupRetentionPeriod: 14
+      DeletionProtection: true
+      CopyTagsToSnapshot: true
+      AutoMinorVersionUpgrade: true
+      EnableCloudwatchLogsExports: [postgresql]
+      DBSubnetGroupName: !Ref DBSubnetGroup
+      VPCSecurityGroups: [!GetAtt DBSecurityGroup.GroupId]
+      DBParameterGroupName: !Ref DBParameterGroup
+
+  # ------------------------------------------------------------ load balancing
+
+  LoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: Terminates TLS for sidecars, which refuse plain HTTP to non-loopback hosts.
+        must: [Internal only. The control plane must never be internet facing.]
+    Properties:
+      Name: !Sub '${AWS::StackName}-control'
+      Scheme: internal
+      Type: application
+      Subnets: [!Ref PrivateSubnetA, !Ref PrivateSubnetB]
+      SecurityGroups: [!GetAtt LoadBalancerSecurityGroup.GroupId]
+
+  TargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub '${AWS::StackName}-control'
+      VpcId: !Ref Vpc
+      Port: 8000
+      Protocol: HTTP
+      TargetType: ip
+      HealthCheckPath: /readyz
+      HealthCheckIntervalSeconds: 15
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+      Matcher: {HttpCode: '200'}
+
+  Listener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref LoadBalancer
+      Port: 443
+      Protocol: HTTPS
+      SslPolicy: ELBSecurityPolicy-TLS13-1-2-2021-06
+      Certificates: [{CertificateArn: !Ref CertificateArn}]
+      DefaultActions: [{Type: forward, TargetGroupArn: !Ref TargetGroup}]
+
+  # ------------------------------------------------------------------ compute
+
+  Cluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Sub '${AWS::StackName}-cluster'
+      ClusterSettings: [{Name: containerInsights, Value: enabled}]
+
+  ExecutionRole:
+    Type: AWS::IAM::Role
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: Lets ECS pull the image and inject secrets. Not used by application code.
+        must: [Secret read access is scoped to this stack's secrets only.]
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: ecs-tasks.amazonaws.com}
+            Action: 'sts:AssumeRole'
+            Condition:
+              ArnLike: {'aws:SourceArn': !Sub 'arn:${AWS::Partition}:ecs:${AWS::Region}:${AWS::AccountId}:*'}
+              StringEquals: {'aws:SourceAccount': !Ref 'AWS::AccountId'}
+      ManagedPolicyArns:
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy'
+      Policies:
+        - PolicyName: read-stack-secrets
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: ['secretsmanager:GetSecretValue']
+                Resource:
+                  - !Ref PolicySigningSeedSecret
+                  - !Ref DatabaseUrlSecret
+                  - !Ref AppDbPasswordSecret
+              - Effect: Allow
+                Action: ['kms:Decrypt']
+                Resource: !GetAtt EncryptionKey.Arn
+
+  TaskRole:
+    Type: AWS::IAM::Role
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: Identity of the running control plane. Deliberately minimal.
+        must: [Grant nothing the application does not use.]
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: ecs-tasks.amazonaws.com}
+            Action: 'sts:AssumeRole'
+            Condition:
+              ArnLike: {'aws:SourceArn': !Sub 'arn:${AWS::Partition}:ecs:${AWS::Region}:${AWS::AccountId}:*'}
+              StringEquals: {'aws:SourceAccount': !Ref 'AWS::AccountId'}
+
+  TaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: Runs the control plane non-root with a read-only root filesystem.
+        must: [Credentials arrive as secret references, never plaintext environment values.]
+    Properties:
+      Family: !Sub '${AWS::StackName}-control'
+      NetworkMode: awsvpc
+      RequiresCompatibilities: [FARGATE]
+      Cpu: '512'
+      Memory: '1024'
+      ExecutionRoleArn: !GetAtt ExecutionRole.Arn
+      TaskRoleArn: !GetAtt TaskRole.Arn
+      ContainerDefinitions:
+        - Name: control
+          Image: !Ref ControlPlaneImage
+          Essential: true
+          User: '65532:65532'
+          ReadonlyRootFilesystem: true
+          StopTimeout: 60
+          LinuxParameters:
+            Capabilities: {Drop: [ALL]}
+          PortMappings: [{ContainerPort: 8000, Protocol: tcp}]
+          Environment:
+            - {Name: POLICY_KEY_ID, Value: !Ref PolicyKeyId}
+          Secrets:
+            - {Name: DATABASE_URL, ValueFrom: !Ref DatabaseUrlSecret}
+            - {Name: POLICY_SIGNING_SEED, ValueFrom: !Ref PolicySigningSeedSecret}
+          HealthCheck:
+            Command:
+              - CMD
+              - python
+              - -c
+              - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/readyz',timeout=3)"
+            Interval: 15
+            Timeout: 5
+            Retries: 3
+            StartPeriod: 60
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref LogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: control
+              mode: non-blocking
+              max-buffer-size: 4m
+
+  Service:
+    Type: AWS::ECS::Service
+    DependsOn: [Listener, BootstrapRun]
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: Two replicas behind the internal load balancer, rolling back failed deploys.
+        must: [Must not start before the database has been migrated by BootstrapRun.]
+    Properties:
+      ServiceName: !Sub '${AWS::StackName}-control'
+      Cluster: !Ref Cluster
+      TaskDefinition: !Ref TaskDefinition
+      DesiredCount: 2
+      LaunchType: FARGATE
+      PlatformVersion: '1.4.0'
+      HealthCheckGracePeriodSeconds: 60
+      DeploymentConfiguration:
+        DeploymentCircuitBreaker: {Enable: true, Rollback: true}
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          Subnets: [!Ref PrivateSubnetA, !Ref PrivateSubnetB]
+          SecurityGroups: [!GetAtt ControlPlaneSecurityGroup.GroupId]
+          AssignPublicIp: DISABLED
+      LoadBalancers:
+        - TargetGroupArn: !Ref TargetGroup
+          ContainerName: control
+          ContainerPort: 8000
+
+  # ----------------------------------------------------------------- bootstrap
+
+  ProvisionerRole:
+    Type: AWS::IAM::Role
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: Runs the two provisioning steps CloudFormation cannot express itself.
+        must: [Scoped to this stack's secrets, cluster and task definition only.]
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: lambda.amazonaws.com}
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+      Policies:
+        - PolicyName: provision
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: ['secretsmanager:PutSecretValue', 'secretsmanager:GetSecretValue']
+                Resource:
+                  - !Ref PolicySigningSeedSecret
+                  - !Ref DatabaseUrlSecret
+                  - !Ref AppDbPasswordSecret
+              - Effect: Allow
+                Action: ['kms:Decrypt', 'kms:GenerateDataKey']
+                Resource: !GetAtt EncryptionKey.Arn
+              - Effect: Allow
+                Action: ['ecs:RunTask', 'ecs:DescribeTasks']
+                Resource: '*'
+                Condition:
+                  ArnEquals: {'ecs:cluster': !GetAtt Cluster.Arn}
+              - Effect: Allow
+                Action: 'iam:PassRole'
+                Resource: [!GetAtt ExecutionRole.Arn, !GetAtt TaskRole.Arn]
+
+  # Any 32 random bytes is a valid Ed25519 seed, so no crypto library is needed
+  # and no key material passes through CloudFormation parameters or outputs.
+  SeedFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-seed'
+      Runtime: python3.13
+      Handler: index.handler
+      Timeout: 60
+      Role: !GetAtt ProvisionerRole.Arn
+      Code:
+        ZipFile: |
+          import base64, json, os, secrets, urllib.request
+          import boto3
+
+          def send(event, context, status, reason=""):
+              body = json.dumps({
+                  "Status": status, "Reason": reason or "see CloudWatch logs",
+                  "PhysicalResourceId": event.get("PhysicalResourceId") or context.log_stream_name,
+                  "StackId": event["StackId"], "RequestId": event["RequestId"],
+                  "LogicalResourceId": event["LogicalResourceId"], "Data": {},
+              }).encode()
+              req = urllib.request.Request(event["ResponseURL"], data=body, method="PUT")
+              req.add_header("content-type", "")
+              req.add_header("content-length", str(len(body)))
+              urllib.request.urlopen(req, timeout=30)
+
+          def handler(event, context):
+              try:
+                  if event["RequestType"] in ("Create", "Update"):
+                      arn = event["ResourceProperties"]["SecretArn"]
+                      sm = boto3.client("secretsmanager")
+                      try:
+                          existing = sm.get_secret_value(SecretId=arn)["SecretString"]
+                      except sm.exceptions.ResourceNotFoundException:
+                          existing = ""
+                      except Exception:
+                          existing = ""
+                      # Never regenerate: a new seed would invalidate every
+                      # sidecar's pinned public key.
+                      if not existing:
+                          seed = base64.b64encode(secrets.token_bytes(32)).decode()
+                          sm.put_secret_value(SecretId=arn, SecretString=seed)
+                  send(event, context, "SUCCESS")
+              except Exception as e:
+                  send(event, context, "FAILED", str(e)[:400])
+
+  SeedFill:
+    Type: AWS::CloudFormation::CustomResource
+    Properties:
+      ServiceToken: !GetAtt SeedFunction.Arn
+      SecretArn: !Ref PolicySigningSeedSecret
+
+  BootstrapTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: Applies migrations and creates the weaker runtime login.
+        must:
+          - Migrations run as the database owner; the runtime login must stay separate
+            or row level security is bypassed.
+    Properties:
+      Family: !Sub '${AWS::StackName}-bootstrap'
+      NetworkMode: awsvpc
+      RequiresCompatibilities: [FARGATE]
+      Cpu: '512'
+      Memory: '1024'
+      ExecutionRoleArn: !GetAtt ExecutionRole.Arn
+      TaskRoleArn: !GetAtt TaskRole.Arn
+      ContainerDefinitions:
+        - Name: bootstrap
+          Image: !Ref ControlPlaneImage
+          Essential: true
+          User: '65532:65532'
+          ReadonlyRootFilesystem: true
+          # Reuses scripts/devstack.py dbinit, the same sequence the local
+          # development stack runs, rather than a second implementation.
+          EntryPoint: ['sh', '-c']
+          Command:
+            - >-
+              MIGRATION_DATABASE_URL="postgresql://switchboard_owner:${PGPASSWORD}@${DBHOST}:5432/switchboard?sslmode=verify-full&sslrootcert=/etc/ssl/rds/global-bundle.pem"
+              python scripts/devstack.py dbinit
+          Environment:
+            - {Name: DBHOST, Value: !GetAtt Database.Endpoint.Address}
+          Secrets:
+            - Name: PGPASSWORD
+              ValueFrom: !Sub '${Database.MasterUserSecret.SecretArn}:password::'
+            - {Name: APP_DB_PASSWORD, ValueFrom: !Ref AppDbPasswordSecret}
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref LogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: bootstrap
+              mode: non-blocking
+              max-buffer-size: 4m
+
+  BootstrapFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-bootstrap'
+      Runtime: python3.13
+      Handler: index.handler
+      Timeout: 900
+      Role: !GetAtt ProvisionerRole.Arn
+      Code:
+        ZipFile: |
+          import json, time, urllib.parse, urllib.request
+          import boto3
+
+          def send(event, context, status, reason=""):
+              body = json.dumps({
+                  "Status": status, "Reason": reason or "see CloudWatch logs",
+                  "PhysicalResourceId": event.get("PhysicalResourceId") or context.log_stream_name,
+                  "StackId": event["StackId"], "RequestId": event["RequestId"],
+                  "LogicalResourceId": event["LogicalResourceId"], "Data": {},
+              }).encode()
+              req = urllib.request.Request(event["ResponseURL"], data=body, method="PUT")
+              req.add_header("content-type", "")
+              req.add_header("content-length", str(len(body)))
+              urllib.request.urlopen(req, timeout=30)
+
+          def handler(event, context):
+              try:
+                  if event["RequestType"] == "Delete":
+                      return send(event, context, "SUCCESS")
+                  p = event["ResourceProperties"]
+                  sm = boto3.client("secretsmanager")
+
+                  # Compose the runtime DSN here rather than in the task, so the
+                  # control plane image needs no AWS SDK of its own.
+                  password = sm.get_secret_value(SecretId=p["AppDbPasswordArn"])["SecretString"]
+                  dsn = ("postgresql://switchboard_rt:%s@%s:5432/switchboard"
+                         "?sslmode=verify-full&sslrootcert=/etc/ssl/rds/global-bundle.pem" % (
+                             urllib.parse.quote(password, safe=""), p["DbHost"]))
+                  sm.put_secret_value(SecretId=p["DatabaseUrlArn"], SecretString=dsn)
+
+                  ecs = boto3.client("ecs")
+                  run = ecs.run_task(
+                      cluster=p["Cluster"], taskDefinition=p["TaskDefinition"],
+                      launchType="FARGATE", count=1,
+                      networkConfiguration={"awsvpcConfiguration": {
+                          "subnets": p["Subnets"], "securityGroups": [p["SecurityGroup"]],
+                          "assignPublicIp": "DISABLED"}})
+                  if run.get("failures"):
+                      raise RuntimeError("run_task failed: %s" % run["failures"])
+                  arn = run["tasks"][0]["taskArn"]
+
+                  deadline = time.time() + 780
+                  while time.time() < deadline:
+                      time.sleep(10)
+                      d = ecs.describe_tasks(cluster=p["Cluster"], tasks=[arn])["tasks"][0]
+                      if d["lastStatus"] == "STOPPED":
+                          code = d["containers"][0].get("exitCode")
+                          if code == 0:
+                              return send(event, context, "SUCCESS")
+                          raise RuntimeError(
+                              "bootstrap exited %s: %s" % (code, d.get("stoppedReason", "")))
+                  raise TimeoutError("bootstrap task did not finish within 13 minutes")
+              except Exception as e:
+                  send(event, context, "FAILED", str(e)[:400])
+
+  BootstrapRun:
+    Type: AWS::CloudFormation::CustomResource
+    DependsOn: [NatGateway, PrivateDefaultRoute]
+    Properties:
+      ServiceToken: !GetAtt BootstrapFunction.Arn
+      Cluster: !Ref Cluster
+      TaskDefinition: !Ref BootstrapTaskDefinition
+      Subnets: [!Ref PrivateSubnetA, !Ref PrivateSubnetB]
+      SecurityGroup: !GetAtt ControlPlaneSecurityGroup.GroupId
+      DbHost: !GetAtt Database.Endpoint.Address
+      AppDbPasswordArn: !Ref AppDbPasswordSecret
+      DatabaseUrlArn: !Ref DatabaseUrlSecret
+
+Outputs:
+  ControlPlaneEndpoint:
+    Description: >-
+      Point the DNS name on your certificate at this address, then set the
+      sidecar's control_url to https://<that name>.
+    Value: !GetAtt LoadBalancer.DNSName
+  PolicySigningSeedSecretArn:
+    Description: Secret holding the signing seed. Read the public key from the control plane, never this.
+    Value: !Ref PolicySigningSeedSecret
+  DatabaseEndpoint:
+    Value: !GetAtt Database.Endpoint.Address
+  ClusterArn:
+    Description: Run your application tasks with the Switchboard sidecar in this cluster.
+    Value: !GetAtt Cluster.Arn
+  SidecarSecurityGroupId:
+    Description: Attach this to application tasks so their sidecars can reach the control plane.
+    Value: !GetAtt ControlPlaneSecurityGroup.GroupId

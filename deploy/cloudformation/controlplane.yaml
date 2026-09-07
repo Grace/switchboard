@@ -1,0 +1,373 @@
+AWSTemplateFormatVersion: '2010-09-09'
+
+Description: >-
+  Switchboard control plane and its Postgres database. Deploys an encrypted
+  Multi-AZ RDS instance reachable only from the security groups you nominate, and
+  two Fargate replicas of the control plane behind an existing target group. VPC,
+  subnets, KMS keys, IAM roles, ECS cluster and load balancer are supplied as
+  parameters and are never created or modified by this stack.
+
+Metadata:
+  AWSToolsMetrics:
+    AWSAgentToolkit: aws-cloudformation@2
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label: {default: Naming}
+        Parameters: [NamePrefix]
+      - Label: {default: Existing network}
+        Parameters: [VpcId, PrivateSubnetIds, ClientSecurityGroup1, ClientSecurityGroup2, ClientSecurityGroup3, ClientSecurityGroup4]
+      - Label: {default: 'Existing IAM, KMS and load balancer'}
+        Parameters: [ExecutionRoleArn, TaskRoleArn, KmsKeyArn, LogKmsKeyArn, EcsClusterArn, TargetGroupArn, ControlPlaneSecurityGroupIds]
+      - Label: {default: Control plane}
+        Parameters: [ControlPlaneImage, PolicyKeyId, DatabaseUrlSecretArn, PolicySigningSeedSecretArn]
+      - Label: {default: Database}
+        Parameters: [EngineVersion, DBParameterGroupFamily, DBInstanceClass, AllocatedStorage, MaxAllocatedStorage]
+
+Parameters:
+  NamePrefix:
+    Type: String
+    Description: Short name distinguishing this deployment, used in resource names.
+    AllowedPattern: '^[a-z][a-z0-9-]{1,30}$'
+    ConstraintDescription: lowercase letters, digits and hyphens, starting with a letter.
+
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: Existing VPC. This stack does not create networking.
+  PrivateSubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: Private subnets in at least two availability zones, for RDS and Fargate.
+
+  # Terraform models this as for_each over a set of arbitrary size. CloudFormation
+  # has no equivalent, so the set is bounded at four explicit slots. Leave unused
+  # slots empty. If you need more, add further slots and matching conditions.
+  ClientSecurityGroup1:
+    Type: String
+    Default: ''
+    Description: Security group permitted to reach Postgres on 5432. Usually the control plane's.
+  ClientSecurityGroup2: {Type: String, Default: '', Description: Optional additional client security group.}
+  ClientSecurityGroup3: {Type: String, Default: '', Description: Optional additional client security group.}
+  ClientSecurityGroup4: {Type: String, Default: '', Description: Optional additional client security group.}
+
+  ControlPlaneSecurityGroupIds:
+    Type: List<AWS::EC2::SecurityGroup::Id>
+    Description: Security groups attached to the control plane tasks.
+
+  ExecutionRoleArn:
+    Type: String
+    Description: Existing ECS execution role. Must be able to read the two secrets below.
+    AllowedPattern: '^arn:[^:]+:iam::\d{12}:role/.+$'
+  TaskRoleArn:
+    Type: String
+    Description: Existing ECS task role for the control plane container.
+    AllowedPattern: '^arn:[^:]+:iam::\d{12}:role/.+$'
+  KmsKeyArn:
+    Type: String
+    Description: Customer managed KMS key for database storage and the managed master password.
+    AllowedPattern: '^arn:[^:]+:kms:[a-z0-9-]+:\d{12}:key/.+$'
+  LogKmsKeyArn:
+    Type: String
+    Description: Customer managed KMS key encrypting the CloudWatch log group.
+    AllowedPattern: '^arn:[^:]+:kms:[a-z0-9-]+:\d{12}:key/.+$'
+  EcsClusterArn:
+    Type: String
+    Description: Existing ECS cluster to run the control plane in.
+    AllowedPattern: '^arn:[^:]+:ecs:[a-z0-9-]+:\d{12}:cluster/.+$'
+  TargetGroupArn:
+    Type: String
+    Description: Existing load balancer target group. Its listener should terminate TLS.
+    AllowedPattern: '^arn:[^:]+:elasticloadbalancing:[a-z0-9-]+:\d{12}:targetgroup/.+$'
+
+  ControlPlaneImage:
+    Type: String
+    Description: >-
+      Control plane image pinned by digest. Subscribers use the AWS Marketplace
+      ECR path supplied in the listing's usage instructions.
+    AllowedPattern: '^.+@sha256:[0-9a-f]{64}$'
+    ConstraintDescription: 'must be pinned by digest, ending @sha256: followed by 64 hex characters.'
+
+  PolicyKeyId:
+    Type: String
+    Description: Identifier of the policy signing key. Sidecars pin the matching public key.
+    AllowedPattern: '^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$'
+
+  # The Terraform module took a free-form map and asserted at plan time that it
+  # contained exactly these two keys. Naming them as separate required parameters
+  # enforces the same requirement structurally, so it cannot be got wrong.
+  DatabaseUrlSecretArn:
+    Type: String
+    Description: Secrets Manager ARN holding the runtime DATABASE_URL. Use sslmode=verify-full.
+    AllowedPattern: '^arn:[^:]+:secretsmanager:[a-z0-9-]+:\d{12}:secret:.+$'
+  PolicySigningSeedSecretArn:
+    Type: String
+    Description: Secrets Manager ARN holding the base64 Ed25519 POLICY_SIGNING_SEED.
+    AllowedPattern: '^arn:[^:]+:secretsmanager:[a-z0-9-]+:\d{12}:secret:.+$'
+
+  EngineVersion:
+    Type: String
+    Default: '17.4'
+    Description: Postgres engine version available in your Region.
+  DBParameterGroupFamily:
+    Type: String
+    Default: postgres17
+    Description: Must match the major version of EngineVersion.
+  DBInstanceClass:
+    Type: String
+    Default: db.t4g.medium
+    Description: Review against your expected load before production use.
+  AllocatedStorage:
+    Type: Number
+    Default: 50
+    MinValue: 20
+  MaxAllocatedStorage:
+    Type: Number
+    Default: 500
+    MinValue: 20
+
+Conditions:
+  HasClient1: !Not [!Equals [!Ref ClientSecurityGroup1, '']]
+  HasClient2: !Not [!Equals [!Ref ClientSecurityGroup2, '']]
+  HasClient3: !Not [!Equals [!Ref ClientSecurityGroup3, '']]
+  HasClient4: !Not [!Equals [!Ref ClientSecurityGroup4, '']]
+
+Resources:
+
+  DBSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: Places the database in private subnets only.
+        must:
+          - Subnets must span at least two availability zones for Multi-AZ.
+    Properties:
+      DBSubnetGroupDescription: !Sub 'Switchboard Postgres subnets for ${NamePrefix}'
+      SubnetIds: !Ref PrivateSubnetIds
+
+  DBSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: Restricts Postgres to nominated client security groups.
+        must:
+          - Never widen ingress to a CIDR. Reference security groups only.
+    Properties:
+      GroupDescription: !Sub 'Postgres from nominated clients only (${NamePrefix})'
+      VpcId: !Ref VpcId
+      SecurityGroupEgress:
+        - IpProtocol: '-1'
+          CidrIp: 127.0.0.1/32
+          Description: No egress required from the database.
+      Tags:
+        - {Key: Name, Value: !Sub '${AWS::StackName}-postgres'}
+
+  DBIngress1:
+    Type: AWS::EC2::SecurityGroupIngress
+    Condition: HasClient1
+    Properties:
+      GroupId: !GetAtt DBSecurityGroup.GroupId
+      IpProtocol: tcp
+      FromPort: 5432
+      ToPort: 5432
+      SourceSecurityGroupId: !Ref ClientSecurityGroup1
+      Description: Postgres from client security group 1.
+  DBIngress2:
+    Type: AWS::EC2::SecurityGroupIngress
+    Condition: HasClient2
+    Properties:
+      GroupId: !GetAtt DBSecurityGroup.GroupId
+      IpProtocol: tcp
+      FromPort: 5432
+      ToPort: 5432
+      SourceSecurityGroupId: !Ref ClientSecurityGroup2
+      Description: Postgres from client security group 2.
+  DBIngress3:
+    Type: AWS::EC2::SecurityGroupIngress
+    Condition: HasClient3
+    Properties:
+      GroupId: !GetAtt DBSecurityGroup.GroupId
+      IpProtocol: tcp
+      FromPort: 5432
+      ToPort: 5432
+      SourceSecurityGroupId: !Ref ClientSecurityGroup3
+      Description: Postgres from client security group 3.
+  DBIngress4:
+    Type: AWS::EC2::SecurityGroupIngress
+    Condition: HasClient4
+    Properties:
+      GroupId: !GetAtt DBSecurityGroup.GroupId
+      IpProtocol: tcp
+      FromPort: 5432
+      ToPort: 5432
+      SourceSecurityGroupId: !Ref ClientSecurityGroup4
+      Description: Postgres from client security group 4.
+
+  DBParameterGroup:
+    Type: AWS::RDS::DBParameterGroup
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: Forces TLS for every database connection.
+        must:
+          - rds.force_ssl must remain 1. The control plane also demands sslmode=verify-full.
+    Properties:
+      Description: !Sub 'Switchboard Postgres parameters for ${NamePrefix}'
+      Family: !Ref DBParameterGroupFamily
+      Parameters:
+        rds.force_ssl: '1'
+
+  Database:
+    Type: AWS::RDS::DBInstance
+    # Stateful. A stack delete or a replacing update must not destroy the data;
+    # the instance also carries deletion protection and a 14 day backup window.
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: Durable store for policies, principals, telemetry and audit records.
+        must:
+          - RDS manages the master password. Never add a MasterUserPassword parameter.
+          - Storage and the managed secret are encrypted with the supplied CMK.
+          - Must not be publicly accessible.
+        mutability:
+          DBInstanceClass: mutable
+          AllocatedStorage: mutable
+    Properties:
+      DBInstanceIdentifier: !Sub '${AWS::StackName}-postgres'
+      Engine: postgres
+      EngineVersion: !Ref EngineVersion
+      DBInstanceClass: !Ref DBInstanceClass
+      AllocatedStorage: !Ref AllocatedStorage
+      MaxAllocatedStorage: !Ref MaxAllocatedStorage
+      StorageType: gp3
+      StorageEncrypted: true
+      KmsKeyId: !Ref KmsKeyArn
+      DBName: switchboard
+      MasterUsername: switchboard_owner
+      ManageMasterUserPassword: true
+      MasterUserSecret:
+        KmsKeyId: !Ref KmsKeyArn
+      MultiAZ: true
+      PubliclyAccessible: false
+      BackupRetentionPeriod: 14
+      DeletionProtection: true
+      CopyTagsToSnapshot: true
+      AutoMinorVersionUpgrade: true
+      EnableCloudwatchLogsExports: [postgresql]
+      DBSubnetGroupName: !Ref DBSubnetGroup
+      VPCSecurityGroups: [!GetAtt DBSecurityGroup.GroupId]
+      DBParameterGroupName: !Ref DBParameterGroup
+
+  LogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: Retains control plane logs under a customer managed key.
+        must:
+          - Retention and encryption are audit relevant. Do not lower without review.
+    Properties:
+      LogGroupName: !Sub '/ecs/${NamePrefix}/control'
+      RetentionInDays: 30
+      KmsKeyId: !Ref LogKmsKeyArn
+
+  TaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: Runs the control plane as a non-root, read-only-root Fargate task.
+        must:
+          - Runs as 65532 with all Linux capabilities dropped and a read only root filesystem.
+          - Credentials arrive as Secrets Manager references, never as plaintext environment values.
+    Properties:
+      Family: !Sub '${AWS::StackName}-control'
+      NetworkMode: awsvpc
+      RequiresCompatibilities: [FARGATE]
+      Cpu: '512'
+      Memory: '1024'
+      ExecutionRoleArn: !Ref ExecutionRoleArn
+      TaskRoleArn: !Ref TaskRoleArn
+      ContainerDefinitions:
+        - Name: control
+          Image: !Ref ControlPlaneImage
+          Essential: true
+          Cpu: 512
+          Memory: 1024
+          User: '65532:65532'
+          ReadonlyRootFilesystem: true
+          StopTimeout: 60
+          LinuxParameters:
+            Capabilities:
+              Drop: [ALL]
+          PortMappings:
+            - ContainerPort: 8000
+              Protocol: tcp
+          Environment:
+            - Name: POLICY_KEY_ID
+              Value: !Ref PolicyKeyId
+          Secrets:
+            - Name: DATABASE_URL
+              ValueFrom: !Ref DatabaseUrlSecretArn
+            - Name: POLICY_SIGNING_SEED
+              ValueFrom: !Ref PolicySigningSeedSecretArn
+          HealthCheck:
+            Command:
+              - CMD
+              - python
+              - -c
+              - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/readyz',timeout=3)"
+            Interval: 15
+            Timeout: 5
+            Retries: 3
+            StartPeriod: 60
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref LogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: control
+              mode: non-blocking
+              max-buffer-size: 4m
+
+  Service:
+    Type: AWS::ECS::Service
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: Two replicas behind an existing target group, with rollback on failed deploys.
+        must:
+          - Tasks stay in private subnets without public IPs.
+    Properties:
+      ServiceName: !Sub '${AWS::StackName}-control'
+      Cluster: !Ref EcsClusterArn
+      TaskDefinition: !Ref TaskDefinition
+      DesiredCount: 2
+      LaunchType: FARGATE
+      PlatformVersion: '1.4.0'
+      HealthCheckGracePeriodSeconds: 60
+      DeploymentConfiguration:
+        DeploymentCircuitBreaker:
+          Enable: true
+          Rollback: true
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          Subnets: !Ref PrivateSubnetIds
+          SecurityGroups: !Ref ControlPlaneSecurityGroupIds
+          AssignPublicIp: DISABLED
+      LoadBalancers:
+        - TargetGroupArn: !Ref TargetGroupArn
+          ContainerName: control
+          ContainerPort: 8000
+
+Outputs:
+  DatabaseEndpoint:
+    Description: Database address. Build the runtime DATABASE_URL from this.
+    Value: !GetAtt Database.Endpoint.Address
+  MasterUserSecretArn:
+    Description: >-
+      Secrets Manager ARN of the RDS managed master password. Use it to run
+      migrations and to create the weaker runtime login; it is not the runtime
+      credential itself.
+    Value: !GetAtt Database.MasterUserSecret.SecretArn
+  DatabaseSecurityGroupId:
+    Description: Attach this as a client to reach Postgres, or nominate it as a client slot.
+    Value: !GetAtt DBSecurityGroup.GroupId
+  TaskDefinitionArn:
+    Value: !Ref TaskDefinition

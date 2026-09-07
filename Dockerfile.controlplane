@@ -2,7 +2,12 @@ FROM python:3.14-slim-bookworm
 ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 PIP_NO_CACHE_DIR=1
 WORKDIR /app
 COPY controlplane/requirements.txt ./requirements.txt
-RUN pip install --no-cache-dir -r requirements.txt && useradd --uid 65532 --no-create-home app
+# The Amazon RDS root CA is not in the system trust store, and the control plane
+# demands sslmode=verify-full, so without this bundle it cannot reach RDS at all.
+# Fetched from AWS at build time; AWS rotates it, so it is not pinned by digest.
+ADD https://truststore.pki.rds.amazonaws.com/global/global-bundle.pem /etc/ssl/rds/global-bundle.pem
+RUN chmod 0644 /etc/ssl/rds/global-bundle.pem \
+ && pip install --no-cache-dir -r requirements.txt && useradd --uid 65532 --no-create-home app
 COPY controlplane ./controlplane
 COPY scripts ./scripts
 USER 65532:65532
