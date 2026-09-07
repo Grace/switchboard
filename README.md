@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="docs/img/switchboard-logo.png" alt="Switchboard" width="420">
+  <img src="docs/img/switchboard.png" alt="Switchboard" width="420">
 </p>
 
 # Switchboard Sidecar
