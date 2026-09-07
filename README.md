@@ -31,7 +31,7 @@ Only `model`, `messages`, `stream`, `max_tokens`, and `temperature` are supporte
 
 ## Build and test
 
-Go 1.26 (or newer supported Go release) and Python 3.12:
+Go 1.26 (or newer supported Go release) and Python 3.14:
 
 ```sh
 go test -race ./...
