@@ -18,7 +18,7 @@ Metadata:
       - Label: {default: 'Lifecycle'}
         Parameters: [Environment]
       - Label: {default: 'Optional: sizing and cost'}
-        Parameters: [DBInstanceClass, MultiAZ, VpcCidr, PolicyKeyId, EngineVersion, DBParameterGroupFamily]
+        Parameters: [DBInstanceClass, MultiAZ, VpcCidr, PolicyKeyId, EngineVersion]
 
 Parameters:
   NamePrefix:
@@ -86,11 +86,7 @@ Parameters:
     Description: Multi-AZ roughly doubles database cost. Leave true for production.
   EngineVersion:
     Type: String
-    Default: '17.11'
-  DBParameterGroupFamily:
-    Type: String
-    Default: postgres17
-    Description: Must match the major version of EngineVersion.
+    Default: '18.6'
 
 Conditions:
   IsMultiAZ: !Equals [!Ref MultiAZ, 'true']
@@ -359,7 +355,12 @@ Resources:
         must: [rds.force_ssl must remain 1.]
     Properties:
       Description: !Sub 'Switchboard Postgres parameters (${NamePrefix})'
-      Family: !Ref DBParameterGroupFamily
+      # Derived rather than supplied. These two were separate parameters that
+      # had to be kept in agreement by hand, with the constraint written in
+      # prose; a mismatch fails the stack after most of it is built.
+      Family: !Sub
+        - 'postgres${Major}'
+        - Major: !Select [0, !Split ['.', !Ref EngineVersion]]
       Parameters:
         rds.force_ssl: '1'
 
