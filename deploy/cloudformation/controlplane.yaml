@@ -104,8 +104,11 @@ Parameters:
 
   EngineVersion:
     Type: String
-    Default: '17.4'
-    Description: Postgres engine version available in your Region.
+    Default: '17.11'
+    Description: >-
+      Postgres engine version. Verify availability in your Region with
+      aws rds describe-db-engine-versions --engine postgres; versions are
+      retired over time and a stale default fails at create time.
   DBParameterGroupFamily:
     Type: String
     Default: postgres17

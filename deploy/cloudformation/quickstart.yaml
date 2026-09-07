@@ -86,7 +86,7 @@ Parameters:
     Description: Multi-AZ roughly doubles database cost. Leave true for production.
   EngineVersion:
     Type: String
-    Default: '17.4'
+    Default: '17.11'
   DBParameterGroupFamily:
     Type: String
     Default: postgres17
