@@ -14,7 +14,9 @@ Metadata:
   AWS::CloudFormation::Interface:
     ParameterGroups:
       - Label: {default: Required}
-        Parameters: [NamePrefix, CertificateArn, ControlPlaneImage]
+        Parameters: [NamePrefix, CertificateArn, ControlPlaneHostname, ControlPlaneImage]
+      - Label: {default: 'Lifecycle'}
+        Parameters: [Environment]
       - Label: {default: 'Optional: sizing and cost'}
         Parameters: [DBInstanceClass, MultiAZ, VpcCidr, PolicyKeyId, EngineVersion, DBParameterGroupFamily]
 
@@ -34,6 +36,24 @@ Parameters:
       loopback and trusts only system roots, so this stack cannot mint its own.
       After deploy, point that DNS name at the load balancer address in Outputs.
     AllowedPattern: '^arn:[^:]+:acm:[a-z0-9-]+:\d{12}:certificate/.+$'
+
+  ControlPlaneHostname:
+    Type: String
+    Description: >-
+      The name on your certificate, e.g. switchboard.example.com. This stack
+      creates a private hosted zone so the name resolves to the internal load
+      balancer from inside the VPC only; your public DNS is untouched.
+    AllowedPattern: '^(?!-)[A-Za-z0-9-]{1,63}(\.[A-Za-z0-9-]{1,63})+$'
+
+  Environment:
+    Type: String
+    Default: production
+    AllowedValues: [production, evaluation]
+    Description: >-
+      production keeps database deletion protection on. evaluation turns it off
+      so a trial stack can be deleted without a manual step. The database is
+      snapshotted on delete either way; run scripts/teardown.sh afterwards to
+      remove the retained key, secrets and log group.
 
   ControlPlaneImage:
     Type: String
@@ -74,6 +94,7 @@ Parameters:
 
 Conditions:
   IsMultiAZ: !Equals [!Ref MultiAZ, 'true']
+  IsProduction: !Equals [!Ref Environment, production]
 
 Resources:
 
@@ -338,14 +359,20 @@ Resources:
 
   Database:
     Type: AWS::RDS::DBInstance
-    DeletionPolicy: Retain
-    UpdateReplacePolicy: Retain
+    # Snapshot rather than Retain. Both preserve the data on stack delete, but a
+    # retained Multi-AZ instance keeps billing around $107/month, which turns
+    # every evaluation into a standing charge the deleter did not expect. A
+    # snapshot of the same data is a few dollars a month. The KMS key below is
+    # retained precisely so the snapshot stays readable.
+    DeletionPolicy: Snapshot
+    UpdateReplacePolicy: Snapshot
     Metadata:
       com.aws.cloudformation.Context:
         why: Stores policies, principals, telemetry and audit records.
         must:
           - RDS manages the master password. Never add a MasterUserPassword parameter.
           - Must not be publicly accessible.
+          - The KMS key must outlive this instance or its snapshot cannot be read.
     Properties:
       DBInstanceIdentifier: !Sub '${AWS::StackName}-postgres'
       Engine: postgres
@@ -364,7 +391,7 @@ Resources:
       MultiAZ: !If [IsMultiAZ, true, false]
       PubliclyAccessible: false
       BackupRetentionPeriod: 14
-      DeletionProtection: true
+      DeletionProtection: !If [IsProduction, true, false]
       CopyTagsToSnapshot: true
       AutoMinorVersionUpgrade: true
       EnableCloudwatchLogsExports: [postgresql]
@@ -401,6 +428,37 @@ Resources:
       HealthyThresholdCount: 2
       UnhealthyThresholdCount: 3
       Matcher: {HttpCode: '200'}
+
+  # Resolves the certificate's name to the internal load balancer, inside this
+  # VPC only. Without it every deployer has to create the record by hand, and
+  # pointing a public record at a private address would publish internal
+  # topology. A private zone is invisible outside the VPC and does not affect
+  # the domain's public DNS.
+  PrivateZone:
+    Type: AWS::Route53::HostedZone
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: Lets the sidecar reach the control plane by its certificate name over TLS.
+        must:
+          - Must stay private. The control plane is never internet facing.
+    Properties:
+      Name: !Ref ControlPlaneHostname
+      HostedZoneConfig:
+        Comment: !Sub 'Switchboard control plane, private to ${AWS::StackName}'
+      VPCs:
+        - VPCId: !Ref Vpc
+          VPCRegion: !Ref AWS::Region
+
+  ControlPlaneRecord:
+    Type: AWS::Route53::RecordSet
+    Properties:
+      HostedZoneId: !Ref PrivateZone
+      Name: !Ref ControlPlaneHostname
+      Type: A
+      AliasTarget:
+        DNSName: !GetAtt LoadBalancer.DNSName
+        HostedZoneId: !GetAtt LoadBalancer.CanonicalHostedZoneID
+        EvaluateTargetHealth: false
 
   Listener:
     Type: AWS::ElasticLoadBalancingV2::Listener
@@ -780,10 +838,12 @@ Resources:
       DatabaseUrlArn: !Ref DatabaseUrlSecret
 
 Outputs:
-  ControlPlaneEndpoint:
+  ControlPlaneURL:
     Description: >-
-      Point the DNS name on your certificate at this address, then set the
-      sidecar's control_url to https://<that name>.
+      Set the sidecar's control_url to this. It resolves inside the VPC only.
+    Value: !Sub 'https://${ControlPlaneHostname}'
+  LoadBalancerDNSName:
+    Description: The load balancer's own name, for diagnostics.
     Value: !GetAtt LoadBalancer.DNSName
   PolicySigningSeedSecretArn:
     Description: Secret holding the signing seed. Read the public key from the control plane, never this.
