@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="docs/img/switchboard-logo.png" alt="Switchboard" width="420">
+</p>
+
 # Switchboard Sidecar
 
 Switchboard is an AI infrastructure platform. The **Switchboard Sidecar** is its
