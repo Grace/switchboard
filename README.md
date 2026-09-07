@@ -1,6 +1,12 @@
-# Switchboard 1.0
+# Switchboard Sidecar
 
-Go inference sidecar with a Postgres-backed Python/FastAPI control plane, targeting AWS ECS/Fargate.
+Switchboard is an AI infrastructure platform. The **Switchboard Sidecar** is its
+deployable data-plane component: a Go inference sidecar with a Postgres-backed
+Python/FastAPI control plane, targeting AWS ECS/Fargate.
+
+It runs beside your application in the same task, exposes one OpenAI-compatible
+endpoint on loopback, and routes to OpenAI, Anthropic or Gemini according to a
+signed policy it cannot itself edit.
 
 **Release status: production-oriented release candidate, not production-certified.** This is a fresh implementation of the architecture described in the earlier Switchboard conversation. The v0.2 ZIP was unavailable, so compatibility with its implementation or persisted data has not been verified. Read [validation](docs/VALIDATION.md) and [remaining gaps](docs/GAPS.md) before deployment.
 

@@ -35,6 +35,7 @@ type Config struct {
 	QueueSize       int                       `json:"queue_size"`
 	SpoolBytes      int64                     `json:"spool_bytes"`
 	OTLPURL         string                    `json:"otlp_url"`
+	Marketplace     *MarketplaceConfig        `json:"marketplace,omitempty"`
 	AllowLocalHTTP  bool                      `json:"allow_local_http"`
 }
 
@@ -90,7 +91,7 @@ func (c Config) Validate() error {
 	if len(c.Providers) == 0 {
 		return errors.New("no providers")
 	}
-	return nil
+	return c.Marketplace.Validate()
 }
 func (c Config) Store() *PolicyStore {
 	keys := map[string]ed25519.PublicKey{}

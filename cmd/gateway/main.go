@@ -47,6 +47,20 @@ func main() {
 		slog.Error("cannot read policy cache")
 		os.Exit(1)
 	}
+	if c.Marketplace != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		api, e := gateway.NewUsageRegistrar(ctx)
+		if e == nil {
+			e = gateway.RegisterUsage(ctx, c.Marketplace, api)
+		}
+		cancel()
+		if e != nil {
+			// Fails closed: no entitlement, no serving.
+			slog.Error("marketplace registration failed", "error", e)
+			os.Exit(1)
+		}
+		slog.Info("marketplace usage registered", "product_code", c.Marketplace.ProductCode)
+	}
 	m := &gateway.Metrics{LogDropped: &logs.Dropped}
 	t, e := gateway.NewTelemetry(c, m)
 	if e != nil {

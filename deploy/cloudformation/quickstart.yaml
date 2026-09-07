@@ -470,6 +470,26 @@ Resources:
               ArnLike: {'aws:SourceArn': !Sub 'arn:${AWS::Partition}:ecs:${AWS::Region}:${AWS::AccountId}:*'}
               StringEquals: {'aws:SourceAccount': !Ref 'AWS::AccountId'}
 
+  # RegisterUsage is called by the sidecar inside the customer's application
+  # task, not by the control plane, so the permission cannot simply be attached
+  # to a role this stack owns. It is published here for the customer to attach
+  # to whichever task role runs the sidecar.
+  SidecarMeteringPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: Minimum permission a metered Switchboard Sidecar task role requires.
+        must:
+          - RegisterUsage only. Do not widen to other Marketplace actions.
+    Properties:
+      Description: Allows a Switchboard Sidecar task to register Marketplace usage.
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action: 'aws-marketplace:RegisterUsage'
+            Resource: '*'
+
   TaskDefinition:
     Type: AWS::ECS::TaskDefinition
     Metadata:
@@ -777,3 +797,8 @@ Outputs:
   SidecarSecurityGroupId:
     Description: Attach this to application tasks so their sidecars can reach the control plane.
     Value: !GetAtt ControlPlaneSecurityGroup.GroupId
+  SidecarMeteringPolicyArn:
+    Description: >-
+      Attach to the task role running the Switchboard Sidecar. Required only for
+      a metered Marketplace subscription; unnecessary for free or BYOL use.
+    Value: !Ref SidecarMeteringPolicy

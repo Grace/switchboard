@@ -60,3 +60,47 @@ Alert on policy refresh errors/approaching expiry, inference errors, rejections,
 Keep Postgres point-in-time recovery and restore drills. Retain telemetry with a scheduled trusted maintenance job; tables are not automatically partitioned. Delete old telemetry in small batches after your agreed retention period, and retain audit/policy records according to customer requirements. Runtime role cannot delete audit data.
 
 Roll back an image by redeploying the previous digest only if schema compatibility has been checked. Roll back routing by publishing a **higher** policy version. Do not edit old migration files or restore old policy-cache snapshots over newer versions. Use forward migrations; automated destructive down migrations are intentionally absent.
+
+## Reference images
+
+Built `linux/amd64` and pushed 2026-09-07. Both CloudFormation templates pin by
+digest, so these are the values to supply as `ControlPlaneImage` and to reference
+from the sidecar task definition. ARM64 is not built: it matters for EKS add-on
+delivery, which is not the chosen distribution path.
+
+| Image | Digest |
+|---|---|
+| `switchboard/gateway:0.1.0` | `sha256:52069ca601b4fad0704f158c29ea4f5e8a90d20b2bfd522e2e5aa64d943cb94b` |
+| `switchboard/controlplane:0.1.0` | `sha256:e14c959ee1347f52e48ac23c9f7de6b5b339654ac7e999970634bca728b4cfd2` |
+
+These live in a development registry. A Marketplace listing requires every image
+a subscriber needs to be pushed to AWS Marketplace managed ECR instead.
+
+**Image scanning.** The gateway image reports no findings; it is distroless and
+carries almost no operating system. The control-plane image reports 19 findings
+(4 critical, 15 high) in Debian packages — perl, util-linux, openssl, zlib,
+pcre2 — none in the application or its Python dependencies, and **every one is
+currently marked as having no fix available upstream**. Rebuilding on Debian
+trixie was worse rather than better. See `docs/GAPS.md`.
+
+## CloudFormation templates
+
+| Template | Required parameters | Capabilities |
+|---|---|---|
+| `quickstart.yaml` | `CertificateArn`, `ControlPlaneImage` | `CAPABILITY_IAM` |
+| `controlplane.yaml` | 23, all pre-existing infrastructure | none |
+
+`quickstart.yaml` creates IAM roles, so a deploying buyer must acknowledge
+`CAPABILITY_IAM`. Every other quickstart parameter has a default.
+
+The certificate cannot be created by either template: the sidecar refuses plain
+HTTP to anything but loopback and trusts only the system roots, so reaching the
+control plane requires a publicly trusted certificate, and issuing one needs a
+domain the deployer controls.
+
+**Marketplace metering.** `RegisterUsage` is called by the sidecar, not the
+control plane, so the permission belongs on whichever task role runs the sidecar
+— not on any role these templates own. `quickstart.yaml` therefore publishes it
+as an attachable managed policy and exports the ARN as
+`SidecarMeteringPolicyArn`. It is required only for a metered subscription; free
+and BYOL listings do not call `RegisterUsage` at all.

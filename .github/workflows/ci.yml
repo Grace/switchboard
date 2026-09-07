@@ -15,6 +15,10 @@ jobs:
       - run: go test -race -coverprofile=coverage.out ./...
       - run: CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath ./cmd/gateway
       - run: CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -trimpath ./cmd/gateway
+      # Scans the module graph against the Go vulnerability database. Marketplace
+      # requires sellers to keep software free of known vulnerabilities.
+      - run: go install golang.org/x/vuln/cmd/govulncheck@latest
+      - run: govulncheck ./...
   control:
     runs-on: ubuntu-latest
     services:
@@ -43,6 +47,15 @@ jobs:
       - uses: actions/checkout@v7
       - run: docker build -f Dockerfile.gateway -t switchboard-gateway:ci .
       - run: docker build -f Dockerfile.controlplane -t switchboard-control:ci .
+  cloudformation:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.14'
+      - run: pip install 'cfn-lint>=1,<2'
+      - run: cfn-lint deploy/cloudformation/*.yaml
   terraform:
     runs-on: ubuntu-latest
     steps:

@@ -1,51 +1,129 @@
 # Validation performed
 
-Date: 2026-09-07. Host toolchain: Go 1.24.1 on macOS ARM64; bundled Python 3.12 with cryptography. Release Docker/CI definitions target Go 1.26 and Python 3.14. Local builds are validation artifacts, not approved deployment binaries.
+What has actually been run, with the results. `docs/GAPS.md` records what has
+not. Local builds are validation artifacts, not approved deployment binaries.
 
-## Passed locally
+## 2026-09-07 — original build session
 
-- `go vet ./...`.
-- `SWITCHBOARD_IN_MEMORY_TESTS=1 go test -race -coverprofile=coverage.out ./...`: 24 top-level Go tests plus table subtests passed. Gateway package statement coverage: **75.4%**. The command-line main package has **0% test coverage**; it is compile-checked only.
-- Cross-compilation of the Go command to Linux AMD64 and Linux ARM64 with CGO disabled.
-- Three Python `unittest` policy tests, including Ed25519 signature verification of the fixture shared with Go.
-- Python syntax parsing for all control-plane/scripts/tests sources, and JSON parsing for configuration, task and Terraform JSON files.
-- Shell syntax validation of the GitHub publication helper.
+Host toolchain: Go 1.24.1 on macOS ARM64; bundled Python 3.12. This session had
+no network, no Docker, no Terraform and no access to GitHub, so much of it could
+only be compile-checked. Superseded in most respects by the runs below; retained
+because it is the record of what was and was not established at the time.
 
-Go scenarios include normal streaming for all three adapters; stream truncation and bounded SSE parsing; unsupported tool responses; configuration and trace-context checks; policy tampering, canonicalization, rotation, rollback and expired-cache recovery; no replay after acceptance/transport ambiguity; cancellation; auth, rate and concurrency limits; circuit probe behavior; retry budgets; control-plane-down routing; disk replay/acknowledgement; saturated queue admission; and OTLP delivery during control-plane failure.
+- `go vet ./...` clean.
+- `SWITCHBOARD_IN_MEMORY_TESTS=1 go test -race ./...`: 24 top-level Go tests plus
+  subtests passed, 75.4% statement coverage in the gateway package, 0% in the
+  command-line main package. The in-memory flag substitutes an in-process
+  transport, so no real socket, TLS or timeout behavior was exercised.
+- Cross-compilation to Linux AMD64 and ARM64 with CGO disabled.
+- Three Python policy tests, including Ed25519 verification of the fixture shared
+  with Go.
+- Not run: real sockets, Postgres integration, container builds, dependency
+  audit, Terraform validation, live providers, deployment, load, soak, or
+  graceful shutdown. No remote repository or CI run existed.
 
-## Not passed or not run here
+## 2026-09-07 — local stack and CI
 
-Real socket tests could not bind a local port (`operation not permitted`). The in-process transport exercises handler/adapter/retry paths but does not validate TCP, real HTTP flushing, TLS or timeout behavior. CI uses the real socket transport by default.
+Python moved to 3.14; CI runs Go 1.26 and Python 3.14.
 
-Python dependency downloads failed due restricted network/DNS; escalation was rejected. The installed environment lacks FastAPI/Psycopg/Postgres. Full control-plane API, migration, RLS, revocation and deduplication tests are included in `controlplane/tests/test_postgres.py` and required by CI with a disposable Postgres service; **they were not executed locally**.
+- All four CI jobs pass remotely: `go`, `control` (against a real `postgres:17`),
+  `containers`, `terraform`.
+- The local development stack (`make dev-up`) brings up Postgres, the control
+  plane, a mock provider and the gateway, provisions keys, tenant, principals and
+  a signed policy, and serves.
+- `make dev-smoke`: `/readyz` 200; nonstreaming completion 200 with content;
+  streaming completion 200 with 4 SSE frames.
+- Telemetry: 2 events delivered through the disk spool to Postgres and
+  acknowledged.
+- Forcing the provider to 503 returns the documented
+  `routes unavailable or retry budget exhausted` rather than hanging.
+- Docker image builds on `python:3.14-slim-bookworm`; the built image reports
+  Python 3.14.7 and imports the control plane.
 
-Docker failed its environment check. Terraform is unavailable. Container builds/scans, dependency audit, Terraform provider validation/planning, live-provider requests, cloud deployment, load/soak testing and end-to-end graceful shutdown have **not** been verified. JSON syntax checks do not establish Terraform validity.
+## 2026-09-07 — AWS validation, images, load and soak
 
-GitHub access failed, and elevated network access was rejected by the session's automatic approval policy. No remote repository or remote CI run was created. The delivered local repository, source ZIP and Git bundle are ready for publication from an authorized terminal.
+No billable AWS infrastructure was created. No stack was deployed.
 
-## Re-validation after the Python 3.14 move
+### CloudFormation
 
-Date: 2026-09-07 (later session). Host toolchain: Go 1.24.1 on macOS ARM64; Python 3.14.7. This
-entry records a second run after the control plane moved from Python 3.12 to 3.14; it supersedes
-the specific items below, and does not amend the original record above.
+- `cfn-lint` clean on `quickstart.yaml` and `controlplane.yaml`.
+- `aws cloudformation validate-template` accepts both. Server-side validation
+  reported one thing the linter did not: `quickstart.yaml` requires
+  `CAPABILITY_IAM`, which a deploying buyer must acknowledge.
+- `quickstart.yaml` has exactly two parameters without defaults:
+  `CertificateArn` and `ControlPlaneImage`.
 
-Passed:
+### Images
 
-- `go vet ./...`, `go build ./cmd/gateway`, `go test -race ./...`, and `gofmt -l cmd internal`
-  (clean) — the Go side is unaffected by this change.
-- Python dependencies installed successfully; the earlier network restriction no longer applied.
-- `pytest controlplane/tests`: 3 passed, 3 skipped. The skips are the Postgres integration tests,
-  which require `TEST_DATABASE_URL` and are exercised by CI.
-- Three Python `unittest` policy tests via the documented `python -m unittest` path.
-- `docker build -f Dockerfile.controlplane` succeeded on `python:3.14-slim-bookworm`; the resulting
-  image reports Python 3.14.7 and imports `controlplane.app` and `controlplane.policy`.
-- Remote CI ran for the first time and passed all four jobs (`go`, `control`, `containers`,
-  `terraform`), including the Postgres-backed control-plane tests. This resolves the "no remote CI
-  run was created" item above.
+Built `linux/amd64` and pushed to a development ECR registry with immutable tags
+and scan-on-push. Digests are recorded in `docs/DEPLOYMENT.md`.
 
-Known remaining warning: `starlette/testclient.py:53` emits a `DeprecationWarning` for the
-`anyio.abc.BlockingPortal` alias. This originates inside Starlette 1.6.0, which is the current
-release, so it cannot be resolved from this repository. It is deliberately not suppressed.
+- Gateway: **no scan findings**. It is distroless and carries almost no operating
+  system.
+- Control plane: **19 findings, 4 critical and 15 high**, all in Debian packages,
+  none in the application or its Python dependencies, and all marked **no fix
+  available**. Rebuilding on Debian trixie produced 17 findings including 6
+  critical, also all unfixed, so the base was reverted. Recorded as open in
+  `docs/GAPS.md`.
 
-Still not verified here: load/soak testing, graceful shutdown under load, live-provider requests,
-and cloud deployment.
+`Dockerfile.gateway` was changed to cross-compile from `$BUILDPLATFORM`: running
+the Go toolchain under QEMU emulation crashes it outright.
+
+### Supply chain
+
+- `govulncheck` under Go 1.26.8: **no vulnerabilities found**, including the AWS
+  SDK dependencies added for Marketplace metering. Under the older Go 1.24.1
+  still installed locally it reports 29 standard-library findings; that is a
+  stale toolchain, not a property of the code, and neither CI nor the Dockerfile
+  uses it.
+- Python: the full dependency graph is pinned. A clean install in a fresh
+  container resolves to exactly the 27 pinned versions, with nothing floating.
+- `cfn-lint` runs as its own CI job, requiring no AWS credentials.
+
+### Marketplace metering
+
+`RegisterUsage` is implemented behind an interface and unit-tested across
+entitled success, `CustomerNotEntitledException`, absent configuration, client
+failure, per-call nonce uniqueness, and configuration validation. With no
+marketplace block configured it makes no AWS call at all, which is what keeps the
+development stack unaffected.
+
+**The real call has never been made.** It requires a `ProductCode` that only
+exists once a Marketplace listing does.
+
+### Load and soak
+
+Driven by `cmd/loadgen` against the local stack. It reads server-sent event
+streams to completion, which general-purpose HTTP benchmarking tools do not, so
+streaming latencies are measured over the whole generation rather than to the
+first header.
+
+| Scenario | Invocation | Result |
+|---|---|---|
+| Sustained | `-concurrency 8 -rps 40 -duration 60s -stream-pct 50` | 2,399 requests, 2,398 succeeded, 1 transport error. p50 1 ms, p95 43 ms, p99 45 ms. 4,796 SSE frames. |
+| Backpressure | `-concurrency 64 -rps 0 -duration 30s -stream-pct 50` | 874,504 offered at 29,149/s against a 50/s limit. 1,555 admitted, 872,888 rejected 429. p99 held at 10 ms. |
+| Failure injection | `-concurrency 16 -rps 40 -duration 60s -stream-pct 30`, provider failing its first 5 requests | 1,803 rejected 503 then 595 succeeded. Rejections took about 1 ms, without contacting the provider. Recovery was unaided. |
+| Graceful shutdown | `-concurrency 12 -rps 4 -duration 45s -stream-pct 40`, provider delayed 3,000 ms, SIGTERM at 12s | Process exited after 4s with status 0. Every completed request shows a full ~3.01 s generation, so in-flight work finished. Subsequent transport errors are the generator continuing to fire at a stopped server. |
+
+Two observations worth carrying forward:
+
+- Backpressure is genuinely bounded. Offering load 580 times over the configured
+  rate did not degrade latency; the gateway rejected immediately rather than
+  queueing.
+- Circuit-breaker recovery took roughly 45 seconds, where the architecture
+  documents a 15-second open period with one half-open probe. The cause is not
+  established. Recorded as open in `docs/GAPS.md` rather than reconciled by
+  assumption.
+
+An earlier attempt at the failure-injection scenario was invalid and is recorded
+here rather than discarded: with the provider set to fail its first 300 requests,
+the breaker opened and stopped contacting the provider, so its failure counter
+never advanced and recovery was unreachable within the run. The test was
+redesigned, not the system.
+
+### Not run here
+
+Full quickstart deployment, live provider requests, real Marketplace
+registration, soak beyond 60 seconds, SBOM generation and image signing. See
+`docs/GAPS.md` for the distinction between what remains open and what is blocked
+on an external action.
