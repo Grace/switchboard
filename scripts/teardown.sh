@@ -26,6 +26,17 @@ done
 
 aws() { command aws --region "$REGION" "$@"; }
 
+# The stack must be gone first. Run during a delete and the final snapshot is
+# still being created, so it cannot be removed, the script stops there, and the
+# KMS key is silently left behind — a partial cleanup that reports itself as an
+# error rather than as unfinished work.
+if STATUS=$(aws cloudformation describe-stacks --stack-name "$STACK" \
+    --query 'Stacks[0].StackStatus' --output text 2>/dev/null); then
+  echo "Stack '$STACK' still exists ($STATUS)." >&2
+  echo "Wait for it to finish deleting, then run this again. Nothing was touched." >&2
+  exit 1
+fi
+
 echo "Looking for resources left behind by stack '$STACK' in $REGION."
 echo
 
@@ -111,13 +122,33 @@ for a in ${SECRETS:-}; do
   aws secretsmanager delete-secret --secret-id "$a" --force-delete-without-recovery >/dev/null \
     && echo "deleted secret $a"
 done
+SNAPSHOT_FAILED=0
 if [ -n "${SNAPSHOTS:-}" ]; then
-  echo "$SNAPSHOTS" | while read -r id _; do
+  for id in $(echo "$SNAPSHOTS" | awk '{print $1}'); do
     [ -n "$id" ] || continue
-    aws rds delete-db-snapshot --db-snapshot-identifier "$id" >/dev/null \
-      && echo "deleted snapshot $id"
+    state=$(aws rds describe-db-snapshots --db-snapshot-identifier "$id" \
+      --query 'DBSnapshots[0].Status' --output text 2>/dev/null || echo unknown)
+    case "$state" in
+      available|failed) ;;
+      *) echo "snapshot $id is '$state' and cannot be deleted yet; run again shortly"
+         SNAPSHOT_FAILED=1; continue ;;
+    esac
+    if aws rds delete-db-snapshot --db-snapshot-identifier "$id" >/dev/null 2>&1; then
+      echo "deleted snapshot $id"
+    else
+      echo "could not delete snapshot $id"
+      SNAPSHOT_FAILED=1
+    fi
   done
 fi
+if [ "$SNAPSHOT_FAILED" -eq 1 ]; then
+  echo
+  echo "A snapshot survives, so the KMS key is being kept: deleting it would" >&2
+  echo "make that snapshot permanently unreadable. Re-run once the snapshot is" >&2
+  echo "available and the key will be scheduled then." >&2
+  exit 1
+fi
+
 # Last, and only scheduled: AWS enforces a waiting period of at least seven
 # days on key deletion, and anything encrypted with it becomes unreadable.
 if [ -n "${KEY:-}" ] && [ "$KEY" != "None" ]; then

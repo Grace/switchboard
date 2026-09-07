@@ -20,8 +20,11 @@ import (
 
 type Metrics struct {
 	Requests, Errors, Retries, Rejected, Dropped, DiskErrors, ExportErrors, PolicyErrors, SpoolUsed, SpoolCount, Active, LatencyMS, Completed atomic.Int64
-	LatencyBuckets                                                                                                                            [7]atomic.Int64
-	LogDropped                                                                                                                                *atomic.Int64
+	// RateLimited counts provider 429s, which are deliberately not Errors:
+	// the provider was healthy and the request failed over.
+	RateLimited    atomic.Int64
+	LatencyBuckets [7]atomic.Int64
+	LogDropped     *atomic.Int64
 }
 
 var latencyBounds = [7]int64{100, 500, 1000, 5000, 15000, 60000, 90000}
@@ -41,7 +44,7 @@ func (m *Metrics) ServeHTTP(w http.ResponseWriter, _ *http.Request) {
 	for _, v := range []struct {
 		name, kind string
 		v          *atomic.Int64
-	}{{"requests_total", "counter", &m.Requests}, {"errors_total", "counter", &m.Errors}, {"retries_total", "counter", &m.Retries}, {"rejected_total", "counter", &m.Rejected}, {"telemetry_dropped_total", "counter", &m.Dropped}, {"telemetry_disk_errors_total", "counter", &m.DiskErrors}, {"telemetry_export_errors_total", "counter", &m.ExportErrors}, {"policy_errors_total", "counter", &m.PolicyErrors}, {"spool_bytes", "gauge", &m.SpoolUsed}, {"spool_events", "gauge", &m.SpoolCount}, {"active_requests", "gauge", &m.Active}} {
+	}{{"requests_total", "counter", &m.Requests}, {"errors_total", "counter", &m.Errors}, {"retries_total", "counter", &m.Retries}, {"rate_limited_total", "counter", &m.RateLimited}, {"rejected_total", "counter", &m.Rejected}, {"telemetry_dropped_total", "counter", &m.Dropped}, {"telemetry_disk_errors_total", "counter", &m.DiskErrors}, {"telemetry_export_errors_total", "counter", &m.ExportErrors}, {"policy_errors_total", "counter", &m.PolicyErrors}, {"spool_bytes", "gauge", &m.SpoolUsed}, {"spool_events", "gauge", &m.SpoolCount}, {"active_requests", "gauge", &m.Active}} {
 		fmt.Fprintf(w, "# TYPE switchboard_%s %s\nswitchboard_%s %d\n", v.name, v.kind, v.name, v.v.Load())
 	}
 	fmt.Fprintln(w, "# TYPE switchboard_request_duration_milliseconds histogram")

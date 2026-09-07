@@ -11,6 +11,7 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -74,6 +75,44 @@ func (c *circuit) result(failed bool) {
 	}
 }
 func (c *circuit) release() { c.mu.Lock(); c.probe = false; c.mu.Unlock() }
+
+// cooldown withholds a provider for a period it asked for, without recording a
+// failure. A 429 means this caller is over quota while the provider itself is
+// healthy, so counting it toward the breaker would open the circuit against a
+// provider that is working. Extends an existing wait, never shortens it.
+func (c *circuit) cooldown(d time.Duration) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.probe = false
+	if until := time.Now().Add(d); until.After(c.until) {
+		c.until = until
+	}
+}
+
+// maxCooldown bounds what a provider can ask for. Retry-After is attacker- and
+// bug-reachable, and an unbounded value would park a route indefinitely.
+const maxCooldown = 5 * time.Minute
+
+// retryAfter reads the delay a provider asked for. RFC 9110 permits either a
+// number of seconds or an HTTP date. Anything unparseable, negative or beyond
+// maxCooldown yields zero, meaning "no usable instruction".
+func retryAfter(h string) time.Duration {
+	if h == "" {
+		return 0
+	}
+	if n, err := strconv.Atoi(strings.TrimSpace(h)); err == nil {
+		if n <= 0 {
+			return 0
+		}
+		return min(time.Duration(n)*time.Second, maxCooldown)
+	}
+	if t, err := http.ParseTime(h); err == nil {
+		if d := time.Until(t); d > 0 {
+			return min(d, maxCooldown)
+		}
+	}
+	return 0
+}
 
 type Server struct {
 	C           Config
@@ -269,11 +308,28 @@ func (s *Server) chat(w http.ResponseWriter, r *http.Request) {
 		if res.StatusCode != 200 {
 			status := res.StatusCode
 			res.Body.Close()
-			retryable := status == 429 || status == 503
-			s.circuits[route.Provider].result(retryable)
-			if retryable {
+			wait := retryAfter(res.Header.Get("Retry-After"))
+			switch status {
+			case 429:
+				// Rate limited: the provider is fine, this caller is over quota.
+				// Fail over, respect any stated wait, but do not count it as a
+				// health failure.
+				if wait > 0 {
+					s.circuits[route.Provider].cooldown(wait)
+				} else {
+					s.circuits[route.Provider].release()
+				}
+				s.Metrics.RateLimited.Add(1)
+				continue
+			case 503:
+				// Provider degraded. This is what the breaker is for.
+				s.circuits[route.Provider].result(true)
+				if wait > 0 {
+					s.circuits[route.Provider].cooldown(wait)
+				}
 				continue
 			}
+			s.circuits[route.Provider].result(false)
 			if status == 400 || status == 422 {
 				fail(400, "provider rejected request")
 			} else {
@@ -281,6 +337,12 @@ func (s *Server) chat(w http.ResponseWriter, r *http.Request) {
 			}
 			return
 		}
+		// The caller cannot otherwise tell which provider answered, or that an
+		// earlier one was skipped. Without this, a failover is invisible to
+		// everything except the logs and the telemetry spool.
+		w.Header().Set("X-Switchboard-Provider", route.Provider)
+		w.Header().Set("X-Switchboard-Attempts", strconv.Itoa(event.Attempts))
+
 		// Acceptance (HTTP 200) commits this generation. No body/stream error may fail over.
 		if c.Stream {
 			event.Status = 200
