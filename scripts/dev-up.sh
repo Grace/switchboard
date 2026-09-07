@@ -26,7 +26,7 @@ if [ ! -s .dev/env ]; then
   echo "building images"
   $COMPOSE build devtools gateway >/dev/null
   echo "generating signing key and tokens"
-  $COMPOSE run --rm --no-deps -T dbinit python scripts/devstack.py keys > .dev/env.tmp
+  $COMPOSE run --rm --no-deps -T dbinit scripts/devstack.py keys > .dev/env.tmp
   mv .dev/env.tmp .dev/env
   chmod 0600 .dev/env
   echo "  wrote .dev/env (Ed25519 seed and bearer tokens; gitignored, local only)"
@@ -47,7 +47,7 @@ echo "starting the shared namespace, mock provider and control plane"
 # Recreate together so nothing is left attached to a stale namespace.
 $COMPOSE up -d --force-recreate taskns mockprovider controlplane
 echo "provisioning tenant, principals and signed policy"
-in_namespace python scripts/devstack.py init
+in_namespace scripts/devstack.py init
 echo "starting gateway"
 $COMPOSE up -d gatewayinit
 $COMPOSE up -d --force-recreate gateway

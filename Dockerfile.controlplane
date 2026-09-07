@@ -1,15 +1,42 @@
-FROM python:3.14-slim-bookworm
-ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 PIP_NO_CACHE_DIR=1
+# The runtime image is distroless. The control plane previously ran on
+# python:3.14-slim, which reports 19 scanner findings, 4 of them critical, every
+# one in a Debian package with no fix available upstream: perl, util-linux,
+# openssl, zlib, pcre2. None are in the application or its Python dependencies,
+# and rebuilding on trixie was worse rather than better, so the only real
+# remediation is to stop shipping the packages at all. perl in particular was
+# installed and never used.
+#
+# This is viable because the interpreter needs only glibc, and psycopg and
+# cryptography vendor their own OpenSSL and krb5 inside their wheels rather than
+# linking the operating system's.
+FROM python:3.14-slim-bookworm AS build
+ENV PYTHONDONTWRITEBYTECODE=1 PIP_NO_CACHE_DIR=1
 WORKDIR /app
 COPY controlplane/requirements.txt ./requirements.txt
-# The Amazon RDS root CA is not in the system trust store, and the control plane
+
+# The Amazon RDS root CA is not in any system trust store, and the control plane
 # demands sslmode=verify-full, so without this bundle it cannot reach RDS at all.
 # Fetched from AWS at build time; AWS rotates it, so it is not pinned by digest.
 ADD https://truststore.pki.rds.amazonaws.com/global/global-bundle.pem /etc/ssl/rds/global-bundle.pem
 RUN chmod 0644 /etc/ssl/rds/global-bundle.pem \
- && pip install --no-cache-dir -r requirements.txt && useradd --uid 65532 --no-create-home app
-COPY controlplane ./controlplane
-COPY scripts ./scripts
+ && pip install --no-cache-dir -r requirements.txt
+
+# Standard-library C extensions link against libraries outside /usr/local. Stage
+# them under a fixed path so the copy below does not have to name an
+# architecture-specific triplet.
+RUN mkdir -p /staged && cp -a /usr/lib/*-linux-gnu /staged/
+
+FROM gcr.io/distroless/base-debian12:nonroot
+COPY --from=build /usr/local /usr/local
+COPY --from=build /staged/ /usr/lib/
+COPY --from=build /etc/ssl/rds/global-bundle.pem /etc/ssl/rds/global-bundle.pem
+COPY controlplane /app/controlplane
+COPY scripts /app/scripts
+WORKDIR /app
+ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 PATH=/usr/local/bin:/usr/bin:/bin
 USER 65532:65532
 EXPOSE 8000
-CMD ["python", "-m", "uvicorn", "controlplane.app:app", "--host", "0.0.0.0", "--port", "8000", "--no-access-log", "--no-proxy-headers", "--limit-concurrency", "128", "--timeout-keep-alive", "5", "--timeout-graceful-shutdown", "30"]
+# There is no shell in this image, so the entrypoint is the interpreter itself
+# and every command below is arguments to it.
+ENTRYPOINT ["/usr/local/bin/python3.14"]
+CMD ["-m", "uvicorn", "controlplane.app:app", "--host", "0.0.0.0", "--port", "8000", "--no-access-log", "--no-proxy-headers", "--limit-concurrency", "128", "--timeout-keep-alive", "5", "--timeout-graceful-shutdown", "30"]

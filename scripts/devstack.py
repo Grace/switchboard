@@ -1,3 +1,4 @@
+#!/usr/local/bin/python3
 """Local development bootstrap.
 
 Collapses the manual first-run sequence — keypair, database role, tenant,
@@ -22,6 +23,7 @@ import subprocess
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 
 
@@ -58,11 +60,30 @@ def cmd_keys(args):
         print("%s=%s" % (k, v))
 
 
+def _migration_dsn():
+    """Prefer a complete DSN, otherwise compose one from parts.
+
+    Composing it here rather than in a shell wrapper is what lets the image be
+    distroless: there is no `sh` in it to interpolate the password into a URL.
+    """
+    dsn = os.environ.get("MIGRATION_DATABASE_URL")
+    if dsn:
+        return dsn
+    host = os.environ["DBHOST"]
+    password = urllib.parse.quote(os.environ["PGPASSWORD"], safe="")
+    user = os.environ.get("DBUSER", "switchboard_owner")
+    name = os.environ.get("DBNAME", "switchboard")
+    ssl = os.environ.get("DBSSLMODE", "verify-full")
+    root = os.environ.get("DBSSLROOTCERT", "/etc/ssl/rds/global-bundle.pem")
+    return ("postgresql://%s:%s@%s:5432/%s?sslmode=%s&sslrootcert=%s"
+            % (user, password, host, name, ssl, root))
+
+
 def cmd_dbinit(args):
     import psycopg
     from psycopg import sql
 
-    admin = os.environ["MIGRATION_DATABASE_URL"]
+    admin = _migration_dsn()
     # Migrations must run as an owner that can create roles and tables; the
     # runtime login is deliberately a different, weaker principal.
     subprocess.run([sys.executable, "-m", "controlplane.migrate"], check=True,
@@ -110,8 +131,9 @@ def _wait_for(url, attempts=60):
 
 def _principal_exists(digest):
     import psycopg
-    dsn = os.environ.get("MIGRATION_DATABASE_URL")
-    if not dsn:
+    try:
+        dsn = _migration_dsn()
+    except KeyError:
         return False
     with psycopg.connect(dsn) as db:
         row = db.execute(

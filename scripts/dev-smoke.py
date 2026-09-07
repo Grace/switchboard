@@ -1,3 +1,4 @@
+#!/usr/local/bin/python3
 """End-to-end smoke test against the local stack.
 
 Runs inside the shared network namespace so it can reach the gateway's

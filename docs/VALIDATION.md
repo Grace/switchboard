@@ -63,8 +63,8 @@ and scan-on-push. Digests are recorded in `docs/DEPLOYMENT.md`.
 - Control plane: **19 findings, 4 critical and 15 high**, all in Debian packages,
   none in the application or its Python dependencies, and all marked **no fix
   available**. Rebuilding on Debian trixie produced 17 findings including 6
-  critical, also all unfixed, so the base was reverted. Recorded as open in
-  `docs/GAPS.md`.
+  critical, also all unfixed, so the base was reverted. Subsequently resolved by
+  rebasing onto distroless; see below.
 
 `Dockerfile.gateway` was changed to cross-compile from `$BUILDPLATFORM`: running
 the Go toolchain under QEMU emulation crashes it outright.
@@ -111,15 +111,79 @@ Two observations worth carrying forward:
   rate did not degrade latency; the gateway rejected immediately rather than
   queueing.
 - Circuit-breaker recovery took roughly 45 seconds, where the architecture
-  documents a 15-second open period with one half-open probe. The cause is not
-  established. Recorded as open in `docs/GAPS.md` rather than reconciled by
-  assumption.
+  documented a 15-second open period. This was investigated rather than assumed
+  and is fully explained below; the code was correct and the document was not.
 
 An earlier attempt at the failure-injection scenario was invalid and is recorded
 here rather than discarded: with the provider set to fail its first 300 requests,
 the breaker opened and stopped contacting the provider, so its failure counter
 never advanced and recovery was unreachable within the run. The test was
 redesigned, not the system.
+
+## 2026-09-07 — resolving the two open findings
+
+### Control-plane image, rebased onto distroless
+
+The 19 findings were all in Debian packages with no upstream fix, so they could
+not be resolved by rebuilding or by changing Debian release. Three inspections
+established that they could be removed instead: perl was installed and never
+used by the application; the interpreter resolves only against glibc; and
+`psycopg` and `cryptography` vendor their own OpenSSL and krb5 inside their
+wheels rather than linking the operating system's.
+
+The image now builds the environment on `python:3.14-slim` and copies the
+interpreter, site-packages and the required architecture libraries into
+`gcr.io/distroless/base-debian12`.
+
+| | Findings | Size |
+|---|---|---|
+| `0.1.0`, python:3.14-slim-bookworm | 4 critical, 15 high, 6 medium | 62.9 MB |
+| `0.2.0`, distroless | **none** | 55.7 MB |
+
+The image has no shell, which required three changes: `scripts/devstack.py`
+composes the database connection string in Python rather than relying on a `sh`
+wrapper, the entry scripts carry an absolute-path shebang and the executable bit
+so they work both as arguments to the interpreter and when exec'd directly, and
+the CloudFormation bootstrap task passes `DBHOST` and `PGPASSWORD` instead of a
+pre-composed URL. The full local stack was rebuilt and re-smoked afterwards and
+passes unchanged.
+
+Worth stating plainly: ECR scans operating-system packages. The vendored OpenSSL
+inside the Python wheels is not covered by these findings either before or after.
+Zero findings means a much smaller operating-system surface, not a guarantee.
+
+### Circuit-breaker recovery, explained
+
+The earlier 45-second recovery is the breaker behaving as written, not a defect.
+It trips at three transient failures and closes to traffic for 15 seconds, then
+admits exactly one half-open probe. A successful probe closes it immediately. A
+**failed probe re-arms a fresh full 15 seconds**, with no backoff or decay.
+
+The provider under test failed its first five requests: three to trip the
+breaker, then two more consumed by failed probes, so three cycles elapsed —
+3 x 15s = 45s.
+
+Confirmed by prediction rather than by argument. Repeating the run with the
+provider failing exactly three times, so no probe would fail:
+
+| Injected failures | Predicted recovery | 503s observed | 200s observed |
+|---|---|---|---|
+| 5 | 3 cycles, ~45s | 1,803 | 595 |
+| 3 | 1 cycle, ~15s | 603 | 1,795 |
+
+At 40 requests/second those counts correspond to 45 and 15 seconds. The retry
+budget played no part: it is consulted only on a second or later provider
+attempt, and this route table has one provider. `docs/ARCHITECTURE.md` has been
+corrected, since "opens for 15 seconds" described one cycle rather than a bound.
+
+### Go toolchain
+
+Upgraded locally from 1.24.1 to 1.27.1, and `go.mod`, CI and the gateway
+Dockerfile aligned on 1.27. The `go` directive was raised deliberately: Go
+switches toolchains automatically when a module requires a newer one, so this
+makes it impossible to build the binary with a standard library carrying known
+vulnerabilities. `govulncheck` under the local toolchain now reports no
+vulnerabilities, where 1.24.1 reported 29.
 
 ### Not run here
 

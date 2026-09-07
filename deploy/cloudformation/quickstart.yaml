@@ -681,12 +681,11 @@ Resources:
           User: '65532:65532'
           ReadonlyRootFilesystem: true
           # Reuses scripts/devstack.py dbinit, the same sequence the local
-          # development stack runs, rather than a second implementation.
-          EntryPoint: ['sh', '-c']
-          Command:
-            - >-
-              MIGRATION_DATABASE_URL="postgresql://switchboard_owner:${PGPASSWORD}@${DBHOST}:5432/switchboard?sslmode=verify-full&sslrootcert=/etc/ssl/rds/global-bundle.pem"
-              python scripts/devstack.py dbinit
+          # development stack runs, rather than a second implementation. The
+          # image is distroless and has no shell, so the connection string is
+          # composed in Python from DBHOST and PGPASSWORD rather than by a
+          # wrapper command.
+          Command: ['scripts/devstack.py', 'dbinit']
           Environment:
             - {Name: DBHOST, Value: !GetAtt Database.Endpoint.Address}
           Secrets:

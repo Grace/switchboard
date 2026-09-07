@@ -1,7 +1,7 @@
 # Build on the builder's own architecture and cross-compile to the target. Go
 # cross-compiles natively, and running the toolchain under emulation instead is
 # both far slower and unreliable.
-FROM --platform=$BUILDPLATFORM golang:1.26-bookworm AS build
+FROM --platform=$BUILDPLATFORM golang:1.27-bookworm AS build
 ARG TARGETOS
 ARG TARGETARCH
 WORKDIR /src

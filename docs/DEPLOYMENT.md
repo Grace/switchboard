@@ -71,17 +71,20 @@ delivery, which is not the chosen distribution path.
 | Image | Digest |
 |---|---|
 | `switchboard/gateway:0.1.0` | `sha256:52069ca601b4fad0704f158c29ea4f5e8a90d20b2bfd522e2e5aa64d943cb94b` |
-| `switchboard/controlplane:0.1.0` | `sha256:e14c959ee1347f52e48ac23c9f7de6b5b339654ac7e999970634bca728b4cfd2` |
+| `switchboard/controlplane:0.2.0` | `sha256:b8a6153a0e5a89875cf84ebd41c5d41eb7c1041d75326c15d040aa6aae599eb3` |
 
 These live in a development registry. A Marketplace listing requires every image
 a subscriber needs to be pushed to AWS Marketplace managed ECR instead.
 
-**Image scanning.** The gateway image reports no findings; it is distroless and
-carries almost no operating system. The control-plane image reports 19 findings
-(4 critical, 15 high) in Debian packages — perl, util-linux, openssl, zlib,
-pcre2 — none in the application or its Python dependencies, and **every one is
-currently marked as having no fix available upstream**. Rebuilding on Debian
-trixie was worse rather than better. See `docs/GAPS.md`.
+**Image scanning.** Both images report **no findings**. The control plane was
+rebased onto distroless in `0.2.0`, which removed the 19 findings its
+Debian-based `0.1.0` carried — all of them in operating-system packages with no
+upstream fix available, 13 of them in perl and util-linux, neither of which the
+application used.
+
+Note what this does and does not mean: ECR scans operating-system packages, so
+the OpenSSL vendored inside the `psycopg` and `cryptography` wheels is outside
+its scope. A clean scan is a much smaller attack surface, not a guarantee.
 
 ## CloudFormation templates
 

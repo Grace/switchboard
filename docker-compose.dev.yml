@@ -45,7 +45,7 @@ services:
       MIGRATION_DATABASE_URL: postgresql://postgres:devonly@postgres:5432/switchboard
     volumes:
       - ./scripts:/app/scripts:ro
-    command: ["python", "scripts/devstack.py", "dbinit"]
+    command: ["scripts/devstack.py", "dbinit"]
     depends_on:
       postgres: {condition: service_healthy}
 
@@ -90,7 +90,7 @@ services:
     volumes:
       - gwconfig:/config
       - ./scripts:/app/scripts:ro
-    command: ["python", "scripts/devstack.py", "init"]
+    command: ["scripts/devstack.py", "init"]
     depends_on:
       controlplane: {condition: service_started}
 
