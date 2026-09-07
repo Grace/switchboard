@@ -18,6 +18,9 @@ bin/
 coverage.out
 /gateway
 
+# Local dev stack: Ed25519 signing seed and bearer tokens
+.dev/
+
 .DS_Store
 
 # Private working notes — names companies, not for publication

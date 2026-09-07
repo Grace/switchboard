@@ -1,0 +1,128 @@
+# Local development stack. Not a deployment artifact.
+#
+# The gateway refuses any listen address that is not loopback, and refuses plain
+# http to anything but localhost, so the containers cannot reach each other over
+# compose service names. They share one network namespace instead, which is also
+# how this runs on ECS: every container in a task shares the task's namespace and
+# talks over localhost. `taskns` stands in for the task.
+#
+# Postgres sits outside that namespace on the default network, as RDS would.
+services:
+  postgres:
+    image: postgres:17
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: devonly
+      POSTGRES_DB: switchboard
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d switchboard"]
+      interval: 2s
+      timeout: 3s
+      retries: 20
+
+  # Owns the shared network namespace. Everything below joins it and reaches the
+  # others on 127.0.0.1, exactly as the sidecar does in production.
+  taskns:
+    image: alpine:3.20
+    command: ["sleep", "infinity"]
+    ports:
+      - "18000:8000"   # control plane, for poking at from the host
+    healthcheck:
+      test: ["CMD", "true"]
+      interval: 2s
+      retries: 5
+
+  # One-shot: migrations plus the least-privileged runtime login. Runs on the
+  # default network because it only talks to Postgres.
+  dbinit:
+    build:
+      context: .
+      dockerfile: Dockerfile.controlplane
+    user: "0:0"
+    working_dir: /app
+    env_file: [.dev/env]
+    environment:
+      MIGRATION_DATABASE_URL: postgresql://postgres:devonly@postgres:5432/switchboard
+    volumes:
+      - ./scripts:/app/scripts:ro
+    command: ["python", "scripts/devstack.py", "dbinit"]
+    depends_on:
+      postgres: {condition: service_healthy}
+
+  controlplane:
+    build:
+      context: .
+      dockerfile: Dockerfile.controlplane
+    network_mode: "service:taskns"
+    env_file: [.dev/env]
+    environment:
+      # switchboard_rt, not the migration owner. sslmode is relaxed only because
+      # ALLOW_LOCAL_HTTP is set; the app demands verify-full otherwise.
+      DATABASE_URL: postgresql://switchboard_rt:${APP_DB_PASSWORD}@postgres:5432/switchboard
+      ALLOW_LOCAL_HTTP: "true"
+    depends_on:
+      taskns: {condition: service_started}
+      dbinit: {condition: service_completed_successfully}
+
+  mockprovider:
+    image: python:3.14-slim
+    network_mode: "service:taskns"
+    volumes:
+      - ./scripts:/scripts:ro
+    environment:
+      MOCK_HOST: 127.0.0.1
+      MOCK_PORT: "9090"
+    command: ["python", "/scripts/mockprovider.py"]
+    depends_on:
+      taskns: {condition: service_started}
+
+  # Provisions tenant, principals and the signed policy, then writes the gateway
+  # config. Runs inside the namespace so it can reach the control plane.
+  devtools:
+    build:
+      context: .
+      dockerfile: Dockerfile.controlplane
+    image: switchboard-dev:latest
+    user: "0:0"
+    working_dir: /app
+    network_mode: "service:taskns"
+    env_file: [.dev/env]
+    volumes:
+      - gwconfig:/config
+      - ./scripts:/app/scripts:ro
+    command: ["python", "scripts/devstack.py", "init"]
+    depends_on:
+      controlplane: {condition: service_started}
+
+  # Mirrors the init container in deploy/task-definition.json: the data volume
+  # mounts root-owned, and the gateway runs read-only-root as 65532 with every
+  # capability dropped, so it cannot chown its own mount.
+  gatewayinit:
+    image: alpine:3.20
+    user: "0:0"
+    volumes:
+      - gwdata:/data
+    command: ["sh", "-c", "chown 65532:65532 /data && chmod 0700 /data"]
+
+  gateway:
+    build:
+      context: .
+      dockerfile: Dockerfile.gateway
+    network_mode: "service:taskns"
+    env_file: [.dev/env]
+    environment:
+      # Never reached: the policy routes to the mock. Present because config
+      # validation requires every configured provider's key env to be non-empty.
+      OPENAI_API_KEY: unused-local-placeholder
+    volumes:
+      - gwdata:/data
+      - gwconfig:/config:ro
+    command: ["-config", "/config/config.json"]
+    read_only: true
+    depends_on:
+      taskns: {condition: service_started}
+      gatewayinit: {condition: service_completed_successfully}
+
+volumes:
+  gwdata:
+  gwconfig:
