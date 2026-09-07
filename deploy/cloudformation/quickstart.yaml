@@ -507,6 +507,11 @@ Resources:
                   - !Ref PolicySigningSeedSecret
                   - !Ref DatabaseUrlSecret
                   - !Ref AppDbPasswordSecret
+                  # RDS creates and owns the master password secret, so it is
+                  # not one of the three above. The bootstrap task needs it to
+                  # connect as the migration owner; without it ECS cannot start
+                  # the task at all and fails with ResourceInitializationError.
+                  - !GetAtt Database.MasterUserSecret.SecretArn
               - Effect: Allow
                 Action: ['kms:Decrypt']
                 Resource: !GetAtt EncryptionKey.Arn
@@ -651,6 +656,11 @@ Resources:
                   - !Ref PolicySigningSeedSecret
                   - !Ref DatabaseUrlSecret
                   - !Ref AppDbPasswordSecret
+                  # RDS creates and owns the master password secret, so it is
+                  # not one of the three above. The bootstrap task needs it to
+                  # connect as the migration owner; without it ECS cannot start
+                  # the task at all and fails with ResourceInitializationError.
+                  - !GetAtt Database.MasterUserSecret.SecretArn
               - Effect: Allow
                 Action: ['kms:Decrypt', 'kms:GenerateDataKey']
                 Resource: !GetAtt EncryptionKey.Arn
@@ -818,8 +828,11 @@ Resources:
                           code = d["containers"][0].get("exitCode")
                           if code == 0:
                               return send(event, context, "SUCCESS")
-                          raise RuntimeError(
-                              "bootstrap exited %s: %s" % (code, d.get("stoppedReason", "")))
+                          # A missing exit code means the container never ran,
+                          # which is a different failure from a nonzero exit.
+                          where = ("exited %d" % code) if code is not None else "never started"
+                          raise RuntimeError("bootstrap %s: %s" % (
+                              where, d.get("stoppedReason") or d["containers"][0].get("reason", "")))
                   raise TimeoutError("bootstrap task did not finish within 13 minutes")
               except Exception as e:
                   send(event, context, "FAILED", str(e)[:400])
