@@ -90,3 +90,35 @@ variable to be non-empty even when the policy never routes to it.
 is gitignored and must stay local. `devstack.py` prints tokens to stdout by
 design, which is exactly what a deployment must never do — this tooling is for
 local use only.
+
+## Verifying against real providers
+
+The local stack runs against a mock, which is what makes it free and
+deterministic. A mock cannot tell you whether the adapters match reality: it
+only returns the fields they were written to expect.
+
+That is not hypothetical. The first real call to Bedrock immediately found a
+defect that would have failed every genuine request — the response carried a
+field the wire struct did not model, and decoding was strict. The mock returned
+only modelled fields, so it passed.
+
+`internal/gateway/live_test.go` calls the real APIs. It is skipped unless
+enabled, because it costs money and needs credentials:
+
+```sh
+SWITCHBOARD_LIVE_OPENAI=1    OPENAI_API_KEY=...    go test -run Live ./internal/gateway/
+SWITCHBOARD_LIVE_ANTHROPIC=1 ANTHROPIC_API_KEY=... go test -run Live ./internal/gateway/
+SWITCHBOARD_LIVE_GEMINI=1    GEMINI_API_KEY=...    go test -run Live ./internal/gateway/
+SWITCHBOARD_BEDROCK_LIVE=1                          go test -run Bedrock ./internal/gateway/
+```
+
+Bedrock needs no key — it authenticates with the ambient AWS credentials.
+
+Each request goes through `upstream()` and each response through `normalize()`,
+which is the path a production request takes, so request construction,
+authentication, response parsing and finish-reason mapping are exercised
+together. Three cases are covered per provider: a complete response, a streamed
+response, and a deliberately truncated one, since an unmapped finish reason is
+a hard failure rather than a degraded result.
+
+Cost is a few cents. Keys can be revoked afterwards.
