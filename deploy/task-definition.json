@@ -20,14 +20,13 @@
   "containerDefinitions": [
     {
       "name": "switchboard-init",
-      "image": "REPLACE_REVIEWED_BUSYBOX_IMAGE_AT_SHA256",
+      "image": "REPLACE_CONFIGURED_GATEWAY_IMAGE_AT_SHA256",
       "essential": false,
       "user": "0:0",
       "readonlyRootFilesystem": true,
       "command": [
-        "sh",
-        "-c",
-        "chown 65532:65532 /data && chmod 0700 /data"
+        "-init-data-dir",
+        "/data"
       ],
       "linuxParameters": {
         "capabilities": {

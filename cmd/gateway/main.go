@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"flag"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"os"
@@ -18,7 +19,32 @@ func main() {
 	slog.SetDefault(slog.New(slog.NewJSONHandler(logs, nil)))
 	config := flag.String("config", "/etc/switchboard/config.json", "config file")
 	health := flag.Bool("healthcheck", false, "check readiness and exit")
+	// Prepares the data volume and exits, for use as an init container. An ECS
+	// volume mounts owned by root, and the gateway proper runs as 65532 with a
+	// read-only root filesystem and every capability dropped, so it cannot take
+	// ownership of its own mount. Doing this with the gateway's own image rather
+	// than a general-purpose one means a deployment ships a single image.
+	initDir := flag.String("init-data-dir", "", "take ownership of this directory and exit")
 	flag.Parse()
+
+	if *initDir != "" {
+		if e := os.MkdirAll(*initDir, 0700); e != nil {
+			slog.Error("init: cannot create data directory", "error", e)
+			os.Exit(1)
+		}
+		if e := os.Chown(*initDir, 65532, 65532); e != nil {
+			slog.Error("init: cannot take ownership; this must run as root", "error", e)
+			os.Exit(1)
+		}
+		if e := os.Chmod(*initDir, 0700); e != nil {
+			slog.Error("init: cannot set permissions", "error", e)
+			os.Exit(1)
+		}
+		// Straight to stderr rather than through the async writer, which has no
+		// flush and would be racing this process's exit.
+		fmt.Fprintf(os.Stderr, "init: prepared %s for uid/gid 65532\n", *initDir)
+		return
+	}
 	c, e := gateway.LoadConfig(*config)
 	if e != nil {
 		slog.Error("invalid configuration", "error", e)
