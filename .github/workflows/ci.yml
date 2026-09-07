@@ -6,8 +6,8 @@ jobs:
   go:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
         with:
           go-version: '1.26.x'
       - run: test -z "$(gofmt -l cmd internal)"
@@ -29,8 +29,8 @@ jobs:
     env:
       TEST_DATABASE_URL: postgresql://postgres@localhost:5432/switchboard_test
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
           python-version: '3.14'
       - run: pip install -r controlplane/requirements-dev.txt
@@ -40,14 +40,14 @@ jobs:
   containers:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - run: docker build -f Dockerfile.gateway -t switchboard-gateway:ci .
       - run: docker build -f Dockerfile.controlplane -t switchboard-control:ci .
   terraform:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: hashicorp/setup-terraform@v3
+      - uses: actions/checkout@v7
+      - uses: hashicorp/setup-terraform@v4
       - run: terraform -chdir=deploy/terraform fmt -recursive
       - run: terraform -chdir=deploy/terraform init -backend=false
       - run: terraform -chdir=deploy/terraform validate
