@@ -262,8 +262,42 @@ func TestAllProvidersEmptyNamesTheCause(t *testing.T) {
 	if w.Code != 503 {
 		t.Fatalf("status = %d, want 503", w.Code)
 	}
-	if !strings.Contains(w.Body.String(), "max_tokens") {
-		t.Errorf("failure does not name the cause: %s", w.Body)
+	// Naming the routes is the point. Without it the caller sees a routing
+	// failure and cannot tell the fix is theirs, or which model to stop asking.
+	body := w.Body.String()
+	for _, want := range []string{"openai", "anthropic", "test-model", "1024", "max_tokens"} {
+		if !strings.Contains(body, want) {
+			t.Errorf("failure message is missing %q: %s", want, body)
+		}
+	}
+	// Only what was measured. The OpenAI-shaped body reported 1024 reasoning
+	// tokens; the Anthropic-shaped one reports none, and must not claim zero.
+	if !strings.Contains(body, "spent all 1024 tokens on internal reasoning") {
+		t.Errorf("reasoning figure not reported: %s", body)
+	}
+	if strings.Contains(body, "all 0 tokens") {
+		t.Errorf("an absent reasoning figure was printed as zero: %s", body)
+	}
+}
+
+// The diagnostic exists for the exhausted case only. A request that recovers by
+// failing over must carry no trace of it.
+func TestEmptyDiagnosticDoesNotLeakIntoSuccess(t *testing.T) {
+	a := testHTTP(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		io.WriteString(w, emptyByBudget)
+	}))
+	defer a.Close()
+	b := testHTTP(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		io.WriteString(w, `{"content":[{"type":"text","text":"rescued"}],"stop_reason":"end_turn"}`)
+	}))
+	defer b.Close()
+	s := testServer(t, map[string]ProviderConfig{"openai": {URL: a.URL, KeyEnv: "PROVIDER_KEY"}, "anthropic": {URL: b.URL, KeyEnv: "PROVIDER_KEY"}})
+	w := call(s, chat)
+	if w.Code != 200 {
+		t.Fatalf("status = %d, want 200", w.Code)
+	}
+	if strings.Contains(w.Body.String(), "internal reasoning") {
+		t.Errorf("diagnostic leaked into a successful response: %s", w.Body)
 	}
 }
 

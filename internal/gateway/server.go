@@ -89,6 +89,27 @@ func (c *circuit) cooldown(d time.Duration) {
 	}
 }
 
+// emptyRoute records a provider that answered and produced nothing, so an
+// exhausted request can name what happened instead of failing anonymously.
+// Bounded by construction: MaxAttempts is validated 1-3.
+type emptyRoute struct {
+	provider, model string
+	budget          int // the caller's max_tokens
+	reasoning       int // tokens the provider reported spending on hidden reasoning
+}
+
+func (e emptyRoute) String() string {
+	// Only what was measured. The budget a route would actually have needed is
+	// not a stable property: the same prompt was observed spending 1920 reasoning
+	// tokens at a budget of 2048 and 1152 at 4096. Suggesting a number that then
+	// also fails would be worse than suggesting none.
+	if e.reasoning > 0 {
+		return fmt.Sprintf("%s/%s spent all %d tokens on internal reasoning and returned none",
+			e.provider, e.model, e.reasoning)
+	}
+	return fmt.Sprintf("%s/%s returned no output", e.provider, e.model)
+}
+
 // errStreamEmpty reports a stream that ended having produced no text and,
 // crucially, having written nothing to the client. It is not a provider failure:
 // the provider answered correctly and the answer was empty. Because no bytes
@@ -282,9 +303,9 @@ func (s *Server) chat(w http.ResponseWriter, r *http.Request) {
 		fail(503, "policy expired")
 		return
 	}
-	// Set when a provider answered but produced no text, so an exhausted loop
-	// can say why rather than reporting a generic routing failure.
-	emptied := false
+	// Providers that answered and produced no text, so an exhausted loop can say
+	// which ones and why rather than reporting a generic routing failure.
+	var empties []emptyRoute
 	for _, route := range p.Routes {
 		pc, ok := s.C.Providers[route.Provider]
 		if !ok {
@@ -407,7 +428,7 @@ func (s *Server) chat(w http.ResponseWriter, r *http.Request) {
 				// byte. It is healthy, so the circuit closes; the request is
 				// still unanswered, so it moves on.
 				s.circuits[route.Provider].result(false)
-				emptied = true
+				empties = append(empties, emptyRoute{provider: route.Provider, model: route.Model, budget: c.MaxTokens})
 				s.Metrics.EmptyCompletion.Add(1)
 				slog.Warn("provider produced no output within the token budget", "request_id", id,
 					"provider", route.Provider, "model", route.Model, "max_tokens", c.MaxTokens)
@@ -447,7 +468,7 @@ func (s *Server) chat(w http.ResponseWriter, r *http.Request) {
 			// The provider is healthy, so the circuit was already reset above.
 			// Nothing has been written to the client yet, so failing over does
 			// not violate the no-replay-after-acceptance rule.
-			emptied = true
+			empties = append(empties, emptyRoute{route.Provider, route.Model, c.MaxTokens, n.Reasoning})
 			s.Metrics.EmptyCompletion.Add(1)
 			slog.Warn("provider produced no output within the token budget", "request_id", id,
 				"provider", route.Provider, "model", route.Model,
@@ -460,9 +481,15 @@ func (s *Server) chat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.Header().Set("Retry-After", "1")
-	if emptied {
-		fail(503, "every attempted provider consumed the token budget without producing "+
-			"output; retry with a higher max_tokens")
+	if len(empties) > 0 {
+		// Name the routes. Without this the caller sees a routing failure and
+		// cannot tell that the fix is theirs, or which model to stop asking.
+		parts := make([]string, 0, len(empties))
+		for _, e := range empties {
+			parts = append(parts, e.String())
+		}
+		fail(503, fmt.Sprintf("no provider produced output within max_tokens=%d: %s; retry with a higher max_tokens",
+			c.MaxTokens, strings.Join(parts, "; ")))
 		return
 	}
 	fail(503, "routes unavailable or retry budget exhausted")

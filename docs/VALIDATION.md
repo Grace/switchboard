@@ -457,3 +457,43 @@ failure count, because the provider is healthy and only the account is not.
 
 Not changed: `ParseChat`'s 1024 default. Raising it would cost every caller money to protect against
 one model family, and the operator can now see the problem instead. Recorded in `docs/GAPS.md`.
+
+## 2026-09-07 — how often the default token budget produces nothing
+
+The empty-completion handling was added on a single observation. This is the measurement that should
+have preceded it, and it changed the conclusion.
+
+Seven ordinary prompts against `gpt-5-nano` at `ParseChat`'s default of 1024:
+
+| Prompt | @1024 | @2048 | @4096 | `gpt-4o-mini` @1024 |
+|---|---|---|---|---|
+| Reply with the single word: ok | 2 ch | | | |
+| What is 2+2? | 22 ch | | | |
+| Summarize the water cycle in two sentences | 277 ch | | | |
+| List three uses for a paperclip | **empty** | 223 ch | 210 ch | 443 ch, 105 billed |
+| Explain how TCP congestion control works | **empty** | **empty** | 4980 ch | |
+| Write a long paragraph about the sea | **empty** | | | |
+| Write a 500-word essay on urban planning | **empty** | **empty** | **empty** | 4158 ch, 666 billed |
+
+**Four of seven fail at the default**, including a trivially simple prompt.
+
+**Raising the default is ruled out.** 4096 still returned nothing for the essay prompt, so no static
+number is sufficient. And 1024 is demonstrably correct for non-reasoning models: `gpt-4o-mini`
+answered that same essay prompt in 666 billed tokens with a full 4158-character response, so raising
+the default would charge those callers more for a problem they do not have.
+
+Reasoning demand is not a stable property to size against either: the same prompt consumed 1920
+reasoning tokens at a budget of 2048 and 1152 at 4096. It expands to fill what it is given.
+
+The conclusion is that this is a routing problem, not a configuration one. Pending that, the 503 now
+names each route that produced nothing and the reasoning tokens it consumed:
+
+```
+no provider produced output within max_tokens=1024:
+openai/gpt-5-nano spent all 1024 tokens on internal reasoning and returned none;
+retry with a higher max_tokens
+```
+
+It deliberately does **not** suggest a budget that would work. The table above shows that figure is
+not knowable in advance, and a suggestion that then also fails is worse than none. Where a provider
+reports no reasoning count, the message says only that output was absent rather than printing zero.

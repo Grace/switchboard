@@ -107,14 +107,34 @@ Each of these is backed by a run recorded in `docs/VALIDATION.md`.
    green suite does not always mean Gemini was actually reached; and model names
    proved to be a live dependency rather than a constant, with two of the three
    originally targeted models retired out from under the tests.
-3. **Empty completions are billed but not delivered, in one remaining shape.**
-   A reasoning model can spend an entire token budget on hidden reasoning and
-   return no visible text. The gateway now fails over and counts
-   `switchboard_empty_completion_total`, but `ParseChat` still defaults
-   `max_tokens` to 1024, and gpt-5-nano was measured returning zero characters
-   at exactly that budget for an ordinary prompt. Raising the default would cost
-   every caller money to protect against one model family, so the default is
-   unchanged until the new metric shows how often this happens in practice.
+3. **A small `max_tokens` cannot reach a reasoning model that needs more.** The
+   gateway fails over when a provider returns 200 with no text, counts
+   `switchboard_empty_completion_total`, and now names the offending routes and
+   the reasoning tokens they consumed so the caller can act. What it does not do
+   is avoid the route in the first place, so a policy whose routes are all
+   reasoning models still fails most default-budget requests.
+
+   `ParseChat` still defaults `max_tokens` to 1024. Measured against
+   `gpt-5-nano`, that default returned **zero characters for four of seven
+   ordinary prompts**, including "list three uses for a paperclip". Raising the
+   default is not the fix and has been ruled out on evidence: 4096 still returned
+   nothing for a 500-word essay prompt, while `gpt-4o-mini` answered that same
+   prompt inside 666 billed tokens. There is no static number that is both
+   sufficient for reasoning models and not a tax on everything else. Reasoning
+   demand is not even stable per prompt: the same request consumed 1920 reasoning
+   tokens at a budget of 2048 and 1152 at 4096.
+
+   Two decisions are deliberately open rather than forgotten:
+
+   - **Budget-aware routing.** Track observed reasoning demand per provider and
+     model, and skip a route whose demand exceeds the caller's budget in favour
+     of one that can answer. This is the actual fix, it is what a router is for,
+     and the reasoning-token signal it needs is already being collected. Deferred
+     by choice, to be taken up next.
+   - **Whether `max_tokens` may ever be exceeded** to obtain an answer. Today it
+     never is: the caller's cap is treated as a hard spending limit, and the
+     gateway routes around the problem rather than quietly spending more than was
+     authorised. Left open.
 4. **Anthropic prompt-cache tokens are not counted.** Responses carry
    `cache_creation_input_tokens` and `cache_read_input_tokens`; neither is
    modelled. Both are zero today, so input accounting is currently correct, but
