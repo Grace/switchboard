@@ -35,16 +35,41 @@ import (
 
 type liveProvider struct {
 	name, gate, keyEnv, url, model string
+	// truncHTTP400 records that this provider signals budget exhaustion as an
+	// HTTP 400 rather than in band as a finish reason. OpenAI's reasoning models
+	// do; its legacy chat models do not. The gateway maps that 400 to "provider
+	// rejected request" with no failover, so the distinction is not cosmetic.
+	truncHTTP400 bool
 }
 
+// Model names are a live dependency, not a constant: gemini-2.0-flash and
+// claude-3-5-haiku-latest were both retired out from under this table and
+// returned 404 from the real APIs. Two OpenAI entries are deliberate, because the
+// legacy and reasoning model families take different request shapes.
 var liveProviders = []liveProvider{
 	{"openai", "SWITCHBOARD_LIVE_OPENAI", "OPENAI_API_KEY",
-		"https://api.openai.com", "gpt-4o-mini"},
+		"https://api.openai.com", "gpt-4o-mini", false},
+	{"openai-reasoning", "SWITCHBOARD_LIVE_OPENAI", "OPENAI_API_KEY",
+		"https://api.openai.com", "gpt-5-nano", true},
 	{"anthropic", "SWITCHBOARD_LIVE_ANTHROPIC", "ANTHROPIC_API_KEY",
-		"https://api.anthropic.com", "claude-3-5-haiku-latest"},
+		"https://api.anthropic.com", "claude-haiku-4-5-20251001", false},
 	{"gemini", "SWITCHBOARD_LIVE_GEMINI", "GEMINI_API_KEY",
-		"https://generativelanguage.googleapis.com", "gemini-2.0-flash"},
+		"https://generativelanguage.googleapis.com", "gemini-3.6-flash", false},
 }
+
+// adapter is the provider name the gateway routes on. The reasoning entry
+// exercises a different model through the same openai adapter.
+func (p liveProvider) adapter() string {
+	if p.name == "openai-reasoning" {
+		return "openai"
+	}
+	return p.name
+}
+
+// liveRetries bounds retries against a busy provider. Three attempts is enough
+// to ride out a brief capacity spike without turning a broken adapter into a
+// slow test.
+const liveRetries = 3
 
 func (p liveProvider) skipUnlessEnabled(t *testing.T) {
 	t.Helper()
@@ -58,20 +83,43 @@ func (p liveProvider) skipUnlessEnabled(t *testing.T) {
 
 func (p liveProvider) send(t *testing.T, c Chat) *http.Response {
 	t.Helper()
-	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
-	t.Cleanup(cancel)
-	req, err := upstream(ctx, c,
-		Route{Provider: p.name, Model: p.model},
-		ProviderConfig{URL: p.url, KeyEnv: p.keyEnv}, nil)
-	if err != nil {
-		t.Fatalf("%s: could not build the request: %v", p.name, err)
+	// Each attempt gets its own deadline. Sharing one across retries meant a
+	// provider that was slow to say "busy" burned the whole budget before the
+	// retry could run, which surfaced as a timeout rather than as the 503 it was.
+	const perAttempt = 45 * time.Second
+	var res *http.Response
+	for attempt := 1; ; attempt++ {
+		ctx, cancel := context.WithTimeout(context.Background(), perAttempt)
+		t.Cleanup(cancel)
+		req, err := upstream(ctx, c,
+			Route{Provider: p.adapter(), Model: p.model},
+			ProviderConfig{URL: p.url, KeyEnv: p.keyEnv}, nil)
+		if err != nil {
+			t.Fatalf("%s: could not build the request: %v", p.name, err)
+		}
+		res, err = http.DefaultClient.Do(req)
+		if err == nil {
+			t.Cleanup(func() { res.Body.Close() })
+			// 503 (busy) and 429 (throttled) both say the provider would not
+			// serve this request right now, not that the adapter is wrong.
+			// Retrying keeps the test measuring what it is meant to measure.
+			// Gemini in particular enforces a short per-minute quota.
+			if res.StatusCode != 503 && res.StatusCode != 429 {
+				return res
+			}
+			res.Body.Close()
+		}
+		if attempt == liveRetries {
+			if err != nil {
+				t.Fatalf("%s: request failed after %d attempts: %v", p.name, attempt, err)
+			}
+			t.Skipf("%s: provider was busy or throttled on all %d attempts "+
+				"(last status %d); this is provider capacity, not an adapter defect",
+				p.name, attempt, res.StatusCode)
+		}
+		t.Logf("%s: attempt %d did not succeed (err=%v), retrying", p.name, attempt, err)
+		time.Sleep(time.Duration(attempt) * 4 * time.Second)
 	}
-	res, err := http.DefaultClient.Do(req)
-	if err != nil {
-		t.Fatalf("%s: request failed: %v", p.name, err)
-	}
-	t.Cleanup(func() { res.Body.Close() })
-	return res
 }
 
 // A complete response, through the same normalize() a production request uses.
@@ -80,14 +128,17 @@ func TestLiveNonStreaming(t *testing.T) {
 		t.Run(p.name, func(t *testing.T) {
 			p.skipUnlessEnabled(t)
 			res := p.send(t, Chat{
-				MaxTokens: 16,
+				// 512, not 16: a reasoning model spends its whole allowance on
+				// internal thinking first and returns no visible text at all
+				// below roughly this budget.
+				MaxTokens: 512,
 				Messages:  []Message{{Role: "user", Content: "Reply with the single word: ok"}},
 			})
 			body, _ := io.ReadAll(io.LimitReader(res.Body, 1<<20))
 			if res.StatusCode != 200 {
 				t.Fatalf("%s returned %d: %s", p.name, res.StatusCode, truncate(body))
 			}
-			n, _, err := normalize(p.name, body, false)
+			n, _, err := normalize(p.adapter(), body, false)
 			if err != nil {
 				// The Bedrock equivalent of this failure was a real defect, not
 				// a test problem, so the body is printed to make it diagnosable.
@@ -119,7 +170,7 @@ func TestLiveStreaming(t *testing.T) {
 			p.skipUnlessEnabled(t)
 			res := p.send(t, Chat{
 				Stream:    true,
-				MaxTokens: 32,
+				MaxTokens: 512,
 				Messages:  []Message{{Role: "user", Content: "Count: one two three"}},
 			})
 			if res.StatusCode != 200 {
@@ -146,7 +197,7 @@ func TestLiveStreaming(t *testing.T) {
 					break
 				}
 				frames++
-				n, complete, err := normalize(p.name, []byte(payload), true)
+				n, complete, err := normalize(p.adapter(), []byte(payload), true)
 				if err != nil {
 					t.Fatalf("%s: a real stream frame did not normalize: %v\nframe: %s",
 						p.name, err, truncate([]byte(payload)))
@@ -191,10 +242,25 @@ func TestLiveTruncatedFinishReason(t *testing.T) {
 				Messages:  []Message{{Role: "user", Content: "Write a long paragraph about the sea."}},
 			})
 			body, _ := io.ReadAll(io.LimitReader(res.Body, 1<<20))
-			if res.StatusCode != 200 {
-				t.Skipf("%s returned %d for a one-token request", p.name, res.StatusCode)
+			if p.truncHTTP400 {
+				// Recorded, not tolerated: this provider reports "output was cut
+				// short" as a client error, so the gateway surfaces a bare 400
+				// and does not fail over. See docs/GAPS.md.
+				if res.StatusCode != 400 {
+					t.Fatalf("%s: expected truncation to surface as HTTP 400, got %d: %s",
+						p.name, res.StatusCode, truncate(body))
+				}
+				t.Logf("%s: truncation signalled as HTTP 400, not a finish reason: %s",
+					p.name, truncate(body))
+				return
 			}
-			n, _, err := normalize(p.name, body, false)
+			if res.StatusCode != 200 {
+				// Not Skip: skipping here reported the parent test as PASS when
+				// every request was failing authentication.
+				t.Fatalf("%s returned %d for a one-token request: %s",
+					p.name, res.StatusCode, truncate(body))
+			}
+			n, _, err := normalize(p.adapter(), body, false)
 			if err != nil {
 				t.Fatalf("%s: truncated response did not normalize: %v\nbody: %s",
 					p.name, err, truncate(body))
