@@ -242,6 +242,14 @@ func TestEmptyCompletionFailsOver(t *testing.T) {
 	if s.Metrics.EmptyCompletion.Load() != 1 {
 		t.Errorf("EmptyCompletion = %d, want 1", s.Metrics.EmptyCompletion.Load())
 	}
+	// The distinction an alarm needs: this cost money and latency, but the caller
+	// was served. It must not look like lost service.
+	if s.Metrics.EmptyCompletionRecovered.Load() != 1 {
+		t.Errorf("EmptyCompletionRecovered = %d, want 1", s.Metrics.EmptyCompletionRecovered.Load())
+	}
+	if s.Metrics.EmptyCompletionFailed.Load() != 0 {
+		t.Errorf("a recovered request was counted as failed")
+	}
 }
 
 // When no provider can produce output, the caller must be told that rather than
@@ -277,6 +285,19 @@ func TestAllProvidersEmptyNamesTheCause(t *testing.T) {
 	}
 	if strings.Contains(body, "all 0 tokens") {
 		t.Errorf("an absent reasoning figure was printed as zero: %s", body)
+	}
+	// The other half of the distinction: this is lost service, counted once for
+	// the request rather than once per route.
+	if s.Metrics.EmptyCompletionFailed.Load() != 1 {
+		t.Errorf("EmptyCompletionFailed = %d, want 1", s.Metrics.EmptyCompletionFailed.Load())
+	}
+	if s.Metrics.EmptyCompletionRecovered.Load() != 0 {
+		t.Errorf("a failed request was counted as recovered")
+	}
+	// And the per-route counter advanced twice for this one request, which is
+	// exactly why it cannot be used for alerting on its own.
+	if s.Metrics.EmptyCompletion.Load() != 2 {
+		t.Errorf("EmptyCompletion = %d, want 2 (one per empty route)", s.Metrics.EmptyCompletion.Load())
 	}
 }
 

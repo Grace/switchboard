@@ -36,6 +36,7 @@
   "queue_size": 4096,
   "spool_bytes": 67108864,
   "otlp_url": "",
+  "otlp_metrics_url": "",
   "provider_check_strict": false,
   "allow_local_http": false
 }

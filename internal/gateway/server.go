@@ -158,24 +158,26 @@ type Server struct {
 	rate, retry *bucket
 	circuits    map[string]*circuit
 	Draining    atomic.Bool
-	// probeFailed records that the startup provider check rejected a provider.
-	// Only consulted when ProviderCheckStrict is set.
-	probeFailed atomic.Bool
+	// unhealthy holds providers the startup check rejected, and is cleared per
+	// provider by a real request succeeding through it. A plain latch would have
+	// meant readiness could never follow routing back to healthy: the breaker's
+	// half-open probe restores routing on its own, but /readyz would have stayed
+	// 503 until the process restarted. Only consulted when ProviderCheckStrict.
+	unhealthyMu sync.Mutex
+	unhealthy   map[string]bool
 }
 
 func New(c Config, p *PolicyStore, m *Metrics, t *Telemetry) *Server {
 	return &Server{C: c, Policies: p, Metrics: m, Telemetry: t, HTTP: client(time.Duration(c.TimeoutSeconds) * time.Second), slots: make(chan struct{}, c.Concurrency), rate: newBucket(c.Rate, c.Burst), retry: newBucket(c.RetryRate, c.RetryRate), circuits: map[string]*circuit{"openai": {}, "anthropic": {}, "gemini": {}, "bedrock": {}}}
 }
+
+// ready reports whether this gateway can serve a request. It deliberately does
+// not consider the startup provider check: one broken provider is precisely the
+// situation failover exists for, and refusing to serve would turn a degraded
+// deployment into an unavailable one.
 func (s *Server) ready() bool {
 	p := s.Policies.Current()
 	if s.Draining.Load() || p == nil {
-		return false
-	}
-	// In strict mode a provider that could not be reached at startup is treated
-	// as a deployment fault. Staying 503 lets the platform's own health check
-	// replace the task, which is a better failure than serving requests that
-	// will all fail at the provider.
-	if s.C.ProviderCheckStrict && s.probeFailed.Load() {
 		return false
 	}
 	for _, r := range p.Routes {
@@ -185,11 +187,51 @@ func (s *Server) ready() bool {
 	}
 	return false
 }
+
+// readyz answers a different question from ready: not "can I serve this
+// request" but "should the orchestrator keep this task". In strict mode a
+// provider that failed its startup check is treated as a deployment fault, so
+// this reports unhealthy and lets the platform replace the task.
+//
+// Keeping the two separate matters. Gating ready() on the same condition
+// deadlocked recovery: the gateway refused every request, and the only thing
+// that clears a failed check is a request succeeding.
+func (s *Server) readyz() bool {
+	if !s.ready() {
+		return false
+	}
+	return !(s.C.ProviderCheckStrict && s.anyUnhealthy())
+}
+func (s *Server) markUnhealthy(provider string) {
+	s.unhealthyMu.Lock()
+	defer s.unhealthyMu.Unlock()
+	if s.unhealthy == nil {
+		s.unhealthy = map[string]bool{}
+	}
+	s.unhealthy[provider] = true
+}
+
+// markHealthy is called when a real request has succeeded through a provider,
+// which is stronger evidence than the startup check and supersedes it.
+func (s *Server) markHealthy(provider string) {
+	s.unhealthyMu.Lock()
+	defer s.unhealthyMu.Unlock()
+	if len(s.unhealthy) > 0 {
+		delete(s.unhealthy, provider)
+	}
+}
+
+func (s *Server) anyUnhealthy() bool {
+	s.unhealthyMu.Lock()
+	defer s.unhealthyMu.Unlock()
+	return len(s.unhealthy) > 0
+}
+
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(200) })
 	mux.HandleFunc("GET /readyz", func(w http.ResponseWriter, r *http.Request) {
-		if !s.ready() {
+		if !s.readyz() {
 			w.WriteHeader(503)
 			return
 		}
@@ -208,7 +250,8 @@ func (s *Server) Handler() http.Handler {
 			w.Write([]byte(`{"ready":false}`))
 			return
 		}
-		w.Write(jsonBytes(map[string]any{"ready": s.ready(), "policy_version": p.Version, "policy_expires_at": p.ExpiresAt}))
+		w.Write(jsonBytes(map[string]any{"ready": s.readyz(), "serving": s.ready(),
+			"policy_version": p.Version, "policy_expires_at": p.ExpiresAt}))
 	})
 	return mux
 }
@@ -413,6 +456,9 @@ func (s *Server) chat(w http.ResponseWriter, r *http.Request) {
 			}
 			return
 		}
+		// A 200 means this provider authenticated and served, which is stronger
+		// evidence than the startup check and supersedes a rejection from it.
+		s.markHealthy(route.Provider)
 		// The caller cannot otherwise tell which provider answered, or that an
 		// earlier one was skipped. Without this, a failover is invisible to
 		// everything except the logs and the telemetry spool.
@@ -438,6 +484,8 @@ func (s *Server) chat(w http.ResponseWriter, r *http.Request) {
 			s.circuits[route.Provider].result(err != nil)
 			if err != nil {
 				event.Status = 502
+			} else if len(empties) > 0 {
+				s.Metrics.EmptyCompletionRecovered.Add(1)
 			}
 			return
 		}
@@ -475,6 +523,9 @@ func (s *Server) chat(w http.ResponseWriter, r *http.Request) {
 				"max_tokens", c.MaxTokens, "reasoning_tokens", n.Reasoning)
 			continue
 		}
+		if len(empties) > 0 {
+			s.Metrics.EmptyCompletionRecovered.Add(1)
+		}
 		event.Status = 200
 		w.Header().Set("Content-Type", "application/json")
 		w.Write(jsonBytes(completion(id, route, n, start.Unix())))
@@ -482,6 +533,7 @@ func (s *Server) chat(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Retry-After", "1")
 	if len(empties) > 0 {
+		s.Metrics.EmptyCompletionFailed.Add(1)
 		// Name the routes. Without this the caller sees a routing failure and
 		// cannot tell that the fix is theirs, or which model to stop asking.
 		parts := make([]string, 0, len(empties))
@@ -616,10 +668,11 @@ func (s *Server) ProbeProviders(ctx context.Context) {
 		}
 		if reason := s.probeOne(ctx, route, pc); reason != "" {
 			s.Metrics.ProviderProbeFailed.Add(1)
-			s.probeFailed.Store(true)
-			// Withheld rather than removed: the existing half-open probe lets it
-			// return on its own once the account is funded or the key replaced,
-			// with no restart.
+			s.markUnhealthy(route.Provider)
+			// Withheld rather than removed. The breaker's half-open probe restores
+			// routing on its own once the account is funded or the key replaced,
+			// and the first request that then succeeds through this provider
+			// clears it here too, so readiness recovers without a restart.
 			s.circuits[route.Provider].cooldown(accountCooldown)
 			slog.Error("provider check failed", "provider", route.Provider,
 				"model", route.Model, "reason", reason, "strict", s.C.ProviderCheckStrict)

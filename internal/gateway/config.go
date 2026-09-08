@@ -38,8 +38,15 @@ type Config struct {
 	QueueSize       int                       `json:"queue_size"`
 	SpoolBytes      int64                     `json:"spool_bytes"`
 	OTLPURL         string                    `json:"otlp_url"`
-	Marketplace     *MarketplaceConfig        `json:"marketplace,omitempty"`
-	AllowLocalHTTP  bool                      `json:"allow_local_http"`
+	// OTLPMetricsURL is the full OTLP/HTTP metrics endpoint. Empty disables
+	// metric export. It is separate from OTLPURL rather than derived from it,
+	// because OTLPURL is a complete traces endpoint an operator may have pointed
+	// anywhere, and rewriting a path inside it would be guessing. Without this
+	// set, nothing collects /metrics: the endpoint is loopback-only and the
+	// scraping collector is an opt-in sidecar that most deployments do not run.
+	OTLPMetricsURL string             `json:"otlp_metrics_url"`
+	Marketplace    *MarketplaceConfig `json:"marketplace,omitempty"`
+	AllowLocalHTTP bool               `json:"allow_local_http"`
 	// ProviderCheckStrict makes a failed startup provider check hold /readyz at
 	// 503 instead of merely warning. Default false: a warning plus the provider
 	// being withheld from routing is the right default for a gateway whose whole
@@ -73,7 +80,8 @@ func (c Config) Validate() error {
 	if !identifier.MatchString(c.Tenant) || c.DataDir == "" || c.Concurrency < 1 || c.Concurrency > 4096 || c.Rate < 1 || c.Rate > 100000 || c.Burst < 1 || c.Burst > 100000 || c.RetryRate < 1 || c.RetryRate > 10000 || c.MaxAttempts < 1 || c.MaxAttempts > 3 || c.TimeoutSeconds < 1 || c.TimeoutSeconds > 90 || c.QueueSize < 1 || c.QueueSize > 65536 || c.SpoolBytes < 1048576 || c.SpoolBytes > 10737418240 {
 		return errors.New("invalid configuration limits")
 	}
-	if !secureURL(c.ControlURL, c.AllowLocalHTTP) || (c.OTLPURL != "" && !secureURL(c.OTLPURL, c.AllowLocalHTTP)) {
+	if !secureURL(c.ControlURL, c.AllowLocalHTTP) || (c.OTLPURL != "" && !secureURL(c.OTLPURL, c.AllowLocalHTTP)) ||
+		(c.OTLPMetricsURL != "" && !secureURL(c.OTLPMetricsURL, c.AllowLocalHTTP)) {
 		return errors.New("invalid control/OTLP URL")
 	}
 	if len(os.Getenv(c.ControlTokenEnv)) < 32 || len(os.Getenv(c.LocalTokenEnv)) < 32 {

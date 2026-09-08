@@ -53,6 +53,37 @@ For persistent cache/spool across task replacement, mount an encrypted EFS acces
 
 **One data directory must have exactly one running gateway.** A process file lock enforces that boundary. Use a stable independently managed task slot/access point per sidecar and stop the old owner before starting its replacement. Do not point a rolling/scaled ECS service's replicas at the same directory. EFS orchestration/scavenging for arbitrarily scaled replicas is not included; retain the default ephemeral deployment only if its telemetry-loss semantics are acceptable.
 
+## Monitoring
+
+**By default nothing collects the gateway's metrics.** `/metrics` is bound to loopback with the rest
+of the gateway, and `deploy/collector.yaml`, which scrapes it, is an opt-in container present in
+neither CloudFormation template nor the sample task definition. Until one of these is done, every
+counter below is unreadable:
+
+- Set `otlp_metrics_url` to your OTLP/HTTP metrics endpoint. The gateway pushes every counter and
+  gauge every 30 seconds, needing no scraper and no extra container. Counters are cumulative sums;
+  the latency histogram is **not** exported.
+- Or add the Collector as a same-task container, per step 6 above.
+
+### What to alarm on
+
+| Metric | Meaning | Threshold |
+|---|---|---|
+| `empty_completion_failed_total` | Every route produced no output and the caller got a 503. **Lost service.** | Low. Any sustained rate is user-visible failure. |
+| `empty_completion_recovered_total` | A later route answered after one produced nothing. The caller was served, but paid two providers and waited for both. **Wasted spend and latency.** | Higher, and as a rate against `requests_total`. |
+| `account_failover_total` | A provider account could not serve: no credits, balance too low, quota exhausted. | Low. This is usually a billing action, not an incident. |
+| `provider_probe_failed_total` | The startup check rejected a provider. | Any non-zero value warrants a look. |
+| `usage_mismatch_total` | A provider's own token totals did not add up, so billing figures may be wrong. | Any non-zero value. |
+
+`empty_completion_total` is counted **per route**, so one request can advance it more than once. Use
+the recovered and failed counters for alarms; that one cannot tell the two apart.
+
+On what counts as "regularly": reasoning models spend their token budget on hidden reasoning before
+writing an answer and reserve nothing for it. Measured against `gpt-5-nano` at the 1024 default,
+**four of seven ordinary prompts returned no text at all**. A policy routing to a reasoning model
+should expect a non-trivial rate here, and the fix is usually a higher `max_tokens` from the caller
+rather than anything in the deployment.
+
 ## Operations and rollback
 
 Alert on policy refresh errors/approaching expiry, inference errors, rejections, dropped telemetry, export errors and spool growth. Poll authenticated `/runtime` for policy expiry. A control-plane outage is nonfatal only until the cached policy expires. Replace secret-injected tasks after rotation. Test draining with a long stream and prove app-stop ordering before release.

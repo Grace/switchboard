@@ -149,8 +149,9 @@ Cost is a few cents. Keys can be revoked afterwards, and should be.
 
 Once the first signed policy verifies, the gateway sends one 8-token completion to each provider the
 policy routes to, using a model that policy names. A failure withholds that provider from routing for
-60 seconds and logs at ERROR; the existing half-open probe lets it return on its own once the account
-is funded or the key replaced, with no restart.
+60 seconds and logs at ERROR. Routing recovers on its own through the breaker's half-open probe once
+the account is funded or the key replaced, and the first request that then succeeds through that
+provider also clears it from the readiness check, so neither requires a restart.
 
 Setting `"provider_check_strict": true` additionally holds `/readyz` at 503, so the platform's own
 health check replaces the task rather than letting it serve requests that will all fail upstream.
