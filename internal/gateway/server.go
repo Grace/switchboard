@@ -89,6 +89,18 @@ func (c *circuit) cooldown(d time.Duration) {
 	}
 }
 
+// errStreamEmpty reports a stream that ended having produced no text and,
+// crucially, having written nothing to the client. It is not a provider failure:
+// the provider answered correctly and the answer was empty. Because no bytes
+// were sent, the request may still fail over, which is the only window in which
+// that is allowed.
+var errStreamEmpty = errors.New("stream produced no output")
+
+// accountCooldown withholds a provider whose account cannot serve. Longer than
+// the breaker's 15 seconds, because no credits will not resolve in 15 seconds,
+// and short enough that topping up a balance does not require a restart.
+const accountCooldown = 60 * time.Second
+
 // maxCooldown bounds what a provider can ask for. Retry-After is attacker- and
 // bug-reachable, and an unbounded value would park a route indefinitely.
 const maxCooldown = 5 * time.Minute
@@ -125,6 +137,9 @@ type Server struct {
 	rate, retry *bucket
 	circuits    map[string]*circuit
 	Draining    atomic.Bool
+	// probeFailed records that the startup provider check rejected a provider.
+	// Only consulted when ProviderCheckStrict is set.
+	probeFailed atomic.Bool
 }
 
 func New(c Config, p *PolicyStore, m *Metrics, t *Telemetry) *Server {
@@ -133,6 +148,13 @@ func New(c Config, p *PolicyStore, m *Metrics, t *Telemetry) *Server {
 func (s *Server) ready() bool {
 	p := s.Policies.Current()
 	if s.Draining.Load() || p == nil {
+		return false
+	}
+	// In strict mode a provider that could not be reached at startup is treated
+	// as a deployment fault. Staying 503 lets the platform's own health check
+	// replace the task, which is a better failure than serving requests that
+	// will all fail at the provider.
+	if s.C.ProviderCheckStrict && s.probeFailed.Load() {
 		return false
 	}
 	for _, r := range p.Routes {
@@ -260,6 +282,9 @@ func (s *Server) chat(w http.ResponseWriter, r *http.Request) {
 		fail(503, "policy expired")
 		return
 	}
+	// Set when a provider answered but produced no text, so an exhausted loop
+	// can say why rather than reporting a generic routing failure.
+	emptied := false
 	for _, route := range p.Routes {
 		pc, ok := s.C.Providers[route.Provider]
 		if !ok {
@@ -311,10 +336,28 @@ func (s *Server) chat(w http.ResponseWriter, r *http.Request) {
 		}
 		if res.StatusCode != 200 {
 			status := res.StatusCode
+			// The body is read before deciding, because the status code alone
+			// cannot separate an account that cannot pay from a request that is
+			// malformed. Anthropic reports "credit balance is too low" as a 400,
+			// which used to be treated as the caller's fault and never failed
+			// over. Bounded: this is an error path and only the message matters.
+			errBody, _ := io.ReadAll(io.LimitReader(res.Body, 1<<16))
 			res.Body.Close()
 			wait := retryAfter(res.Header.Get("Retry-After"))
-			switch status {
-			case 429:
+			switch classify(status, errBody) {
+			case faultAccount:
+				// This account cannot serve at all. The provider is healthy, so
+				// this is a cooldown rather than a health failure, but a long
+				// one: it will not clear in the breaker's 15 seconds, and the
+				// real OpenAI response carried no Retry-After whatsoever, which
+				// previously released the circuit and re-attempted a dead
+				// account on every single request.
+				s.circuits[route.Provider].cooldown(max(wait, accountCooldown))
+				s.Metrics.AccountFailover.Add(1)
+				slog.Warn("provider account cannot serve; failing over", "request_id", id,
+					"provider", route.Provider, "status", status, "reason", providerReason(errBody))
+				continue
+			case faultRateLimit:
 				// Rate limited: the provider is fine, this caller is over quota.
 				// Fail over, respect any stated wait, but do not count it as a
 				// health failure.
@@ -325,7 +368,7 @@ func (s *Server) chat(w http.ResponseWriter, r *http.Request) {
 				}
 				s.Metrics.RateLimited.Add(1)
 				continue
-			case 503:
+			case faultDegraded:
 				// Provider degraded. This is what the breaker is for.
 				s.circuits[route.Provider].result(true)
 				if wait > 0 {
@@ -333,11 +376,19 @@ func (s *Server) chat(w http.ResponseWriter, r *http.Request) {
 				}
 				continue
 			}
+			// Terminal: this request would fail the same way at every provider,
+			// so failing over would only multiply the waste. Carry the
+			// provider's own words, because "provider rejected request" made a
+			// token-budget problem indistinguishable from a malformed one.
 			s.circuits[route.Provider].result(false)
+			msg := "provider rejected request"
+			if reason := providerReason(errBody); reason != "" {
+				msg += ": " + reason
+			}
 			if status == 400 || status == 422 {
-				fail(400, "provider rejected request")
+				fail(400, msg)
 			} else {
-				fail(502, "provider rejected request; not replayed")
+				fail(502, msg+"; not replayed")
 			}
 			return
 		}
@@ -349,9 +400,20 @@ func (s *Server) chat(w http.ResponseWriter, r *http.Request) {
 
 		// Acceptance (HTTP 200) commits this generation. No body/stream error may fail over.
 		if c.Stream {
-			event.Status = 200
 			err := s.stream(w, res, route, id, start.Unix())
 			res.Body.Close()
+			if errors.Is(err, errStreamEmpty) {
+				// The provider answered and said nothing, without sending a
+				// byte. It is healthy, so the circuit closes; the request is
+				// still unanswered, so it moves on.
+				s.circuits[route.Provider].result(false)
+				emptied = true
+				s.Metrics.EmptyCompletion.Add(1)
+				slog.Warn("provider produced no output within the token budget", "request_id", id,
+					"provider", route.Provider, "model", route.Model, "max_tokens", c.MaxTokens)
+				continue
+			}
+			event.Status = 200
 			s.circuits[route.Provider].result(err != nil)
 			if err != nil {
 				event.Status = 502
@@ -374,12 +436,35 @@ func (s *Server) chat(w http.ResponseWriter, r *http.Request) {
 			fail(502, "unsupported or incomplete provider response; not replayed")
 			return
 		}
+		if n.Finish == "length" && n.Text == "" {
+			// The provider succeeded and produced nothing. A reasoning model
+			// spends its budget on hidden reasoning before writing any answer
+			// and does not reserve room for one, so a budget that is merely too
+			// small yields a 200 with empty content, billed in full. Measured on
+			// gpt-5-nano: 1024 tokens in, 1024 spent reasoning, zero characters
+			// out. Returning that as success charges for an empty answer.
+			//
+			// The provider is healthy, so the circuit was already reset above.
+			// Nothing has been written to the client yet, so failing over does
+			// not violate the no-replay-after-acceptance rule.
+			emptied = true
+			s.Metrics.EmptyCompletion.Add(1)
+			slog.Warn("provider produced no output within the token budget", "request_id", id,
+				"provider", route.Provider, "model", route.Model,
+				"max_tokens", c.MaxTokens, "reasoning_tokens", n.Reasoning)
+			continue
+		}
 		event.Status = 200
 		w.Header().Set("Content-Type", "application/json")
 		w.Write(jsonBytes(completion(id, route, n, start.Unix())))
 		return
 	}
 	w.Header().Set("Retry-After", "1")
+	if emptied {
+		fail(503, "every attempted provider consumed the token budget without producing "+
+			"output; retry with a higher max_tokens")
+		return
+	}
 	fail(503, "routes unavailable or retry budget exhausted")
 }
 func (s *Server) stream(w http.ResponseWriter, res *http.Response, route Route, id string, created int64) error {
@@ -393,6 +478,15 @@ func (s *Server) stream(w http.ResponseWriter, res *http.Response, route Route, 
 	rc := http.NewResponseController(w)
 	finished := false
 	terminal := false
+	// wrote records whether any byte has reached the client. Once one has, this
+	// generation is committed and no failover is permitted.
+	wrote := false
+	// pending holds a frame carrying a truncation finish reason and no text. A
+	// reasoning model can consume the whole budget without writing an answer,
+	// and that frame is the first thing it sends. Emitting it immediately would
+	// commit an empty response; holding it keeps failover available until the
+	// stream proves it has something to say.
+	var pending any
 	// Providers repeat cumulative usage on every frame, so without this a single
 	// response would be counted as several mismatches.
 	mismatchCounted := false
@@ -419,10 +513,16 @@ func (s *Server) stream(w http.ResponseWriter, res *http.Response, route Route, 
 			finished = true
 		}
 		if n.Text != "" || n.Finish != "" {
+			ch := chunk(id, route, n, created)
+			if !wrote && n.Text == "" && n.Finish == "length" {
+				pending = ch
+				return nil
+			}
 			rc.SetWriteDeadline(time.Now().Add(10 * time.Second))
-			if e := writeSSE(w, chunk(id, route, n, created)); e != nil {
+			if e := writeSSE(w, ch); e != nil {
 				return e
 			}
+			wrote = true
 		}
 		if done && route.Provider != "openai" {
 			if !finished {
@@ -435,6 +535,16 @@ func (s *Server) stream(w http.ResponseWriter, res *http.Response, route Route, 
 	})
 	rc.SetWriteDeadline(time.Now().Add(10 * time.Second))
 	if (err == nil || errors.Is(err, streamComplete)) && terminal {
+		if pending != nil && !wrote {
+			// Nothing was ever sent, so the caller is still owed an answer and
+			// another provider may be able to give one.
+			return errStreamEmpty
+		}
+		if pending != nil {
+			if e := writeSSE(w, pending); e != nil {
+				return e
+			}
+		}
 		_, e := fmt.Fprint(w, "data: [DONE]\n\n")
 		if e == nil {
 			e = rc.Flush()
@@ -447,6 +557,106 @@ func (s *Server) stream(w http.ResponseWriter, res *http.Response, route Route, 
 	}
 	return err
 }
+
+// ProbeProviders sends one real request to every provider the current policy
+// routes to, once, after the first signed policy verifies.
+//
+// It sends a completion rather than hitting an auth-only endpoint, because an
+// auth-only check does not answer the question. Measured during live testing:
+// GET /v1/models returned 200 on an OpenAI key whose account had no credits,
+// minutes before a completion on the same key returned 429. A check that passes
+// while every real request fails is worse than no check, because it converts an
+// obvious failure into a confident one.
+//
+// It runs after policy rather than at boot because the models to probe come from
+// the signed policy, and hardcoding model names is what broke the live tests:
+// two of three named models were retired by their providers between being
+// written and being run.
+func (s *Server) ProbeProviders(ctx context.Context) {
+	p := s.awaitPolicy(ctx)
+	if p == nil {
+		return
+	}
+	seen := map[string]bool{}
+	for _, route := range p.Routes {
+		if seen[route.Provider] {
+			continue
+		}
+		seen[route.Provider] = true
+		pc, ok := s.C.Providers[route.Provider]
+		if !ok {
+			continue
+		}
+		if reason := s.probeOne(ctx, route, pc); reason != "" {
+			s.Metrics.ProviderProbeFailed.Add(1)
+			s.probeFailed.Store(true)
+			// Withheld rather than removed: the existing half-open probe lets it
+			// return on its own once the account is funded or the key replaced,
+			// with no restart.
+			s.circuits[route.Provider].cooldown(accountCooldown)
+			slog.Error("provider check failed", "provider", route.Provider,
+				"model", route.Model, "reason", reason, "strict", s.C.ProviderCheckStrict)
+			continue
+		}
+		slog.Info("provider check passed", "provider", route.Provider, "model", route.Model)
+	}
+}
+
+// awaitPolicy blocks until a signed policy is live. There is no callback on that
+// transition, so this polls, the same way the readiness probe and the smoke test
+// already do.
+func (s *Server) awaitPolicy(ctx context.Context) *Policy {
+	t := time.NewTicker(time.Second)
+	defer t.Stop()
+	for {
+		if p := s.Policies.Current(); p != nil {
+			return p
+		}
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-t.C:
+		}
+	}
+}
+
+// probeOne returns "" when the provider is usable, or the reason it is not.
+// Only credentials and account state are being tested here, so a rate limit, a
+// busy provider or a complaint about the tiny token budget all count as passes:
+// each of them proves the request was authenticated and the account can pay.
+func (s *Server) probeOne(ctx context.Context, route Route, pc ProviderConfig) string {
+	ctx, cancel := context.WithTimeout(ctx, 20*time.Second)
+	defer cancel()
+	req, err := upstream(ctx, Chat{
+		MaxTokens: 8,
+		Messages:  []Message{{Role: "user", Content: "ping"}},
+	}, route, pc, s.Bedrock)
+	if err != nil {
+		return "request could not be built: " + err.Error()
+	}
+	res, err := s.HTTP.Do(req)
+	if err != nil {
+		return "provider unreachable: " + err.Error()
+	}
+	body, _ := io.ReadAll(io.LimitReader(res.Body, 1<<16))
+	res.Body.Close()
+	switch {
+	case res.StatusCode == 200:
+		return ""
+	case res.StatusCode == 401 || res.StatusCode == 403:
+		if reason := providerReason(body); reason != "" {
+			return "credentials rejected: " + reason
+		}
+		return "credentials rejected"
+	case classify(res.StatusCode, body) == faultAccount:
+		if reason := providerReason(body); reason != "" {
+			return "account cannot serve: " + reason
+		}
+		return "account cannot serve"
+	}
+	return ""
+}
+
 func (s *Server) Sync(ctx context.Context) {
 	ticker := time.NewTicker(15 * time.Second)
 	defer ticker.Stop()

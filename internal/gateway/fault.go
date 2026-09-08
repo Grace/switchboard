@@ -1,0 +1,129 @@
+package gateway
+
+// Classifying why a provider refused a request.
+//
+// The routing loop used to continue only on 429 and 503, and treat every other
+// non-200 as a dead end. Live testing showed that discards the cases failover
+// exists for. Three real refusals, all measured:
+//
+//	OpenAI, out of credits      429, and no Retry-After or x-ratelimit headers
+//	Anthropic, balance too low  400, not 402 and not 429
+//	Gemini, quota exhausted     429, "exceeded your current quota"
+//
+// The middle one is the point. A 400 was read as "this request is malformed",
+// so the gateway returned an opaque error while a funded provider sat unused in
+// the same policy. But an account that cannot pay is exactly when another
+// provider should be tried, and a genuinely malformed request is exactly when it
+// should not, because it would fail identically everywhere and multiply the
+// waste. Nothing in the status code separates them; only the body does.
+//
+// So this matches strings, which is not a durable contract with any provider.
+// It therefore fails safe: anything unrecognised stays terminal, keeping the
+// old behaviour. A missed billing phrase costs a failover that could have
+// happened. A wrongly matched one would replay a bad request across every
+// configured provider, which is worse.
+
+import (
+	"bytes"
+	"encoding/json"
+	"strings"
+)
+
+type fault int
+
+const (
+	// faultTerminal is a request this provider will not serve and no other
+	// provider would either. Failing over cannot help.
+	faultTerminal fault = iota
+	// faultRateLimit is this caller briefly over quota against a healthy
+	// provider. Fail over, respect any stated wait, do not blame the provider.
+	faultRateLimit
+	// faultAccount is an account that cannot serve at all: no credits, balance
+	// too low, quota exhausted. The provider is healthy; this account is not.
+	// Retrying it every request, as the gateway used to, is pure waste.
+	faultAccount
+	// faultDegraded is the provider itself failing. This is what the breaker is for.
+	faultDegraded
+)
+
+// accountPhrases are lifted verbatim from real provider responses. They will
+// drift, and there is no version to pin, so treat a miss as expected rather than
+// exceptional: the consequence is a failover that did not happen, not a wrong
+// answer. Kept lowercase; the body is folded before comparison.
+var accountPhrases = []string{
+	"no credits remaining",        // OpenAI, 429
+	"credit balance is too low",   // Anthropic, 400
+	"exceeded your current quota", // Gemini, 429
+	"check your plan and billing", // Gemini, 429
+	"purchase credits",
+	"add credits",
+	"billing details",
+	"insufficient_quota",
+	"insufficient funds",
+}
+
+// classify decides how the routing loop should treat a non-200. The body is
+// capped before scanning because it is attacker-influenced and only the error
+// message is ever near the front.
+func classify(status int, body []byte) fault {
+	switch status {
+	case 503:
+		return faultDegraded
+	case 429:
+		if accountExhausted(body) {
+			return faultAccount
+		}
+		return faultRateLimit
+	case 400, 422:
+		if accountExhausted(body) {
+			return faultAccount
+		}
+		return faultTerminal
+	}
+	return faultTerminal
+}
+
+func accountExhausted(body []byte) bool {
+	const scan = 4096
+	if len(body) > scan {
+		body = body[:scan]
+	}
+	lower := strings.ToLower(string(bytes.TrimSpace(body)))
+	for _, p := range accountPhrases {
+		if strings.Contains(lower, p) {
+			return true
+		}
+	}
+	return false
+}
+
+// providerReason pulls the provider's own error text out of a response so the
+// caller is told why rather than "provider rejected request". All four providers
+// nest it differently, so this is deliberately loose: it returns "" rather than
+// guessing, and the caller falls back to a generic message.
+func providerReason(body []byte) string {
+	const scan = 8192
+	if len(body) > scan {
+		body = body[:scan]
+	}
+	var w struct {
+		Error struct {
+			Message string `json:"message"`
+		} `json:"error"`
+		Message string `json:"message"`
+	}
+	if json.Unmarshal(body, &w) != nil {
+		return ""
+	}
+	msg := w.Error.Message
+	if msg == "" {
+		msg = w.Message
+	}
+	msg = strings.TrimSpace(msg)
+	// Bounded: this reaches a client response, and a provider could return an
+	// arbitrarily long message.
+	if len(msg) > 300 {
+		msg = msg[:300]
+	}
+	return msg
+}

@@ -4,8 +4,9 @@ import (
 	"context"
 	"encoding/json"
 	"net/http"
-
+	"net/http/httptest"
 	"os"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -95,4 +96,25 @@ func TestOTLPIndependentOfControlPlane(t *testing.T) {
 	}
 	cancel()
 	tel.Wait()
+}
+
+// A counter that is declared but left out of the export list is invisible, which
+// is the same as not having it. These three exist to make provider faults
+// observable, so silently not exporting them would defeat the point.
+func TestProviderFaultCountersAreExported(t *testing.T) {
+	m := &Metrics{}
+	m.EmptyCompletion.Add(3)
+	m.AccountFailover.Add(2)
+	m.ProviderProbeFailed.Add(1)
+	w := httptest.NewRecorder()
+	m.ServeHTTP(w, httptest.NewRequest("GET", "/metrics", nil))
+	for _, want := range []string{
+		"switchboard_empty_completion_total 3",
+		"switchboard_account_failover_total 2",
+		"switchboard_provider_probe_failed_total 1",
+	} {
+		if !strings.Contains(w.Body.String(), want) {
+			t.Errorf("metrics output is missing %q", want)
+		}
+	}
 }

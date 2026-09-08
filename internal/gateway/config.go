@@ -40,6 +40,11 @@ type Config struct {
 	OTLPURL         string                    `json:"otlp_url"`
 	Marketplace     *MarketplaceConfig        `json:"marketplace,omitempty"`
 	AllowLocalHTTP  bool                      `json:"allow_local_http"`
+	// ProviderCheckStrict makes a failed startup provider check hold /readyz at
+	// 503 instead of merely warning. Default false: a warning plus the provider
+	// being withheld from routing is the right default for a gateway whose whole
+	// purpose is to keep serving when one provider cannot.
+	ProviderCheckStrict bool `json:"provider_check_strict"`
 }
 
 func secureURL(s string, local bool) bool {

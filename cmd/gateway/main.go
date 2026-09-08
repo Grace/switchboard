@@ -112,6 +112,10 @@ func main() {
 	s.Bedrock = bedrock
 	t.Start(background)
 	go s.Sync(background)
+	// Checks each provider the policy routes to, once the first signed policy is
+	// live. A key that is present but wrong, or an account that cannot pay, is
+	// otherwise only discovered by a customer's first request failing.
+	go s.ProbeProviders(background)
 	srv := &http.Server{Addr: c.Listen, Handler: s.Handler(), ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 15 * time.Second, WriteTimeout: 100 * time.Second, IdleTimeout: 60 * time.Second, MaxHeaderBytes: 16384}
 	signals, unregister := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
 	defer unregister()

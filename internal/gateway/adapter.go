@@ -158,6 +158,11 @@ type normalized struct {
 	Text          string
 	Finish        string
 	Input, Output int
+	// Reasoning is the portion of Output the provider spent on hidden internal
+	// reasoning rather than visible text. It is the leading indicator for an
+	// empty completion: as it approaches the caller's budget, the answer runs
+	// out of room before it is written.
+	Reasoning int
 	// UsageMismatch reports that the provider's own token totals did not add up,
 	// which means this gateway's billing figure may be wrong. It is surfaced as a
 	// metric rather than an error: the request itself is fine, but a provider
@@ -213,6 +218,12 @@ type wire struct {
 		Output     int `json:"output_tokens"`
 		Prompt     int `json:"prompt_tokens"`
 		Completion int `json:"completion_tokens"`
+		// Reasoning models bill hidden reasoning inside completion_tokens and
+		// break it out here. Without it there is no way to tell a short answer
+		// from a budget entirely consumed before any answer was written.
+		Details struct {
+			Reasoning int `json:"reasoning_tokens"`
+		} `json:"completion_tokens_details"`
 	} `json:"usage"`
 	Candidates []struct {
 		Index   int `json:"index"`
@@ -262,6 +273,7 @@ func normalize(provider string, b []byte, stream bool) (normalized, bool, error)
 	case "openai":
 		n.Input = w.Usage.Prompt
 		n.Output = w.Usage.Completion
+		n.Reasoning = w.Usage.Details.Reasoning
 		if len(w.Choices) > 1 {
 			return n, false, errors.New("multiple choices unsupported")
 		}
@@ -342,6 +354,7 @@ func normalize(provider string, b []byte, stream bool) (normalized, bool, error)
 		n.Input = w.UsageMetadata.Input
 		// Thinking tokens are billed as output, so they must be counted as output.
 		n.Output = w.UsageMetadata.Output + w.UsageMetadata.Thoughts
+		n.Reasoning = w.UsageMetadata.Thoughts
 		// The provider also reports a total. When it disagrees with the parts,
 		// this gateway is billing on an accounting model the provider no longer
 		// uses, so say so rather than quietly trusting the sum.

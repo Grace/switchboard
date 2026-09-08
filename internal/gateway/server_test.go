@@ -149,3 +149,151 @@ func TestIdempotencyRejected(t *testing.T) {
 		t.Fatal(w.Code)
 	}
 }
+
+// Verbatim from the real Anthropic API. Reported as 400, which the routing loop
+// used to read as "this request is malformed" and refuse to fail over on, while
+// a funded provider sat unused in the same policy.
+const anthropicNoCredit = `{"type":"error","error":{"type":"invalid_request_error","message":` +
+	`"Your credit balance is too low to access the Anthropic API. Please go to Plans & Billing to upgrade or purchase credits."}}`
+
+func TestAccountFailureFailsOver(t *testing.T) {
+	var first, second atomic.Int64
+	a := testHTTP(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		first.Add(1)
+		w.WriteHeader(400)
+		io.WriteString(w, anthropicNoCredit)
+	}))
+	defer a.Close()
+	b := testHTTP(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		second.Add(1)
+		io.WriteString(w, `{"content":[{"type":"text","text":"rescued"}],"stop_reason":"end_turn"}`)
+	}))
+	defer b.Close()
+	s := testServer(t, map[string]ProviderConfig{"openai": {URL: a.URL, KeyEnv: "PROVIDER_KEY"}, "anthropic": {URL: b.URL, KeyEnv: "PROVIDER_KEY"}})
+	w := call(s, chat)
+	if w.Code != 200 || !strings.Contains(w.Body.String(), "rescued") {
+		t.Fatalf("no failover on an unpayable account: %d %s", w.Code, w.Body)
+	}
+	if first.Load() != 1 || second.Load() != 1 {
+		t.Fatalf("attempts: first=%d second=%d", first.Load(), second.Load())
+	}
+	if w.Header().Get("X-Switchboard-Provider") != "anthropic" {
+		t.Errorf("caller cannot see which provider answered: %q", w.Header().Get("X-Switchboard-Provider"))
+	}
+	if s.Metrics.AccountFailover.Load() != 1 {
+		t.Errorf("AccountFailover = %d, want 1", s.Metrics.AccountFailover.Load())
+	}
+	// The provider is healthy; only this account cannot pay. Blaming the
+	// provider would open the breaker against a service that is working.
+	if s.circuits["openai"].failures != 0 {
+		t.Errorf("an unpayable account was counted as a provider health failure")
+	}
+}
+
+// The counterpart, and the more important direction: a request that is genuinely
+// malformed would be refused identically everywhere, so replaying it across
+// every provider multiplies the waste instead of avoiding it.
+func TestMalformedRequestDoesNotFailOver(t *testing.T) {
+	var fallback atomic.Int64
+	a := testHTTP(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(400)
+		io.WriteString(w, `{"error":{"message":"messages: at least one message is required"}}`)
+	}))
+	defer a.Close()
+	b := testHTTP(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { fallback.Add(1) }))
+	defer b.Close()
+	s := testServer(t, map[string]ProviderConfig{"openai": {URL: a.URL, KeyEnv: "PROVIDER_KEY"}, "anthropic": {URL: b.URL, KeyEnv: "PROVIDER_KEY"}})
+	w := call(s, chat)
+	if fallback.Load() != 0 {
+		t.Fatal("a malformed request was replayed to a second provider")
+	}
+	// The caller should learn why, not just that something was rejected.
+	if !strings.Contains(w.Body.String(), "at least one message is required") {
+		t.Errorf("provider's own reason not surfaced: %s", w.Body)
+	}
+}
+
+// A reasoning model can spend its whole token budget on hidden reasoning and
+// return no visible text, billed in full. Measured on gpt-5-nano: 1024 tokens
+// in, 1024 spent reasoning, zero characters out. Reporting that as a 200 charges
+// the caller for an empty answer.
+const emptyByBudget = `{"choices":[{"index":0,"message":{"content":""},"finish_reason":"length"}],` +
+	`"usage":{"prompt_tokens":9,"completion_tokens":1024,"completion_tokens_details":{"reasoning_tokens":1024}}}`
+
+func TestEmptyCompletionFailsOver(t *testing.T) {
+	var second atomic.Int64
+	a := testHTTP(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		io.WriteString(w, emptyByBudget)
+	}))
+	defer a.Close()
+	b := testHTTP(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		second.Add(1)
+		io.WriteString(w, `{"content":[{"type":"text","text":"rescued"}],"stop_reason":"end_turn"}`)
+	}))
+	defer b.Close()
+	s := testServer(t, map[string]ProviderConfig{"openai": {URL: a.URL, KeyEnv: "PROVIDER_KEY"}, "anthropic": {URL: b.URL, KeyEnv: "PROVIDER_KEY"}})
+	w := call(s, chat)
+	if w.Code != 200 || !strings.Contains(w.Body.String(), "rescued") {
+		t.Fatalf("an empty completion was returned as success: %d %s", w.Code, w.Body)
+	}
+	if second.Load() != 1 {
+		t.Fatalf("second provider called %d times", second.Load())
+	}
+	if s.Metrics.EmptyCompletion.Load() != 1 {
+		t.Errorf("EmptyCompletion = %d, want 1", s.Metrics.EmptyCompletion.Load())
+	}
+}
+
+// When no provider can produce output, the caller must be told that rather than
+// receiving a generic routing failure, because the fix is theirs to make.
+func TestAllProvidersEmptyNamesTheCause(t *testing.T) {
+	a := testHTTP(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		io.WriteString(w, emptyByBudget)
+	}))
+	defer a.Close()
+	// The same failure in Anthropic's shape: the budget ran out before any
+	// content block was produced.
+	b := testHTTP(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		io.WriteString(w, `{"content":[],"stop_reason":"max_tokens","usage":{"input_tokens":9,"output_tokens":1024}}`)
+	}))
+	defer b.Close()
+	s := testServer(t, map[string]ProviderConfig{"openai": {URL: a.URL, KeyEnv: "PROVIDER_KEY"}, "anthropic": {URL: b.URL, KeyEnv: "PROVIDER_KEY"}})
+	w := call(s, chat)
+	if w.Code != 503 {
+		t.Fatalf("status = %d, want 503", w.Code)
+	}
+	if !strings.Contains(w.Body.String(), "max_tokens") {
+		t.Errorf("failure does not name the cause: %s", w.Body)
+	}
+}
+
+// The streaming equivalent. Failover is only legitimate here because the frame
+// carrying the truncation reason is held back, so no byte has reached the client.
+func TestEmptyStreamFailsOverBeforeAnyByteIsSent(t *testing.T) {
+	var second atomic.Int64
+	a := testHTTP(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		io.WriteString(w, "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"length\"}]}\n\n")
+		io.WriteString(w, "data: [DONE]\n\n")
+	}))
+	defer a.Close()
+	b := testHTTP(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		second.Add(1)
+		w.Header().Set("Content-Type", "text/event-stream")
+		io.WriteString(w, "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"rescued\"}}\n\n")
+		io.WriteString(w, "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}}\n\n")
+		io.WriteString(w, "data: {\"type\":\"message_stop\"}\n\n")
+	}))
+	defer b.Close()
+	s := testServer(t, map[string]ProviderConfig{"openai": {URL: a.URL, KeyEnv: "PROVIDER_KEY"}, "anthropic": {URL: b.URL, KeyEnv: "PROVIDER_KEY"}})
+	w := call(s, `{"model":"preferred","stream":true,"messages":[{"role":"user","content":"hi"}]}`)
+	if second.Load() != 1 {
+		t.Fatalf("empty stream did not fail over; second provider called %d times", second.Load())
+	}
+	if !strings.Contains(w.Body.String(), "rescued") {
+		t.Fatalf("body: %s", w.Body)
+	}
+	if s.Metrics.EmptyCompletion.Load() != 1 {
+		t.Errorf("EmptyCompletion = %d, want 1", s.Metrics.EmptyCompletion.Load())
+	}
+}
