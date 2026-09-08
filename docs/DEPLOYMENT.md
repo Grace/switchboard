@@ -88,11 +88,9 @@ Datadog takes `dd-api-key`, and a local collector takes no header at all.
 
 ### Triggers worth creating
 
-These four map to something a person should do. Two of them exist in the `gracefulcode` `test`
-environment; the other two do not, and the reason is a plan limit rather than anything about the
-queries. The Honeycomb API answers a third create with `exceeded maximum 2 triggers for this
-team's plan`, so a third and fourth trigger cost a plan change, not a config change. Pick the two
-that matter most for the account you are deploying into.
+These four map to something a person should do. **The Honeycomb free plan allows two triggers per
+team**, and a third create returns `exceeded maximum 2 triggers for this team's plan`. All four
+conditions still fit; see "Four conditions in two triggers" below.
 
 **The column names differ by path, and this is the detail that breaks triggers.** The Prometheus
 exposition on `/metrics` separates words with underscores — `switchboard_empty_completion_failed_total`.
@@ -123,6 +121,37 @@ counter that only ever climbs stays above any threshold once crossed.
 
 `switchboard.empty_completion_recovered_total` is worth a graph rather than a trigger: it is spend
 and latency, not an outage, and budget-aware routing should drive it toward zero on its own.
+
+### Four conditions in two triggers
+
+A trigger query may hold only one aggregate — a second calculation is refused with `query: only one
+non-having aggregate is allowed` — but a **formula** collapses several into one value, and formulas
+do work on a Metrics dataset. So one trigger can watch several counters:
+
+| Slot | Query | Urgency |
+|---|---|---|
+| 1 | `SUM(switchboard.empty_completion_failed_total)` > 0 | **Page.** |
+| 2 | `SUM(account_failover) + SUM(usage_mismatch) + SUM(idempotent_unknown)` > 0 | Notify. |
+
+Leave the page alone in slot 1. It is the only one of the four that is an outage, and merging
+anything into it blunts the only alert that should wake someone.
+
+The cost is that slot 2 says *something moved* rather than *this moved*. Pay for that with a board
+rather than a plan: boards are not capped, and a panel graphing the three counters separately turns
+the notification into a ten-second lookup. Put the counter names in the trigger description too,
+since that text is what arrives in the notification.
+
+```json
+{
+  "calculations": [
+    {"column": "switchboard.account_failover_total",   "op": "SUM", "name": "failover"},
+    {"column": "switchboard.usage_mismatch_total",     "op": "SUM", "name": "mismatch"},
+    {"column": "switchboard.idempotent_unknown_total", "op": "SUM", "name": "unknown"}
+  ],
+  "formulas": [{"name": "needs_a_human", "expression": "$failover + $mismatch + $unknown"}],
+  "time_range": 900
+}
+```
 
 ### What to alarm on
 

@@ -221,20 +221,38 @@ Each of these is backed by a run recorded in `docs/VALIDATION.md`.
    not run, and says nothing afterwards.** The only reliable check is to execute
    the trigger's own query.
 
-   **The other two triggers are blocked by the plan, not by the queries.** The
+   **The free plan allows two triggers, and all four conditions fit anyway.** The
    API answers a third create with `exceeded maximum 2 triggers for this team's
    plan`. The MCP tooling in front of it reported only `Failed to save trigger`,
    which is what made this look like a query problem for as long as it did;
-   calling the API directly gave the real message immediately. So
-   `switchboard.usage_mismatch_total` and `switchboard.idempotent_unknown_total`
-   have no trigger, and getting one costs a Honeycomb plan change. Of the four,
-   the two that exist are the two worth having if the cap stays: lost service and
-   a provider account that cannot serve.
+   calling the API directly gave the real message immediately. A trigger query
+   may hold only one aggregate — a second is refused with `query: only one
+   non-having aggregate is allowed` — but a **formula** reduces several to one
+   value, and formulas do run on a Metrics dataset. So slot 2 now watches
+   `account_failover + usage_mismatch + idempotent_unknown` and fires above zero,
+   while slot 1 keeps the page for lost service to itself. The cost is that slot
+   2 says something moved rather than which; the `Switchboard gateway` board
+   answers that in one panel, and boards are not capped.
 
-   **Neither existing trigger notifies anyone.** The team has no notification
-   recipients configured, so both evaluate and neither pages. That is worse than
-   having no trigger, because it reads as coverage on a dashboard. Adding a
-   recipient is the remaining work.
+   **Both triggers now notify.** One email recipient, attached to both. They had
+   none, which was worse than having no trigger because it read as coverage.
+
+   **Latency percentiles are unusable, and the histogram is not at fault.**
+   `P50`, `P95` and `P99` on `switchboard.request_duration_milliseconds` all
+   return **-100 ms**. A duration cannot be negative, but the encoding is
+   correct: `HISTOGRAM_COUNT` returns exactly `requests_total`, so every
+   observation is accounted for. The cause is `latencyBounds` in
+   `internal/gateway/telemetry.go`, which starts at 100 ms. Every request so far
+   is faster than that, so all of them land in the first bucket — and the first
+   bucket of an explicit-bounds histogram has no lower bound, so any percentile
+   drawn from it is extrapolation into negative time. Honeycomb's own value axis
+   confirms it: the range tops out at exactly 100, the first bound.
+
+   The fix is a lower floor — bounds at 5, 10, 25 and 50 ms before the existing
+   100 — which changes the Prometheus exposition as well as OTLP and so is a
+   decision rather than a patch. Until then the distribution is readable for
+   shape and the counts are right, but no latency SLO or percentile alarm built
+   on this column means anything. The board panel says so on its face.
 
 6. **Anthropic prompt-cache tokens are not counted.** Responses carry
    `cache_creation_input_tokens` and `cache_read_input_tokens`; neither is
