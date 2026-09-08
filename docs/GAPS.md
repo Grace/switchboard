@@ -105,9 +105,10 @@ Each of these is backed by a run recorded in `docs/VALIDATION.md`.
    as zero; OpenAI reasoning models were unusable because the request sent
    `max_tokens`). See `docs/VALIDATION.md`. What remains open is narrower:
    regional availability and data-retention suitability are still unassessed;
-   `gemini-3.6-flash` is capacity-constrained enough that a run can need several
-   retries and will skip rather than fail when all of them are refused, so a
-   green suite does not always mean Gemini was actually reached; and model names
+   `gemini-3.6-flash` returns 503 under load and 429 when the suite is run in
+   quick succession, so a run can need retries and will skip rather than fail
+   when all of them are refused, meaning a green suite does not by itself prove
+   Gemini was reached; and model names
    proved to be a live dependency rather than a constant, with two of the three
    originally targeted models retired out from under the tests.
 3. **A small `max_tokens` cannot reach a reasoning model that needs more.** The

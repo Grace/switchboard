@@ -379,10 +379,18 @@ configuration. The OpenAI body is now built explicitly, like the other three ada
   caching were ever enabled.
 - **Gemini streams have no `[DONE]` terminator** — the stream simply ends after the frame carrying
   `finishReason`. The adapter already treats a finish reason as completion, so this works.
-- **Gemini capacity is unreliable.** `gemini-3.6-flash` returned 503 "high demand" repeatedly and
-  429 on a short per-minute quota. The live tests now retry both, three attempts with backoff, and
-  skip rather than fail when a provider is busy for all three — a skip records "not verified", which
-  is honest, where a failure would wrongly accuse the adapter.
+- **Gemini throttles, and part of that was self-inflicted.** `gemini-3.6-flash` returned 503 "high
+  demand" repeatedly, which is Google's own capacity signal. It also returned 429 "exceeded your
+  current quota" — that one was a short per-minute limit tripped by running the suite repeatedly in
+  quick succession, not an account problem, and it was initially and wrongly reported as needing
+  billing enabled. The account had prepay credit throughout. A later run with no burst behind it
+  passed all four Gemini cases with no retries at all, in 16 seconds against the 47 to 104 seconds
+  the retrying runs took.
+
+  The live tests retry 503 and 429 three times with backoff and skip rather than fail when all three
+  are refused. A skip records "not verified", which is honest, where a failure would wrongly accuse
+  the adapter. The corollary is worth stating: a green suite does not by itself prove Gemini was
+  reached, so read the per-case output rather than the summary line.
 
 ### Confirmed sound
 
@@ -499,3 +507,25 @@ retry with a higher max_tokens
 It deliberately does **not** suggest a budget that would work. The table above shows that figure is
 not knowable in advance, and a suggestion that then also fails is worse than none. Where a provider
 reports no reasoning count, the message says only that output was absent rather than printing zero.
+
+## 2026-09-08 — a clean live run, all four providers
+
+Every earlier live run had at least one Gemini case skipped on 503 or 429, which was recorded as
+provider capacity. Re-running with no preceding burst of requests passed all twelve cases with no
+retries, in 16 seconds:
+
+| Case | Complete | Streaming | Truncation |
+|---|---|---|---|
+| openai (`gpt-4o-mini`) | `in=14 out=1` | 8 frames | `finish=length` |
+| openai-reasoning (`gpt-5-nano`) | `in=13 out=74` | 2 frames | HTTP 400 |
+| anthropic (`claude-haiku-4-5`) | `in=14 out=4` | 8 frames | `finish=length` |
+| gemini (`gemini-3.6-flash`) | `in=8 out=79` | 2 frames | `finish=length` |
+
+The Gemini figure is the metering fix confirmed once more against the live API: 79 output tokens
+where the pre-fix code would have reported 1, the difference being reasoning billed as output.
+
+Two corrections to the earlier record. Gemini's 429 was a per-minute limit tripped by running the
+suite repeatedly, not an account problem; it was wrongly reported as needing billing enabled when the
+account had prepay credit throughout. Google's 503 "high demand" was real. The distinction matters
+because "the provider is unreliable" and "the test harness is hammering it" call for different
+responses, and only the second was true here.
