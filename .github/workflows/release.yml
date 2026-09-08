@@ -19,8 +19,8 @@ jobs:
       # without a stored access key, and signing without a stored private key.
       id-token: write
     env:
-      GATEWAY_REPO: switchboard-gateway
-      CONTROL_REPO: switchboard-controlplane
+      GATEWAY_REPO: switchboard/gateway
+      CONTROL_REPO: switchboard/controlplane
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
