@@ -67,6 +67,50 @@ def test_telemetry_dedup_and_isolation(setup):
     with pool.connection() as db:
         assert db.execute("SELECT count(*) AS n FROM telemetry").fetchone()["n"] == 0
 
+def _event(**over):
+    e = {"id":uuid.uuid4().hex,"request_id":uuid.uuid4().hex,"trace_id":uuid.uuid4().hex,
+         "span_id":"a"*16,"provider":"openai","status":200,"attempts":1,"start_ns":1,"end_ns":2}
+    e.update(over)
+    return e
+
+def test_telemetry_batch(setup):
+    c,t,_ = setup
+    events = [_event() for _ in range(3)]
+    r = c.post("/v1/telemetry/batch",json={"events":events},headers=auth(t,role="agent"))
+    assert r.status_code == 200
+    # The ids, not a count: the sender deletes exactly what came back, so a
+    # partially applied batch converges rather than losing or resending forever.
+    assert r.json()["accepted"] == [e["id"] for e in events]
+
+    # Idempotent on the event id, which is what makes a retried batch safe: the
+    # ids come back again, and no duplicate rows appear.
+    again = c.post("/v1/telemetry/batch",json={"events":events},headers=auth(t,role="agent"))
+    assert again.status_code == 200 and again.json()["accepted"] == [e["id"] for e in events]
+    stored = c.get("/v1/telemetry",headers=auth(t)).json()
+    assert len([r for r in stored if r["event"]["id"] in {e["id"] for e in events}]) == len(events)
+    # Written under the other tenant's identity, they are invisible to it.
+    assert c.get("/v1/telemetry",headers=auth(t,"tenant-b")).json() == []
+
+def test_telemetry_batch_skips_bad_events_without_failing_the_batch(setup):
+    c,t,_ = setup
+    good, bad = _event(), _event(end_ns=0)   # end_ns < start_ns
+    r = c.post("/v1/telemetry/batch",json={"events":[good,bad]},headers=auth(t,role="agent"))
+    # One malformed event must not fail the batch. The sender retries whatever was
+    # not acknowledged, so a rejected event would otherwise be resent every tick
+    # forever and wedge every event behind it.
+    assert r.status_code == 200
+    assert r.json()["accepted"] == [good["id"]]
+
+def test_telemetry_batch_is_bounded_and_role_gated(setup):
+    c,t,_ = setup
+    assert c.post("/v1/telemetry/batch",json={"events":[_event()]},headers=auth(t,role="viewer")).status_code == 403
+    assert c.post("/v1/telemetry/batch",json={"events":[_event()]}).status_code == 401
+    # Unbounded arrays are a denial-of-service vector against a route that inserts
+    # every element, so the limit is enforced by the model rather than by hand.
+    assert c.post("/v1/telemetry/batch",json={"events":[]},headers=auth(t,role="agent")).status_code == 422
+    too_many = [_event() for _ in range(201)]
+    assert c.post("/v1/telemetry/batch",json={"events":too_many},headers=auth(t,role="agent")).status_code == 422
+
 def test_revocation_and_audit(setup):
     c,t,_=setup
     token=secrets.token_hex(32)

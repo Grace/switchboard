@@ -90,6 +90,34 @@ Each of these is backed by a run recorded in `docs/VALIDATION.md`.
     the check. A completion is used rather than an auth-only endpoint
     because `GET /v1/models` returned 200 on a key whose account had no credits,
     minutes before a completion on the same key returned 429.
+17. **Telemetry delivery is batched.** Delivery was one POST per event, issued
+    sequentially, so its real ceiling was round-trip bound rather than the
+    hundred per tick the cap suggested: comfortable against a control plane in
+    the same task, roughly twenty per second across a network at 50 ms. A spool
+    that cannot drain grows to its cap and then drops events, and those events
+    are billing and audit records.
+
+    Measured after the change, at 150 requests per second for 45 seconds: 6,746
+    events delivered in **47 requests**, 143.5 events each, with the spool
+    empty and zero drops and zero export errors afterwards.
+
+    The control-plane route is additive and the gateway falls back to the
+    per-event route on a 404, or on a 200 that does not carry the expected
+    acknowledgement, so either component can be deployed first. That is what
+    makes this safe to ship while the `Event` token fields are not: those would
+    be rejected by an older control plane's `extra="forbid"`.
+
+    An event the control plane refuses is dropped and counted rather than
+    retried forever, because a deterministic rejection resent every tick would
+    wedge every event queued behind it.
+
+    **Write churn was deliberately not fixed.** `atomicFile` costs three dentry
+    operations per event, which is most of the reclaimable slab growth measured
+    on 2026-09-08. Fixing it means appending to rotating segment files, which
+    widens the crash-loss window from the in-memory queue to the in-memory queue
+    plus the unflushed tail of the open segment. Widening a data-loss window on
+    billing records to make a container memory graph look tidier is the wrong
+    trade, and the slab growth is reclaimable rather than a leak.
 
 ## Still open
 
@@ -237,7 +265,7 @@ Each of these is backed by a run recorded in `docs/VALIDATION.md`.
    compromised shared database session.
 12. **Scale and operations.** Rate limits and circuit state are per process, not
    fleet-wide. There is no retention policy, partitioning, dashboard, SLO, audit
-   export or restore drill. The spool caps at 100 events per tick.
+   export or restore drill.
 13. **The release pipeline exists but has never run.**
     `.github/workflows/release.yml` builds both images on a `v*` tag, attaches
     SBOM and provenance attestations using buildx's own attestation support

@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -196,6 +197,9 @@ type Telemetry struct {
 	wg    sync.WaitGroup
 	http  *http.Client
 	dir   string
+	// perEvent is set once when the control plane turns out to have no batch
+	// route, so the fallback is decided a single time rather than per tick.
+	perEvent atomic.Bool
 	// start anchors cumulative counters. OTLP requires every point of a
 	// cumulative series to carry the same start time, so a consumer can tell a
 	// counter reset from a process restart.
@@ -319,15 +323,37 @@ func (t *Telemetry) persist(e Event) {
 	t.m.SpoolUsed.Add(int64(len(b)))
 	t.m.SpoolCount.Add(1)
 }
+
+// deliverBatch is how many events go in one request, and deliverBatches how many
+// requests one tick may issue. Delivery used to be one POST per event issued
+// sequentially, so its real ceiling was round-trip bound: comfortable against a
+// control plane in the same task, roughly twenty per second across a network at
+// 50 ms. A spool that cannot drain grows to its cap and then drops events, and
+// the events are billing and audit records.
+const (
+	deliverBatch   = 200
+	deliverBatches = 5
+)
+
+// spooled is one file waiting to be sent, kept with its size so the accounting
+// gauges can be corrected exactly when it is removed.
+type spooled struct {
+	path  string
+	id    string
+	size  int64
+	event json.RawMessage
+}
+
 func (t *Telemetry) deliver(ctx context.Context) {
 	files, e := os.ReadDir(t.dir)
 	if e != nil {
 		t.m.DiskErrors.Add(1)
 		return
 	}
-	sent := 0
+	batch := make([]spooled, 0, deliverBatch)
+	sentBatches := 0
 	for _, f := range files {
-		if ctx.Err() != nil || sent >= 100 {
+		if ctx.Err() != nil || sentBatches >= deliverBatches {
 			return
 		}
 		if !strings.HasSuffix(f.Name(), ".json") {
@@ -344,31 +370,135 @@ func (t *Telemetry) deliver(ctx context.Context) {
 			t.m.DiskErrors.Add(1)
 			continue
 		}
-		req, _ := http.NewRequestWithContext(ctx, "POST", trimURL(t.c.ControlURL)+"/v1/telemetry", bytes.NewReader(b))
-		req.Header.Set("Authorization", "Bearer "+os.Getenv(t.c.ControlTokenEnv))
-		req.Header.Set("Content-Type", "application/json")
-		res, e := t.http.Do(req)
+		batch = append(batch, spooled{path: path, id: event.ID, size: int64(len(b)), event: b})
+		if len(batch) < deliverBatch {
+			continue
+		}
+		if !t.send(ctx, batch) {
+			return
+		}
+		batch, sentBatches = batch[:0], sentBatches+1
+	}
+	if len(batch) > 0 && sentBatches < deliverBatches {
+		t.send(ctx, batch)
+	}
+}
+
+// send delivers one batch and removes exactly what the control plane
+// acknowledged. It reports whether the exchange succeeded, so a failing tick
+// stops rather than hammering an unreachable control plane.
+func (t *Telemetry) send(ctx context.Context, batch []spooled) bool {
+	if t.perEvent.Load() {
+		return t.sendPerEvent(ctx, batch)
+	}
+	body := make([]byte, 0, 256*len(batch))
+	body = append(body, []byte(`{"events":[`)...)
+	for i, s := range batch {
+		if i > 0 {
+			body = append(body, ',')
+		}
+		body = append(body, s.event...)
+	}
+	body = append(body, []byte(`]}`)...)
+
+	res, e := t.post(ctx, "/v1/telemetry/batch", body)
+	if e != nil {
+		t.m.ExportErrors.Add(1)
+		return false
+	}
+	ack, _ := io.ReadAll(io.LimitReader(res.Body, 1<<20))
+	res.Body.Close()
+	// An older control plane has no batch route. Fall back for the rest of this
+	// process and say so, because "your control plane predates batching" should
+	// be visible rather than inferred from throughput.
+	if res.StatusCode == 404 || res.StatusCode == 405 {
+		if t.perEvent.CompareAndSwap(false, true) {
+			slog.Info("control plane has no batch telemetry route; falling back to one request per event",
+				"url", trimURL(t.c.ControlURL)+"/v1/telemetry")
+		}
+		return t.sendPerEvent(ctx, batch)
+	}
+	// A pointer distinguishes an absent field from an empty list. An empty list is
+	// a legitimate answer, meaning every event in the batch was rejected as
+	// malformed; an absent one means whatever answered is not the batch route.
+	var a struct {
+		Accepted *[]string `json:"accepted"`
+	}
+	if res.StatusCode != 200 {
+		t.m.ExportErrors.Add(1)
+		return false
+	}
+	if json.Unmarshal(ack, &a) != nil || a.Accepted == nil {
+		// 200 from something that is not the batch route: an older control plane
+		// behind a proxy that does not 404, for instance. Falling back is strictly
+		// better than looping forever acknowledging nothing, which would grow the
+		// spool to its cap and then drop billing records.
+		if t.perEvent.CompareAndSwap(false, true) {
+			slog.Info("control plane did not answer the batch route as expected; falling back to one request per event",
+				"status", res.StatusCode)
+		}
+		return t.sendPerEvent(ctx, batch)
+	}
+	ok := make(map[string]bool, len(*a.Accepted))
+	for _, id := range *a.Accepted {
+		ok[id] = true
+	}
+	// The control plane processed the whole batch and reported what it took, so
+	// anything sent and not acknowledged was refused deterministically and will be
+	// refused again. Keeping it would retry it every tick forever and eventually
+	// fill the spool, so it is dropped and counted: losing one malformed event is
+	// better than losing every event queued behind it.
+	for _, sp := range batch {
+		if ok[sp.id] {
+			t.remove(sp)
+			continue
+		}
+		t.m.Dropped.Add(1)
+		t.remove(sp)
+	}
+	return true
+}
+
+// sendPerEvent is the original path, kept for control planes without the batch
+// route rather than deleted, so this change is safe to deploy in either order.
+func (t *Telemetry) sendPerEvent(ctx context.Context, batch []spooled) bool {
+	for _, sp := range batch {
+		res, e := t.post(ctx, "/v1/telemetry", sp.event)
 		if e != nil {
 			t.m.ExportErrors.Add(1)
-			return
+			return false
 		}
 		ack, e := io.ReadAll(io.LimitReader(res.Body, 8193))
 		res.Body.Close()
 		var a struct {
 			ID string `json:"id"`
 		}
-		if e != nil || res.StatusCode != 200 || json.Unmarshal(ack, &a) != nil || a.ID != event.ID {
+		if e != nil || res.StatusCode != 200 || json.Unmarshal(ack, &a) != nil || a.ID != sp.id {
 			t.m.ExportErrors.Add(1)
-			return
+			return false
 		}
-		if os.Remove(path) != nil {
-			t.m.DiskErrors.Add(1)
-			return
-		}
-		t.m.SpoolUsed.Add(-int64(len(b)))
-		t.m.SpoolCount.Add(-1)
-		sent++
+		t.remove(sp)
 	}
+	return true
+}
+
+func (t *Telemetry) post(ctx context.Context, path string, body []byte) (*http.Response, error) {
+	req, err := http.NewRequestWithContext(ctx, "POST", trimURL(t.c.ControlURL)+path, bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Authorization", "Bearer "+os.Getenv(t.c.ControlTokenEnv))
+	req.Header.Set("Content-Type", "application/json")
+	return t.http.Do(req)
+}
+
+func (t *Telemetry) remove(sp spooled) {
+	if os.Remove(sp.path) != nil {
+		t.m.DiskErrors.Add(1)
+		return
+	}
+	t.m.SpoolUsed.Add(-sp.size)
+	t.m.SpoolCount.Add(-1)
 }
 
 // exportMetrics pushes every counter and gauge over OTLP. It exists because

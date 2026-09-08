@@ -442,3 +442,175 @@ func TestRuntimeGaugesExportAsGaugesOverOTLP(t *testing.T) {
 		}
 	}
 }
+
+// spoolN persists n events and returns their ids.
+func spoolN(t *testing.T, tel *Telemetry, n int) []string {
+	t.Helper()
+	ids := make([]string, n)
+	for i := range ids {
+		ids[i] = randomID(16)
+		tel.persist(Event{ID: ids[i], Start: 1, End: 2})
+	}
+	return ids
+}
+
+// Delivery used to be one POST per event issued sequentially, which made its real
+// ceiling round-trip bound rather than the documented hundred per tick. A spool
+// that cannot drain drops billing and audit records.
+func TestBatchDeliverySendsOneRequestForManyEvents(t *testing.T) {
+	var requests atomic.Int64
+	var got atomic.Int64
+	cp := testHTTP(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests.Add(1)
+		var body struct {
+			Events []Event `json:"events"`
+		}
+		json.NewDecoder(r.Body).Decode(&body)
+		got.Add(int64(len(body.Events)))
+		ids := make([]string, 0, len(body.Events))
+		for _, e := range body.Events {
+			ids = append(ids, e.ID)
+		}
+		w.Write(jsonBytes(map[string]any{"accepted": ids}))
+	}))
+	defer cp.Close()
+	c := Config{DataDir: t.TempDir(), ControlURL: cp.URL, QueueSize: 1, SpoolBytes: 1 << 20}
+	m := &Metrics{}
+	tel, err := NewTelemetry(c, m)
+	if err != nil {
+		t.Fatal(err)
+	}
+	useTestTransport(tel.http)
+	spoolN(t, tel, 50)
+
+	tel.deliver(context.Background())
+	if requests.Load() != 1 {
+		t.Fatalf("%d requests for 50 events; batching did not happen", requests.Load())
+	}
+	if got.Load() != 50 {
+		t.Fatalf("control plane saw %d events, want 50", got.Load())
+	}
+	if m.SpoolCount.Load() != 0 {
+		t.Fatalf("SpoolCount = %d after a full ack", m.SpoolCount.Load())
+	}
+}
+
+// The control plane processes the whole batch and reports what it took, so an
+// event it did not acknowledge was refused deterministically and would be
+// refused again. Keeping it would retry it every tick forever and eventually fill
+// the spool, so it is dropped and counted. Losing one malformed event is better
+// than losing every event queued behind it.
+func TestUnacknowledgedEventsAreDroppedNotRetriedForever(t *testing.T) {
+	var requests atomic.Int64
+	cp := testHTTP(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests.Add(1)
+		var body struct {
+			Events []Event `json:"events"`
+		}
+		json.NewDecoder(r.Body).Decode(&body)
+		// Accept only the first, as though the rest failed validation.
+		w.Write(jsonBytes(map[string]any{"accepted": []string{body.Events[0].ID}}))
+	}))
+	defer cp.Close()
+	c := Config{DataDir: t.TempDir(), ControlURL: cp.URL, QueueSize: 1, SpoolBytes: 1 << 20}
+	m := &Metrics{}
+	tel, err := NewTelemetry(c, m)
+	if err != nil {
+		t.Fatal(err)
+	}
+	useTestTransport(tel.http)
+	spoolN(t, tel, 3)
+
+	tel.deliver(context.Background())
+	if m.SpoolCount.Load() != 0 {
+		t.Fatalf("SpoolCount = %d; refused events would be resent every tick forever", m.SpoolCount.Load())
+	}
+	if m.Dropped.Load() != 2 {
+		t.Errorf("Dropped = %d, want 2; a discarded event must be counted", m.Dropped.Load())
+	}
+	// A second tick has nothing left to do, which is the property that matters:
+	// the queue drained rather than wedging behind what cannot be accepted.
+	tel.deliver(context.Background())
+	if requests.Load() != 1 {
+		t.Errorf("requests = %d, want 1; the spool did not drain", requests.Load())
+	}
+}
+
+// A malformed event that the control plane will never accept must not wedge the
+// queue behind it. The rest of the batch has to make progress.
+func TestOneRejectedEventDoesNotBlockTheRest(t *testing.T) {
+	var rejected string
+	cp := testHTTP(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			Events []Event `json:"events"`
+		}
+		json.NewDecoder(r.Body).Decode(&body)
+		ids := []string{}
+		for _, e := range body.Events {
+			if e.ID == rejected {
+				continue
+			}
+			ids = append(ids, e.ID)
+		}
+		w.Write(jsonBytes(map[string]any{"accepted": ids}))
+	}))
+	defer cp.Close()
+	c := Config{DataDir: t.TempDir(), ControlURL: cp.URL, QueueSize: 1, SpoolBytes: 1 << 20}
+	m := &Metrics{}
+	tel, err := NewTelemetry(c, m)
+	if err != nil {
+		t.Fatal(err)
+	}
+	useTestTransport(tel.http)
+	ids := spoolN(t, tel, 5)
+	rejected = ids[2]
+
+	tel.deliver(context.Background())
+	if m.SpoolCount.Load() != 0 {
+		t.Fatalf("SpoolCount = %d; the queue did not drain past the rejected event", m.SpoolCount.Load())
+	}
+	if m.Dropped.Load() != 1 {
+		t.Errorf("Dropped = %d, want 1; the rejected event should be counted, not silently gone",
+			m.Dropped.Load())
+	}
+}
+
+// A control plane without the batch route must not stall delivery. This is what
+// makes the change deployable in either order.
+func TestFallsBackWhenTheBatchRouteIsMissing(t *testing.T) {
+	var batchCalls, singleCalls atomic.Int64
+	cp := testHTTP(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/batch") {
+			batchCalls.Add(1)
+			w.WriteHeader(404)
+			return
+		}
+		singleCalls.Add(1)
+		var e Event
+		json.NewDecoder(r.Body).Decode(&e)
+		w.Write(jsonBytes(map[string]string{"id": e.ID}))
+	}))
+	defer cp.Close()
+	c := Config{DataDir: t.TempDir(), ControlURL: cp.URL, QueueSize: 1, SpoolBytes: 1 << 20}
+	m := &Metrics{}
+	tel, err := NewTelemetry(c, m)
+	if err != nil {
+		t.Fatal(err)
+	}
+	useTestTransport(tel.http)
+	spoolN(t, tel, 4)
+
+	tel.deliver(context.Background())
+	if m.SpoolCount.Load() != 0 {
+		t.Fatalf("SpoolCount = %d; fallback did not deliver everything", m.SpoolCount.Load())
+	}
+	if singleCalls.Load() != 4 {
+		t.Errorf("per-event calls = %d, want 4", singleCalls.Load())
+	}
+	// Decided once, not re-probed every tick.
+	spoolN(t, tel, 2)
+	tel.deliver(context.Background())
+	if batchCalls.Load() != 1 {
+		t.Errorf("batch route probed %d times; the fallback should be remembered", batchCalls.Load())
+	}
+}

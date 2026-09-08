@@ -13,7 +13,7 @@ from typing import Literal
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from psycopg.rows import dict_row
 from psycopg.conninfo import conninfo_to_dict
 from psycopg.types.json import Jsonb
@@ -48,6 +48,19 @@ class Event(Strict):
     attempts: int = Field(ge=0, le=3)
     start_ns: int = Field(ge=1)
     end_ns: int = Field(ge=1)
+
+class EventBatch(Strict):
+    # Bounded in the model rather than checked by hand: an unbounded array is a
+    # denial-of-service vector against a route that inserts every element, and a
+    # limit the framework enforces cannot be forgotten at a call site.
+    #
+    # Elements are dicts, not Events, deliberately. Typing them as Event would
+    # make one schema-invalid element reject the entire request with 422, and the
+    # sender retries whatever was not acknowledged, so a single bad event would be
+    # resent every tick forever with every other event stuck behind it. Each
+    # element is validated individually in the handler instead, where a failure
+    # costs that event and nothing else.
+    events: list[dict] = Field(min_length=1, max_length=200)
 
 def require(principal: dict, *roles):
     if principal["role"] not in roles:
@@ -172,6 +185,30 @@ def create_app(pool=None, seed=None, key_id=None):
         db.execute("INSERT INTO telemetry(tenant_id,id,event) VALUES(%s,%s,%s) ON CONFLICT DO NOTHING",
                    (p["tenant_id"], body.id, Jsonb(body.model_dump(exclude_none=True))))
         return {"id": body.id}
+
+    # Additive, deliberately. The per-event route above stays, so a gateway that
+    # predates batching keeps working and a gateway that postdates an old control
+    # plane falls back to it on 404. Either component can be deployed first, which
+    # is what makes this safe to ship independently.
+    @app.post("/v1/telemetry/batch")
+    def telemetry_batch(body: EventBatch, s=Depends(session, scope="function")):
+        db, p = s
+        require(p, "agent")
+        accepted = []
+        for raw in body.events:
+            # Per element, so a malformed one costs itself and not the batch.
+            try:
+                e = Event.model_validate(raw)
+            except ValidationError:
+                continue
+            if e.end_ns < e.start_ns or e.end_ns > time.time_ns() + 60_000_000_000:
+                continue
+            db.execute("INSERT INTO telemetry(tenant_id,id,event) VALUES(%s,%s,%s) ON CONFLICT DO NOTHING",
+                       (p["tenant_id"], e.id, Jsonb(e.model_dump(exclude_none=True))))
+            accepted.append(e.id)
+        # The ids, not a count: the sender deletes exactly these, so a partially
+        # applied batch converges instead of losing events or resending forever.
+        return {"accepted": accepted}
 
     @app.get("/v1/telemetry")
     def telemetry_list(s=Depends(session, scope="function")):
