@@ -158,6 +158,9 @@ type Server struct {
 	slots       chan struct{}
 	rate, retry *bucket
 	circuits    map[string]*circuit
+	// budgets remembers which models have been seen returning nothing at a given
+	// token budget, so a request is not sent to a route already watched fail.
+	budgets *budgetTable
 	// Idem is nil unless idempotency_ttl_seconds is set. Nil means the feature is
 	// off and a key is refused, which is the behaviour before it existed.
 	Idem     *idemStore
@@ -172,7 +175,7 @@ type Server struct {
 }
 
 func New(c Config, p *PolicyStore, m *Metrics, t *Telemetry) *Server {
-	return &Server{C: c, Policies: p, Metrics: m, Telemetry: t, HTTP: client(time.Duration(c.TimeoutSeconds) * time.Second), slots: make(chan struct{}, c.Concurrency), rate: newBucket(c.Rate, c.Burst), retry: newBucket(c.RetryRate, c.RetryRate), circuits: map[string]*circuit{"openai": {}, "anthropic": {}, "gemini": {}, "bedrock": {}}}
+	return &Server{C: c, Policies: p, Metrics: m, Telemetry: t, HTTP: client(time.Duration(c.TimeoutSeconds) * time.Second), slots: make(chan struct{}, c.Concurrency), rate: newBucket(c.Rate, c.Burst), retry: newBucket(c.RetryRate, c.RetryRate), circuits: map[string]*circuit{"openai": {}, "anthropic": {}, "gemini": {}, "bedrock": {}}, budgets: newBudgetTable()}
 }
 
 // ready reports whether this gateway can serve a request. It deliberately does
@@ -404,12 +407,43 @@ func (s *Server) chat(w http.ResponseWriter, r *http.Request) {
 		fail(503, "policy expired")
 		return
 	}
+	// Decided before the loop, because the answer depends on all the routes: if
+	// every eligible one would be skipped, none is. Refusing to try is worse than
+	// trying and failing over, and a gateway that returns 503 without contacting
+	// anyone has stopped being a gateway. A policy whose routes are all reasoning
+	// models is exactly the case this exists for, and exactly the case that would
+	// otherwise be refused outright.
+	skip := map[int]bool{}
+	eligible := 0
+	for i, route := range p.Routes {
+		if _, ok := s.C.Providers[route.Provider]; !ok {
+			continue
+		}
+		if c.Stream && !streams(route.Provider) {
+			continue
+		}
+		eligible++
+		if s.budgets.skip(route.Provider, route.Model, c.MaxTokens) {
+			skip[i] = true
+		}
+	}
+	if len(skip) == eligible {
+		skip = map[int]bool{}
+	}
+
 	// Providers that answered and produced no text, so an exhausted loop can say
 	// which ones and why rather than reporting a generic routing failure.
 	var empties []emptyRoute
-	for _, route := range p.Routes {
+	for i, route := range p.Routes {
 		pc, ok := s.C.Providers[route.Provider]
 		if !ok {
+			continue
+		}
+		if skip[i] {
+			// Observed returning nothing at this budget, and never observed
+			// succeeding at or below it. Trying anyway spends the caller's money
+			// to learn what is already known.
+			s.Metrics.BudgetSkip.Add(1)
 			continue
 		}
 		if event.Attempts >= s.C.MaxAttempts {
@@ -534,6 +568,7 @@ func (s *Server) chat(w http.ResponseWriter, r *http.Request) {
 				// byte. It is healthy, so the circuit closes; the request is
 				// still unanswered, so it moves on.
 				s.circuits[route.Provider].result(false)
+				s.budgets.observe(route.Provider, route.Model, c.MaxTokens, false)
 				empties = append(empties, emptyRoute{provider: route.Provider, model: route.Model, budget: c.MaxTokens})
 				s.Metrics.EmptyCompletion.Add(1)
 				slog.Warn("provider produced no output within the token budget", "request_id", id,
@@ -546,6 +581,7 @@ func (s *Server) chat(w http.ResponseWriter, r *http.Request) {
 				event.Status = 502
 				idemSettled = s.settleUnknown(idemKey, hashBody(b))
 			} else {
+				s.budgets.observe(route.Provider, route.Model, c.MaxTokens, streamed.text != "")
 				if len(empties) > 0 {
 					s.Metrics.EmptyCompletionRecovered.Add(1)
 				}
@@ -588,6 +624,7 @@ func (s *Server) chat(w http.ResponseWriter, r *http.Request) {
 			// The provider is healthy, so the circuit was already reset above.
 			// Nothing has been written to the client yet, so failing over does
 			// not violate the no-replay-after-acceptance rule.
+			s.budgets.observe(route.Provider, route.Model, c.MaxTokens, false)
 			empties = append(empties, emptyRoute{route.Provider, route.Model, c.MaxTokens, n.Reasoning})
 			s.Metrics.EmptyCompletion.Add(1)
 			slog.Warn("provider produced no output within the token budget", "request_id", id,
@@ -595,6 +632,7 @@ func (s *Server) chat(w http.ResponseWriter, r *http.Request) {
 				"max_tokens", c.MaxTokens, "reasoning_tokens", n.Reasoning)
 			continue
 		}
+		s.budgets.observe(route.Provider, route.Model, c.MaxTokens, true)
 		if len(empties) > 0 {
 			s.Metrics.EmptyCompletionRecovered.Add(1)
 		}

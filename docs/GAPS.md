@@ -139,34 +139,37 @@ Each of these is backed by a run recorded in `docs/VALIDATION.md`.
    Gemini was reached; and model names
    proved to be a live dependency rather than a constant, with two of the three
    originally targeted models retired out from under the tests.
-3. **A small `max_tokens` cannot reach a reasoning model that needs more.** The
-   gateway fails over when a provider returns 200 with no text, counts
-   `switchboard_empty_completion_total`, and now names the offending routes and
-   the reasoning tokens they consumed so the caller can act. What it does not do
-   is avoid the route in the first place, so a policy whose routes are all
-   reasoning models still fails most default-budget requests.
+3. **Budget-aware routing, on measured behaviour.** A route is skipped when that
+   model was already seen returning no text at the caller's `max_tokens`, and has
+   never been seen succeeding at or below it. The gateway used to discover this
+   per request, pay for it, and fail over; it now avoids the call.
 
-   `ParseChat` still defaults `max_tokens` to 1024. Measured against
-   `gpt-5-nano`, that default returned **zero characters for four of seven
-   ordinary prompts**, including "list three uses for a paperclip". Raising the
-   default is not the fix and has been ruled out on evidence: 4096 still returned
-   nothing for a 500-word essay prompt, while `gpt-4o-mini` answered that same
-   prompt inside 666 billed tokens. There is no static number that is both
-   sufficient for reasoning models and not a tax on everything else. Reasoning
-   demand is not even stable per prompt: the same request consumed 1920 reasoning
-   tokens at a budget of 2048 and 1152 at 4096.
+   Verified live against real providers with a policy of `openai:gpt-5-nano` then
+   `anthropic:claude-haiku-4-5`: the first 1024-token request reported
+   `X-Switchboard-Attempts: 2` after the reasoning model returned nothing, and an
+   identical second request reported `1`, having skipped it. Both callers got a
+   real answer of over 1,500 characters.
 
-   Two decisions are deliberately open rather than forgotten:
+   Two facts per model, not a statistic: the largest budget seen producing
+   nothing, and the smallest seen producing text. Averaging would be confidently
+   wrong, because the same prompt consumed 1920 reasoning tokens at a budget of
+   2048 and 1152 at 4096. A single success overrides any number of failures, so
+   the rule corrects itself rather than latching, which bounds its known
+   imprecision: demand depends on the prompt, so a hard prompt failing can
+   briefly shadow an easy one at the same budget.
 
-   - **Budget-aware routing.** Track observed reasoning demand per provider and
-     model, and skip a route whose demand exceeds the caller's budget in favour
-     of one that can answer. This is the actual fix, it is what a router is for,
-     and the reasoning-token signal it needs is already being collected. Deferred
-     by choice, to be taken up next.
-   - **Whether `max_tokens` may ever be exceeded** to obtain an answer. Today it
-     never is: the caller's cap is treated as a hard spending limit, and the
-     gateway routes around the problem rather than quietly spending more than was
-     authorised. Left open.
+   **If every eligible route would be skipped, none is.** Refusing to try is
+   worse than trying and failing over, and a policy whose routes are all
+   reasoning models is exactly the case this exists for. Observations are bounded
+   and expire after six hours, because model behaviour moves: two of the three
+   models named in the live tests were retired by their providers mid-project.
+
+   `ParseChat` still defaults `max_tokens` to 1024, and that is still the budget
+   measured returning nothing for four of seven ordinary prompts on `gpt-5-nano`.
+   Raising it remains ruled out on evidence: 4096 also returned nothing for a
+   500-word essay prompt, while `gpt-4o-mini` answered it inside 666 billed
+   tokens. Routing around the problem is the fix; a bigger number is not.
+
 4. **Metrics only leave the task if you configure it.** `/metrics` is loopback
    only, and the scraping collector is an opt-in container absent from both
    CloudFormation templates and the sample task definition, so a default
