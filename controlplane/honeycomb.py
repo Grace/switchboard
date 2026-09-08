@@ -1,12 +1,15 @@
 """Provision the Honeycomb alerting for a Switchboard deployment.
 
+The conditions come from ``alerting.py``, which knows nothing about Honeycomb.
+This file is the Honeycomb emitter: it applies the OTLP spelling, folds the
+conditions to fit this vendor's trigger cap, and talks to the API.
+
 The alerting for this gateway existed for a while only because someone made a
 series of API calls by hand, which meant a deployer got the documented advice to
 create triggers and no means of doing it. This creates the same two triggers, one
 recipient and one board in any Honeycomb environment, from flags.
 
-    python -m controlplane.honeycombtool \\
-      --dataset Metrics --recipient ops@example.com
+    python -m controlplane.honeycomb --dataset Metrics --recipient ops@example.com
 
 There is no --env flag. A v1 API key is scoped to one environment, so the key
 already chooses it and a flag would only imply a choice that is not there. The
@@ -39,17 +42,22 @@ import time
 import urllib.error
 import urllib.request
 
+from . import alerting
+
 API = "https://api.honeycomb.io"
 
 BOARD_NAME = "Switchboard gateway"
 
-PAGE_TRIGGER = "Lost service: every route returned nothing"
+# The page trigger's name comes from the condition itself. The notify trigger is
+# an invention of this emitter -- it corresponds to no single condition, only to
+# the plan limit that forced three of them together -- so it is named here.
+PAGE_TRIGGER = alerting.condition("lost_service").summary
 NOTIFY_TRIGGER = "Something needs a person: billing, metering or an ambiguous retry"
 
 
 class Fatal(SystemExit):
     def __init__(self, msg):
-        super().__init__(f"honeycombtool: {msg}")
+        super().__init__(f"honeycomb: {msg}")
 
 
 def api(key: str, method: str, path: str, body=None):
@@ -130,7 +138,17 @@ def preflight(key: str) -> dict:
     return auth
 
 
-def counter(column: str, name: str, window: int) -> dict:
+# Honeycomb receives the OTLP spelling: "switchboard." + name. The Prometheus
+# exposition uses "switchboard_" + name instead, and alerting.py stores neither,
+# so this prefix is the one place the dotted form is written.
+PREFIX = "switchboard."
+
+
+def column(metric: str) -> str:
+    return PREFIX + metric
+
+
+def counter(metric: str, alias: str, window: int) -> dict:
     """A query for one cumulative counter over the trigger's own window.
 
     SUM, never RATE_SUM. On a Metrics dataset Honeycomb applies the counter's
@@ -139,164 +157,117 @@ def counter(column: str, name: str, window: int) -> dict:
     the query engine. A trigger holding one is accepted and then never evaluates.
     """
     return {
-        "calculations": [{"column": column, "op": "SUM", "name": name}],
+        "calculations": [{"column": column(metric), "op": "SUM", "name": alias}],
         "time_range": window,
     }
 
 
-def combined(columns: dict[str, str], window: int) -> dict:
+def combined(conditions, window: int) -> dict:
     """Several counters reduced to one value, so one trigger can watch them all.
 
     A trigger query may hold only one aggregate -- a second is refused with
     "only one non-having aggregate is allowed" -- but a formula collapses many
-    into one, and formulas are permitted on a Metrics dataset. This is what makes
-    four alertable conditions fit in the free plan's two triggers.
+    into one, and formulas are permitted on a Metrics dataset.
     """
     return {
         "calculations": [
-            {"column": col, "op": "SUM", "name": alias} for alias, col in columns.items()
+            {"column": column(c.metric), "op": "SUM", "name": c.key} for c in conditions
         ],
         "formulas": [
-            {"name": "needs_a_human", "expression": " + ".join("$" + a for a in columns)}
+            {"name": "needs_a_human", "expression": " + ".join("$" + c.key for c in conditions)}
         ],
         "time_range": window,
     }
 
 
 def triggers() -> list[dict]:
-    """The two triggers, in the order their slots matter.
+    """The conditions from alerting.py, folded to fit Honeycomb's trigger cap.
 
-    The page stays alone. It is the only one of the four conditions that is an
-    outage, and folding anything else into it would blunt the single alert that
-    should wake someone.
+    Switchboard defines four conditions. The Honeycomb free plan allows two
+    triggers per team, so the three notify conditions are summed into one and the
+    page keeps a trigger to itself. That folding is a compromise with this
+    vendor's pricing, not something Switchboard believes about its counters,
+    which is why it happens here and not in alerting.py -- the Prometheus emitter
+    reads the same definitions and writes four separate rules.
+
+    The page stays alone deliberately. It is the only one of the four that is an
+    outage, and merging anything into it would blunt the single alert that should
+    wake someone.
     """
-    return [
-        {
-            "name": PAGE_TRIGGER,
-            "description": (
-                "switchboard.empty_completion_failed_total increased: every route produced no "
-                "output and the caller received a 503. This is lost service, not degraded "
-                "service. Page. Recovered empty completions are deliberately not alerted - those "
-                "are spend and latency, not an outage."
-            ),
-            "query": counter("switchboard.empty_completion_failed_total", "failed", 300),
+    out = []
+    for cond in alerting.by_urgency(alerting.PAGE):
+        out.append({
+            "name": cond.summary,
+            "description": f"{PREFIX}{cond.metric} increased. {cond.detail}",
+            "query": counter(cond.metric, cond.key, cond.window),
             "threshold": {"op": ">", "value": 0},
-            "frequency": 300,
+            "frequency": cond.window,
             "alert_type": "on_change",
             "tags": [
                 {"key": "service", "value": "switchboard"},
-                {"key": "urgency", "value": "page"},
+                {"key": "urgency", "value": cond.urgency},
             ],
-        },
-        {
+        })
+
+    notify = alerting.by_urgency(alerting.NOTIFY)
+    if notify:
+        # The notification carries this text and nothing else, and it cannot say
+        # which of the three moved. So it names all three, and points at the
+        # board, or it is an alert nobody can act on without guessing.
+        detail = " ".join(f"{PREFIX}{c.metric}: {c.detail}" for c in notify)
+        window = max(c.window for c in notify)
+        out.append({
             "name": NOTIFY_TRIGGER,
             "description": (
-                "One of three counters moved. They are watched together because the Honeycomb "
+                "One of several counters moved. They are watched together because the Honeycomb "
                 "free plan allows two triggers in total, not because they belong together; open "
-                "the Switchboard gateway board to see which one moved. account_failover_total: a "
-                "provider account is out of credits, below its balance floor, or has lost its "
-                "quota. usage_mismatch_total: a provider's own token totals did not add up, so "
-                "metering taken from that response may be wrong and any invoice covering the "
-                "window is suspect. idempotent_unknown_total: a retry was refused because the "
-                "original outcome was ambiguous."
+                f"the {BOARD_NAME} board to see which one moved. " + detail
             ),
-            "query": combined(
-                {
-                    "failover": "switchboard.account_failover_total",
-                    "mismatch": "switchboard.usage_mismatch_total",
-                    "unknown": "switchboard.idempotent_unknown_total",
-                },
-                900,
-            ),
+            "query": combined(notify, window),
             "threshold": {"op": ">", "value": 0},
-            "frequency": 900,
+            "frequency": window,
             "alert_type": "on_change",
             "tags": [
                 {"key": "service", "value": "switchboard"},
-                {"key": "urgency", "value": "notify"},
+                {"key": "urgency", "value": alerting.NOTIFY},
             ],
-        },
-    ]
+        })
+    return out
 
 
-def sums(*columns: str) -> dict:
-    return {"calculations": [{"column": c, "op": "SUM"} for c in columns], "time_range": 86400}
+def sums(*metrics: str) -> dict:
+    return {
+        "calculations": [{"column": column(m), "op": "SUM"} for m in metrics],
+        "time_range": 86400,
+    }
 
 
 def board_queries() -> list[tuple[str, str, dict]]:
-    """The panels, in reading order. The first is the one an alert sends you to."""
-    return [
-        (
-            "Which one moved",
-            "The three counters behind the combined notify trigger, separately. This is the "
-            "panel that trigger sends you to.",
-            sums(
-                "switchboard.account_failover_total",
-                "switchboard.usage_mismatch_total",
-                "switchboard.idempotent_unknown_total",
-            ),
-        ),
-        (
-            "Empty completions",
-            "Total, recovered and failed. Recovered means a later route answered: the caller was "
-            "served but two providers were paid and both were waited for. Failed means nobody "
-            "answered.",
-            sums(
-                "switchboard.empty_completion_total",
-                "switchboard.empty_completion_recovered_total",
-                "switchboard.empty_completion_failed_total",
-            ),
-        ),
-        (
-            "Idempotency",
-            "Replay is the mechanism working. Conflict is a reused key with a different body. "
-            "Unknown is the sticky state, where the original outcome could not be established "
-            "and the retry was refused rather than charged twice.",
-            sums(
-                "switchboard.idempotent_replay_total",
-                "switchboard.idempotent_conflict_total",
-                "switchboard.idempotent_unknown_total",
-            ),
-        ),
-        (
-            "Traffic, errors, retries",
-            "Denominator for everything above. Retries and rate limiting without a matching rise "
-            "in errors means the gateway absorbed provider trouble rather than passing it on.",
-            sums(
-                "switchboard.requests_total",
-                "switchboard.errors_total",
-                "switchboard.retries_total",
-                "switchboard.rate_limited_total",
-            ),
-        ),
-        (
-            "Request duration (shape only)",
-            "The counts are right and the shape is readable. Percentiles are not: traffic below "
-            "the lowest bucket bound falls in a bucket with no lower edge, so a percentile there "
-            "extrapolates below zero and reports a negative duration.",
-            {
-                "calculations": [
-                    {"column": "switchboard.request_duration_milliseconds", "op": "HEATMAP"}
-                ],
-                "time_range": 86400,
-            },
-        ),
-    ]
+    """The panels from alerting.py, plus the latency distribution.
+
+    Latency is appended here rather than defined as a panel because it is a
+    histogram and every backend aggregates one differently; HEATMAP is
+    Honeycomb's answer and means nothing to Prometheus.
+    """
+    out = [(p.title, p.caption, sums(*p.metrics)) for p in alerting.PANELS]
+    out.append((
+        "Request duration (shape only)",
+        "The counts are right and the shape is readable. Percentiles are not: traffic below the "
+        "lowest bucket bound falls in a bucket with no lower edge, so a percentile there "
+        "extrapolates below zero and reports a negative duration.",
+        {
+            "calculations": [{"column": column(alerting.LATENCY_METRIC), "op": "HEATMAP"}],
+            "time_range": 86400,
+        },
+    ))
+    return out
 
 
-BOARD_TEXT = """## Start here when a trigger fires
+BOARD_TEXT = alerting.OVERVIEW + """
 
-Two triggers cover four conditions, because the Honeycomb free plan allows two triggers in total.
-That is a plan limit, not a judgement that these conditions belong together.
-
-**Lost service** pages on `empty_completion_failed_total`: every route produced no output and the
-caller got a 503. That one names its own cause.
-
-**Something needs a person** notifies on the sum of three counters, so it tells you that something
-moved but not which. The first panel below is the answer.
-
-`empty_completion_recovered_total` deliberately has no trigger. A later route answered, so the
-caller was served; it is spend and latency rather than an outage. Watch it here instead."""
+The triggers on this environment cover those conditions in two slots, because the Honeycomb free
+plan allows two triggers in total. The page names its own cause; the notify trigger sums several
+counters and cannot say which moved, so the first panel below is the answer."""
 
 
 def find_by_name(items, name: str):
@@ -451,7 +422,7 @@ def apply(key: str, dataset: str, recipient: str | None, dry_run: bool = False) 
 
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(
-        prog="python -m controlplane.honeycombtool",
+        prog="python -m controlplane.honeycomb",
         description="Create or update the Switchboard triggers, recipient and board in Honeycomb.",
     )
     ap.add_argument("--dataset", default="Metrics",

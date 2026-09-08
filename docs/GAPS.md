@@ -422,20 +422,46 @@ Each of these is backed by a run recorded in `docs/VALIDATION.md`.
 12. **Scale and operations.** Rate limits and circuit state are per process, not
    fleet-wide. There is no retention policy, partitioning, dashboard, SLO, audit
    export or restore drill.
-13. **The release pipeline exists but has never run.**
-    `.github/workflows/release.yml` builds both images on a `v*` tag, attaches
-    SBOM and provenance attestations using buildx's own attestation support
-    rather than a third-party action, signs each image by digest with keyless
-    cosign, and verifies the signature it just made. Images are no longer
-    specified as built by hand.
+13. **A release pipeline has run three times; the current rewrite has not.**
+    An earlier heading here said the pipeline had never run, and that was wrong
+    in the direction that matters: it understated what already ships.
 
-    **None of it has executed.** It needs the OIDC role from
+    Three `release` runs completed successfully, roughly four minutes each, on
+    tags this repository still carries:
+
+    | tag | run | date |
+    | --- | --- | --- |
+    | `v0.1.0` | 33892592190 | 2026-09-04 |
+    | `v0.2.0` | 33937475292 | 2026-09-05 |
+    | `v0.3.0` | 33975323568 | 2026-09-05 |
+
+    `git show v0.3.0:.github/workflows/release.yml` shows what executed:
+    `anchore/sbom-action/download-syft`, `sigstore/cosign-installer`,
+    `id-token: write`, a buildx build, and `cosign sign` against an
+    `ghcr.io/grace/switchboard` digest. Signing by digest requires the image to
+    have been pushed first, so **signed images with SBOMs shipped, three times,
+    not by hand.** Whether those ghcr packages still exist is unconfirmed: the
+    available token lacks `read:packages`, so the runs are evidence they were
+    published and not evidence they are still there.
+
+    **The current file is a rewrite and none of it has executed.**
+    `release.yml` was added on 2026-09-04 (`eadf81b`), removed, and re-added on
+    2026-09-08 (`05edca5`); it differs from the v0.3.0 version by 71 insertions
+    and 47 deletions. The differences are the substance: buildx's own
+    `--sbom=true --provenance=mode=max` replaces the third-party syft action,
+    every action is pinned by full commit SHA where before they floated on `@v0`
+    and `@v3`, the target moved from ghcr to ECR with
+    `aws-actions/configure-aws-credentials`, and a step verifies the signature it
+    just made.
+
+    That rewrite needs the OIDC role from
     `deploy/cloudformation/github-oidc.yaml`, which is written but not deployed,
     and it could not be rehearsed locally: the attestation flags require buildx
     0.10 or later on the `docker-container` driver, and the machine it was
-    written on has 0.8.2 on the `docker` driver. What is verified is that the
-    workflow parses, that every action is pinned to a SHA confirmed to be a real
-    commit, and that the trigger admits tags only.
+    written on has buildx 0.8.2 with only `docker`-driver builders, on Docker
+    Engine 20.10.17. What is verified is that the workflow parses, that every
+    action is pinned to a SHA confirmed to be a real commit, and that the trigger
+    admits tags only.
 14. **Infrastructure assumptions.** `controlplane.yaml` requires an existing VPC,
     subnets, IAM roles, KMS keys, ECS cluster and load balancer target group.
     `quickstart.yaml` removes all of those except the certificate.

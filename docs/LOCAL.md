@@ -217,7 +217,7 @@ credential is written into the gateway's config file.
 | Variable | Kind | Used by |
 |---|---|---|
 | `HONEYCOMB_API_KEY` | Ingest | The gateway, to authenticate its OTLP export |
-| `HONEYCOMB_CONFIG_KEY` | Configuration | `honeycombtool` only, never the gateway |
+| `HONEYCOMB_CONFIG_KEY` | Configuration | `controlplane/honeycomb.py` only, never the gateway |
 
 `.dev/env` is passed to the gateway container wholesale as `env_file`, so anything in it is readable
 by the data plane. An ingest key there is correct: it can send telemetry and nothing else. A
@@ -225,7 +225,7 @@ by the data plane. An ingest key there is correct: it can send telemetry and not
 which is the same mistake as letting it sign the policy it enforces — and the reason `policytool`
 is not part of the gateway binary either.
 
-`honeycombtool` therefore reads `HONEYCOMB_CONFIG_KEY` and will not fall back to the other variable.
+`controlplane/honeycomb.py` therefore reads `HONEYCOMB_CONFIG_KEY` and will not fall back to the other variable.
 Export it in your shell when you run the tool rather than adding it to `.dev/env`.
 
 Honeycomb mints both kinds in its UI under **Environment settings > API keys**; nothing here creates
@@ -236,7 +236,7 @@ Triggers, Manage Boards, Manage Recipients and Run Queries** — new keys do not
 default.
 
 Both the gateway and this tooling reach any OTLP backend. Grafana Cloud takes Basic auth, Datadog
-takes `dd-api-key`, a local collector takes no header at all; only `honeycombtool.py` knows what
+takes `dd-api-key`, a local collector takes no header at all; only `controlplane/honeycomb.py` knows what
 Honeycomb is.
 
 ## Verifying against real providers

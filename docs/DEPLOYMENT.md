@@ -122,15 +122,51 @@ counter that only ever climbs stays above any threshold once crossed.
 `switchboard.empty_completion_recovered_total` is worth a graph rather than a trigger: it is spend
 and latency, not an outage, and budget-aware routing should drive it toward zero on its own.
 
-### Provisioning them
+### Where the alert conditions live
 
-`controlplane/honeycombtool.py` creates the recipient, both triggers and the board in any
+`controlplane/alerting.py` holds the four conditions, what each one means, and which of them is an
+outage. It contains no vendor: no API calls, no query syntax, and **no metric prefix**. Two emitters
+read it.
+
+| Emitter | Backend | Spelling it applies | Alerts produced |
+|---|---|---|---|
+| `controlplane/honeycomb.py` | Honeycomb, over OTLP | `switchboard.<name>` | 2 triggers |
+| `controlplane/prometheus.py` | Anything scraping `/metrics` | `switchboard_<name>` | 4 rules |
+
+The two counts are not a discrepancy. There are four conditions; Honeycomb's free plan allows two
+triggers per team, so that emitter folds the three notify conditions into one formula. Prometheus
+has no such cap and gets one rule each. **The folding is a compromise with a vendor's pricing, not
+something Switchboard believes about its own counters**, which is why it lives in the emitter.
+
+The prefixes are the other reason for the split. The gateway publishes every counter twice, and the
+two paths spell it differently: `/metrics` writes `switchboard_empty_completion_failed_total`, OTLP
+writes `switchboard.empty_completion_failed_total`. Building an alert against the wrong one produces
+a rule referencing something that does not exist, which Honeycomb accepts and never fires. Holding
+the bare name in one place and letting each emitter apply its own spelling makes that unwritable
+rather than merely documented.
+
+A third backend is a third emitter reading the same conditions, not an edit to any of this.
+
+### Prometheus
+
+```sh
+python -m controlplane.prometheus --out switchboard.rules.yml
+```
+
+Writes standard alerting rules, using `increase(...[window]) > 0` rather than a rate: these are rare
+events, and a rate turns "one account failed over" into a small fraction with a threshold nobody can
+reason about. The generated file also lists, as comments, the counters that are deliberately *not*
+alerted and why — `empty_completion_recovered_total` above all, since the caller was served.
+
+### Honeycomb
+
+`controlplane/honeycomb.py` creates the recipient, both triggers and the board in any
 Honeycomb environment, and is safe to re-run: everything is matched by name and updated in place.
 
 ```sh
 export HONEYCOMB_CONFIG_KEY=...     # a Configuration key
-python -m controlplane.honeycombtool --dataset Metrics --recipient ops@example.com
-python -m controlplane.honeycombtool --dataset Metrics --recipient ops@example.com --dry-run
+python -m controlplane.honeycomb --dataset Metrics --recipient ops@example.com
+python -m controlplane.honeycomb --dataset Metrics --recipient ops@example.com --dry-run
 ```
 
 **Not `HONEYCOMB_API_KEY`.** That variable holds the *ingest* key the gateway itself reads to
@@ -205,6 +241,24 @@ Two consequences worth knowing before you read that banner as a fault in the gat
 The triggers above carry none of this. They evaluate on their own schedule with no coverage
 requirement, which is the reason to set them up rather than wait for detection to turn itself on.
 It will, once coverage recovers, and nothing needs re-configuring when it does.
+
+**The plan tier is not what stands in the way.** Coverage measures whether data is *present* across
+evaluation windows, not how much of it there is, and Honeycomb's free plan allows 20M events and
+100M metric datapoints a month. The traffic needed to satisfy coverage costs almost none of that:
+
+| Traffic | Monthly | Share of the free allowance |
+|---|---|---|
+| One request a minute | ~43,000 spans | 0.2% of 20M |
+| One request a second | ~2.6M spans | 13% of 20M |
+| Metrics alone, running continuously at the 30s export interval | ~2.4M datapoints | 2.4% of 100M |
+
+What is actually required is a service that runs and receives requests more or less continuously.
+Metrics do not help: coverage for the traces dataset counts spans, and spans are emitted per
+request, so an idle gateway accumulates none however long it stays up.
+
+A synthetic request every minute would satisfy coverage cheaply. It would also dilute the error rate
+that detection is baselining, so whether that is worth doing depends on how much real traffic it
+would be diluting — which is a decision to take with traffic in hand, not in advance.
 
 ### What to alarm on
 

@@ -7,7 +7,8 @@ produces a trigger that is accepted and never fires.
 """
 import pytest
 
-from controlplane.honeycombtool import (
+from controlplane import alerting
+from controlplane.honeycomb import (
     NEEDED,
     NOTIFY_TRIGGER,
     PAGE_TRIGGER,
@@ -47,15 +48,16 @@ def test_notify_trigger_reduces_three_counters_to_one_value():
     non-having aggregate is allowed", which is what makes this the mechanism
     that fits four alertable conditions into the free plan's two triggers.
     """
-    q = combined({"a": "col.a", "b": "col.b", "c": "col.c"}, 900)
-    assert len(q["calculations"]) == 3
+    q = combined(alerting.by_urgency(alerting.NOTIFY), 900)
+    notify = alerting.by_urgency(alerting.NOTIFY)
+    assert len(q["calculations"]) == len(notify) == 3
     assert len(q["formulas"]) == 1
-    assert q["formulas"][0]["expression"] == "$a + $b + $c"
+    assert q["formulas"][0]["expression"] == " + ".join("$" + c.key for c in notify)
     # Every alias the formula names has to exist as a calculation, or the
     # expression references nothing and the threshold compares against nothing.
     names = {c["name"] for c in q["calculations"]}
-    for alias in ("a", "b", "c"):
-        assert alias in names
+    for c in notify:
+        assert c.key in names
 
 
 def test_page_trigger_watches_only_lost_service():
@@ -69,7 +71,7 @@ def test_page_trigger_watches_only_lost_service():
     assert len(page["query"]["calculations"]) == 1
     assert "formulas" not in page["query"]
     assert page["query"]["calculations"][0]["column"] == "switchboard.empty_completion_failed_total"
-    assert dict(page["tags"][1])["value"] == "page"
+    assert dict(page["tags"][1])["value"] == alerting.PAGE
 
 
 def test_every_trigger_fires_above_zero():
@@ -84,8 +86,10 @@ def test_trigger_window_covers_its_evaluation_interval():
         assert spec["query"]["time_range"] >= spec["frequency"]
 
 
-def test_counter_helper_names_its_calculation():
-    q = counter("switchboard.x_total", "x", 300)
+def test_counter_helper_applies_the_otlp_prefix():
+    """The bare name goes in, the dotted name comes out. alerting.py stores
+    neither spelling, so this is where the OTLP one is added."""
+    q = counter("x_total", "x", 300)
     assert q["calculations"] == [{"column": "switchboard.x_total", "op": "SUM", "name": "x"}]
     assert q["time_range"] == 300
 
@@ -116,8 +120,8 @@ def test_descriptions_carry_the_counter_names():
     cannot say which counter moved, so the text has to name all three or the
     alert is unactionable on its own."""
     notify = next(t for t in triggers() if t["name"] == NOTIFY_TRIGGER)
-    for col in ("account_failover_total", "usage_mismatch_total", "idempotent_unknown_total"):
-        assert col in notify["description"]
+    for c in alerting.by_urgency(alerting.NOTIFY):
+        assert c.metric in notify["description"]
 
 
 def test_board_panels_are_described():
