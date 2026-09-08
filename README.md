@@ -58,3 +58,21 @@ The Postgres tests need a **disposable dedicated cluster** and `TEST_DATABASE_UR
 Follow [deployment](docs/DEPLOYMENT.md), then [security and rotation](docs/SECURITY.md). No real credentials, private signing keys or Terraform state belong in this repository. The `.env.example` contains runtime references only.
 
 Directories: `cmd/gateway`, `internal/gateway`, `controlplane`, `deploy`, `scripts`, `testdata`, and `docs`. The fixture public key in `testdata` is intentionally test-only and is not a deployment trust key.
+
+## License
+
+Source available under the [Elastic License 2.0](LICENSE). Not an OSI-approved
+open source license, and the project should not be described as open source.
+
+You may read, audit, modify, self-host and run Switchboard in production,
+including commercially. You may not offer it to third parties as a hosted or
+managed service, and you may not circumvent or remove the licensing
+functionality — in this codebase, the AWS Marketplace entitlement check in
+`internal/gateway/marketplace.go`.
+
+The auditability argument is unaffected: every line is readable, and the
+dependency graph is 4 direct and 12 indirect modules, all AWS-published.
+
+Contributions are not currently accepted. A DCO will be added before any
+external contribution is taken, so that the copyright position stays
+unambiguous.
