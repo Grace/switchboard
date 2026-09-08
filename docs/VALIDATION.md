@@ -287,3 +287,106 @@ Full quickstart deployment, live provider requests, real Marketplace
 registration, soak beyond 60 seconds, SBOM generation and image signing. See
 `docs/GAPS.md` for the distinction between what remains open and what is blocked
 on an external action.
+
+## 2026-09-07 — live verification of the OpenAI, Anthropic and Gemini adapters
+
+Until this run, these three adapters had never been called for real. Every response-shape assumption
+in them had been checked only against mocks written from the same assumptions. That is the blind spot
+that let a 100%-fatal Bedrock defect through earlier the same day, so it was worth closing.
+
+Four provider cases were exercised, not three: OpenAI's legacy chat models and its reasoning models
+take different request shapes and signal truncation differently, so `gpt-4o-mini` and `gpt-5-nano`
+are tested separately through the same adapter.
+
+### Results
+
+| Case | Complete response | Streaming | Truncation |
+|---|---|---|---|
+| openai (`gpt-4o-mini`) | pass | pass, 8 frames | pass, `finish=length` |
+| openai-reasoning (`gpt-5-nano`) | pass | pass, 2 frames | **HTTP 400, not a finish reason** |
+| anthropic (`claude-haiku-4-5-20251001`) | pass | pass, 8 frames | pass, `finish=length` |
+| gemini (`gemini-3.6-flash`) | pass (after retry) | pass, 2 frames | pass, `finish=length` |
+
+All twelve cases pass. Measured usage: openai in 14 / out 1; openai-reasoning in 13 / out 74;
+anthropic in 14 / out 4; **gemini in 8 / out 104**.
+
+That last figure is the point of the exercise. Before the fix below, the identical call reported
+`out=0`.
+
+### Defect found and fixed: Gemini output tokens were metered as zero
+
+`wire.UsageMetadata` read output tokens from `candidatesTokenCount` alone. Real Gemini responses bill
+internal reasoning separately in `thoughtsTokenCount`, and **may omit `candidatesTokenCount`
+entirely**. Two real responses:
+
+```
+{"promptTokenCount":8,                          "thoughtsTokenCount":103,"totalTokenCount":111}
+{"promptTokenCount":6,"candidatesTokenCount":6, "thoughtsTokenCount":206,"totalTokenCount":218}
+```
+
+The first normalized to `out=0` against 103 tokens billed. The second normalized to `out=6` against
+212 — a 97% under-report. Marketplace metering depends on this figure, so this was a revenue defect,
+not a cosmetic one.
+
+Fixed by modelling `thoughtsTokenCount` and `totalTokenCount` and billing on
+`candidatesTokenCount + thoughtsTokenCount`. Because a provider can change its accounting again, the
+gateway now also cross-checks that sum against `totalTokenCount - promptTokenCount` and increments
+`switchboard_usage_mismatch_total` when they disagree, rather than trusting the sum silently. A
+mismatch does not fail the request. Both real bodies above are pinned as regression tests in
+`adapter_test.go`.
+
+### Defect found and fixed: OpenAI reasoning models were unusable
+
+`upstream()` passed the whole `Chat` struct through as the OpenAI request body, which serialises the
+token limit as `max_tokens`. Reasoning models reject that outright:
+
+```
+400 Unsupported parameter: 'max_tokens' is not supported with this model.
+    Use 'max_completion_tokens' instead.
+```
+
+Verified against the live API that `gpt-4o-mini` accepts **either** name, so the fix is one
+unconditional rename to `max_completion_tokens` with no per-model branching and no dialect
+configuration. The OpenAI body is now built explicitly, like the other three adapters.
+
+### Test-harness defects found and fixed
+
+- `TestLiveTruncatedFinishReason` called `t.Skipf` on a non-200, so a run in which **every** request
+  failed authentication reported the parent test as PASS. It now fails.
+- Live model names had gone stale under the tests: `gemini-2.0-flash` and `claude-3-5-haiku-latest`
+  both returned 404 "no longer available". Refreshed, and the table now carries a comment that model
+  names are a live dependency rather than a constant.
+- The tests requested 16 output tokens. A reasoning model spends its whole allowance thinking before
+  emitting any visible text, so it returned `"content": {}` with no `parts` key and
+  `finishReason: MAX_TOKENS`. The adapter handled that correctly; the assertion was wrong. Budgets
+  raised to 512.
+
+### Behaviour recorded, not changed
+
+- **OpenAI reasoning models report truncation as HTTP 400**, where legacy models report it in band as
+  `finish_reason: length`. The gateway maps 400 to "provider rejected request" and does not fail
+  over, so a caller with too small a budget gets an opaque error. Recorded in `docs/GAPS.md`.
+- **Anthropic signals billing exhaustion as HTTP 400** ("credit balance is too low"), not 402 or 429.
+  Same path, same consequence: no failover to a funded provider.
+- **A real OpenAI 429 carried no `Retry-After` and no `x-ratelimit-*` headers at all.** `retryAfter()`
+  returns 0, so the breaker takes the `release()` branch and the gateway re-attempts an exhausted
+  provider on every subsequent request. Correct for a transient limit, wasteful for one that will not
+  clear on its own.
+- **Anthropic returns `cache_creation_input_tokens` and `cache_read_input_tokens`**, neither modelled.
+  Both were zero here, so input accounting is currently correct, but it would under-count if prompt
+  caching were ever enabled.
+- **Gemini streams have no `[DONE]` terminator** — the stream simply ends after the frame carrying
+  `finishReason`. The adapter already treats a finish reason as completion, so this works.
+- **Gemini capacity is unreliable.** `gemini-3.6-flash` returned 503 "high demand" repeatedly and
+  429 on a short per-minute quota. The live tests now retry both, three attempts with backoff, and
+  skip rather than fail when a provider is busy for all three — a skip records "not verified", which
+  is honest, where a failure would wrongly accuse the adapter.
+
+### Confirmed sound
+
+Decoding is lenient for all three adapters, with strictness correctly confined to client input via
+`strictJSON`. The specific Bedrock defect — a provider adding an unmodelled response field — cannot
+recur here. Anthropic's streaming path rejects unknown event types outright; all seven types a real
+stream emitted (`message_start`, `content_block_start`, `content_block_delta`, `content_block_stop`,
+`message_delta`, `message_stop`, `ping`) are in its allowed set, with `content_block.type: text` and
+`delta.type: text_delta` as expected.

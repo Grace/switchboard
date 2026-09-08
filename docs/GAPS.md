@@ -77,38 +77,64 @@ Each of these is backed by a run recorded in `docs/VALIDATION.md`.
    deployed**, no other region has been tried, and the Postgres 18.6 default now
    in the template has never been deployed either — that default and the derived
    parameter-group expression remain unexercised.
-2. **Live provider traffic, mostly still unverified.** Bedrock has now been
-   exercised against the real service: a SigV4-signed Converse request returned
-   a real completion which normalized correctly. **OpenAI, Anthropic and Gemini
-   have still only ever seen the local mock and in-repo test handlers**, so
-   model equivalence, real streaming behaviour, regional availability and
-   data-retention suitability remain unverified for those three.
-3. **Bedrock does not stream.** Bedrock returns AWS event-stream framing rather
+2. **Live provider traffic, now verified; two behaviours recorded.** All four
+   adapters have been exercised against the real services, complete and
+   streaming, and two defects were found and fixed (Gemini metered output tokens
+   as zero; OpenAI reasoning models were unusable because the request sent
+   `max_tokens`). See `docs/VALIDATION.md`. What remains open is narrower:
+   regional availability and data-retention suitability are still unassessed;
+   `gemini-3.6-flash` is capacity-constrained enough that a run can need several
+   retries and will skip rather than fail when all of them are refused, so a
+   green suite does not always mean Gemini was actually reached; and model names
+   proved to be a live dependency rather than a constant, with two of the three
+   originally targeted models retired out from under the tests.
+3. **Provider errors that should probably fail over do not.** Three real cases,
+   all landing on the same path:
+   - OpenAI reasoning models report *truncation* as HTTP 400, not as
+     `finish_reason: length`.
+   - Anthropic reports *billing exhaustion* as HTTP 400, not 402 or 429.
+   - A real OpenAI 429 carried no `Retry-After` and no `x-ratelimit-*` headers,
+     so `retryAfter()` returns 0 and the breaker releases immediately, causing
+     the gateway to re-attempt an exhausted provider on every request.
+
+   `server.go` maps 400 and 422 to "provider rejected request" with no failover,
+   which is right for a genuinely malformed request and wrong for an
+   account-level failure on one provider when another is configured and funded.
+   Changing this alters routing semantics, so it is recorded rather than done.
+4. **Anthropic prompt-cache tokens are not counted.** Responses carry
+   `cache_creation_input_tokens` and `cache_read_input_tokens`; neither is
+   modelled. Both are zero today, so input accounting is currently correct, but
+   enabling prompt caching would under-count input.
+5. **Reasoning models constrain `temperature`.** They reject any value other
+   than the default. `Chat.Temperature` is optional and was nil throughout
+   testing, so this has not been hit, but a caller setting it against a
+   reasoning model would get a 400. Not fixed blind.
+6. **Bedrock does not stream.** Bedrock returns AWS event-stream framing rather
    than server-sent events, and that decode path is not built. A streaming
    request skips a bedrock route at selection time and tries the next provider,
    so a policy with another route still serves it; a policy whose only route is
    bedrock returns the ordinary 503. Nonstreaming Bedrock is complete.
-4. **Soak duration.** The longest run is 60 seconds. Nothing addresses memory
+7. **Soak duration.** The longest run is 60 seconds. Nothing addresses memory
    growth, file-descriptor leaks, spool behavior over hours, or policy rotation
    mid-flight.
-5. **No idempotency.** There is no exactly-once guarantee, replay cache or
+8. **No idempotency.** There is no exactly-once guarantee, replay cache or
    ledger. A 429 or 503 retry cannot prove the absence of upstream billing.
    Clients must disable automatic retries.
-6. **Security operations.** Bearer RBAC exists; SSO, MFA, human-user lifecycle,
+9. **Security operations.** Bearer RBAC exists; SSO, MFA, human-user lifecycle,
    external authorization, hardware-backed signing and automated key renewal do
    not. Row level security defends against query mistakes, not against a
    compromised shared database session.
-7. **Scale and operations.** Rate limits and circuit state are per process, not
+10. **Scale and operations.** Rate limits and circuit state are per process, not
    fleet-wide. There is no retention policy, partitioning, dashboard, SLO, audit
    export or restore drill. The spool caps at 100 events per tick.
-8. **Supply chain, remaining.** No SBOM generation and no image signing, and
+11. **Supply chain, remaining.** No SBOM generation and no image signing, and
    there is no release workflow at all — images are built and pushed by hand.
    Python and Go dependency graphs are pinned and scanned, GitHub Actions are
    pinned by commit SHA, and both images report zero scan findings. Signing and
    SBOM are what a buyer's security review asks for rather than a listing
    requirement; the enforced requirement is freedom from known vulnerabilities,
    which is met.
-9. **Infrastructure assumptions.** `controlplane.yaml` requires an existing VPC,
+12. **Infrastructure assumptions.** `controlplane.yaml` requires an existing VPC,
     subnets, IAM roles, KMS keys, ECS cluster and load balancer target group.
     `quickstart.yaml` removes all of those except the certificate.
 

@@ -116,9 +116,31 @@ Bedrock needs no key — it authenticates with the ambient AWS credentials.
 
 Each request goes through `upstream()` and each response through `normalize()`,
 which is the path a production request takes, so request construction,
-authentication, response parsing and finish-reason mapping are exercised
-together. Three cases are covered per provider: a complete response, a streamed
-response, and a deliberately truncated one, since an unmapped finish reason is
-a hard failure rather than a degraded result.
+authentication, response parsing, finish-reason mapping and token accounting are
+exercised together. Three cases are covered per provider: a complete response, a
+streamed response, and a deliberately truncated one, since an unmapped finish
+reason is a hard failure rather than a degraded result.
 
-Cost is a few cents. Keys can be revoked afterwards.
+Four provider cases run, not three. OpenAI's legacy and reasoning models take
+different request shapes — reasoning models reject `max_tokens` outright — and
+signal truncation differently, so `gpt-4o-mini` and `gpt-5-nano` are exercised
+separately through the same adapter.
+
+**The model names in `liveProviders` are a live dependency, not a constant.**
+Two of the three originally targeted models were retired out from under these
+tests and began returning 404. When a case fails with "no longer available", list
+what the key can actually reach and update the table:
+
+```sh
+curl -s https://api.openai.com/v1/models -H "Authorization: Bearer $OPENAI_API_KEY" | jq -r '.data[].id'
+curl -s 'https://api.anthropic.com/v1/models?limit=100' -H "x-api-key: $ANTHROPIC_API_KEY" \
+  -H 'anthropic-version: 2023-06-01' | jq -r '.data[].id'
+curl -s 'https://generativelanguage.googleapis.com/v1beta/models?pageSize=200' \
+  -H "x-goog-api-key: $GEMINI_API_KEY" | jq -r '.models[].name'
+```
+
+A provider that answers 503 or 429 is retried three times with backoff and then
+**skipped**, not failed: that records "not verified", which is honest, where a
+failure would wrongly accuse the adapter. Gemini hits this most often.
+
+Cost is a few cents. Keys can be revoked afterwards, and should be.
