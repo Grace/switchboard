@@ -5,13 +5,17 @@ wrappers around urllib and would only be testing a mock of the API; the parts
 that are easy to get silently wrong are the query specs, and getting one wrong
 produces a trigger that is accepted and never fires.
 """
+import pytest
+
 from controlplane.honeycombtool import (
+    NEEDED,
     NOTIFY_TRIGGER,
     PAGE_TRIGGER,
     board_queries,
     combined,
     counter,
     find_by_name,
+    main,
     triggers,
 )
 
@@ -124,3 +128,46 @@ def test_board_panels_are_described():
     for name, desc, q in panels:
         assert name and len(desc) > 40
         assert q["calculations"]
+
+
+def test_every_needed_permission_is_explained():
+    """The message a deployer gets has to name the switch to flip.
+
+    The first key handed to this tool was a configuration key with two of these
+    four switched off, and the tool's answer at the time was to guess it was an
+    ingest key. /1/auth had the facts. Each permission therefore carries its own
+    reason, so the failure says which one is missing and what it is for rather
+    than restating that something is not allowed.
+    """
+    assert set(NEEDED) == {"triggers", "boards", "recipients", "queries"}
+    for perm, why in NEEDED.items():
+        assert why and not why.endswith("."), f"{perm} needs a reason phrase"
+
+
+def test_config_key_is_read_from_its_own_variable(monkeypatch, capsys):
+    """No fallback to HONEYCOMB_API_KEY, and the reason is not stylistic.
+
+    That variable holds the ingest key, and the dev stack hands .dev/env to the
+    gateway container wholesale -- so a configuration key placed there is
+    readable by the data plane, which could then rewrite or delete the alerting
+    that watches it. A fallback would make putting it in the wrong variable
+    work, which is precisely how it would end up there.
+    """
+    monkeypatch.setenv("HONEYCOMB_API_KEY", "an-ingest-key")
+    monkeypatch.delenv("HONEYCOMB_CONFIG_KEY", raising=False)
+    with pytest.raises(SystemExit) as e:
+        main(["--dataset", "Metrics", "--no-recipient"])
+    msg = str(e.value)
+    assert "HONEYCOMB_CONFIG_KEY" in msg
+    assert "HONEYCOMB_API_KEY" in msg, "the message must say which variable NOT to use"
+
+
+def test_recipient_choice_must_be_explicit(capsys):
+    """Neither notifying nor not-notifying is a default.
+
+    Both triggers once evaluated correctly and notified nobody for a session,
+    which reads as coverage on a dashboard while being none. Silence is
+    available but has to be typed.
+    """
+    with pytest.raises(SystemExit):
+        main(["--dataset", "Metrics"])

@@ -128,13 +128,21 @@ and latency, not an outage, and budget-aware routing should drive it toward zero
 Honeycomb environment, and is safe to re-run: everything is matched by name and updated in place.
 
 ```sh
-export HONEYCOMB_API_KEY=...        # a Configuration key, not an ingest key
+export HONEYCOMB_CONFIG_KEY=...     # a Configuration key
 python -m controlplane.honeycombtool --dataset Metrics --recipient ops@example.com
 python -m controlplane.honeycombtool --dataset Metrics --recipient ops@example.com --dry-run
 ```
 
-The key needs **Manage Triggers, Manage Boards, Manage Recipients and Run Queries**. The ingest key
-in a gateway's `otlp_headers` has none of them; it can send telemetry and nothing else.
+**Not `HONEYCOMB_API_KEY`.** That variable holds the *ingest* key the gateway itself reads to
+authenticate its OTLP export, and wherever the gateway can read it, a configuration key would let
+the data plane rewrite or delete the alerting that watches it. The tool reads its own variable and
+does not fall back.
+
+The key needs **Manage Triggers, Manage Boards, Manage Recipients and Run Queries**; a new
+Configuration key does not have all four by default. The tool calls `/1/auth` before writing
+anything and names any that are missing, along with the team and environment the key actually points
+at — a key from the wrong environment otherwise provisions a perfectly correct set of triggers
+somewhere nobody is looking.
 
 `--recipient` is required unless you pass `--no-recipient`. **A trigger with no recipient notifies
 nobody** while still appearing healthy in the trigger list, which is worse than having no trigger at

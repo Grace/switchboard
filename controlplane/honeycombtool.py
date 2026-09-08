@@ -75,17 +75,6 @@ def api(key: str, method: str, path: str, body=None):
             detail = json.loads(detail).get("error", detail)
         except Exception:
             pass
-        if "isn't allowed" in detail or "not allowed" in detail:
-            raise Fatal(
-                f"{detail}\n"
-                "  This looks like an ingest key. An ingest key can send telemetry and nothing\n"
-                "  else, and the one in a gateway's OTLP headers is usually exactly that.\n"
-                "  Create a Configuration key under Environment settings > API keys with:\n"
-                "    Manage Triggers, Manage Boards, Manage Recipients, Run Queries\n"
-                "  Run Queries is not optional here. Without it the triggers can still be\n"
-                "  written but not verified, and an unverified trigger is the failure this\n"
-                "  tool exists to prevent, so it stops rather than reporting a false success."
-            )
         if "maximum" in detail and "plan" in detail:
             raise Fatal(
                 f"{detail}\n"
@@ -95,6 +84,50 @@ def api(key: str, method: str, path: str, body=None):
         raise Fatal(f"{method} {path} -> {e.code}: {detail}")
     except urllib.error.URLError as e:
         raise Fatal(f"{method} {path} -> {e.reason}")
+
+
+# What each Honeycomb permission is needed for. Named individually because
+# "isn't allowed" tells a deployer nothing about which switch to flip, and the
+# first key handed to this tool had two of the four off.
+NEEDED = {
+    "triggers": "create and update the two triggers",
+    "boards": "create the board",
+    "recipients": "attach a notification target",
+    "queries": "execute each trigger's query to prove it runs",
+}
+
+
+def preflight(key: str) -> dict:
+    """Ask the key what it can do, before using it for anything.
+
+    An earlier version of this guessed from a failed write that the key was an
+    ingest key. It was not; it was a configuration key with two permissions
+    switched off, and /1/auth would have said so in one request. Guessing about
+    a fact the server will state is how an afternoon goes missing.
+
+    Reporting the environment matters as much as the permissions. The key alone
+    decides which environment is written to, so a key from the wrong one
+    provisions a perfectly correct set of triggers somewhere nobody is looking.
+    """
+    auth = api(key, "GET", "/1/auth")
+    env = (auth.get("environment") or {}).get("slug", "?")
+    team = (auth.get("team") or {}).get("slug", "?")
+    print(f"key: type={auth.get('type', '?')} team={team} environment={env}")
+
+    access = auth.get("api_key_access") or {}
+    missing = [p for p in NEEDED if not access.get(p)]
+    if missing:
+        lines = "\n".join(f"    {p:<12} to {NEEDED[p]}" for p in missing)
+        raise Fatal(
+            "this key is missing permissions it needs:\n" + lines + "\n"
+            "  Enable them in Honeycomb under Environment settings > API keys, or use a\n"
+            "  Configuration key that has them. An ingest key has none of these; it can\n"
+            "  send telemetry and nothing else.\n"
+            "  'queries' is not optional: without it the triggers can be written but not\n"
+            "  verified, and an unverified trigger is precisely the failure this tool\n"
+            "  exists to prevent, so it stops rather than report a false success."
+        )
+    return auth
 
 
 def counter(column: str, name: str, window: int) -> dict:
@@ -303,6 +336,7 @@ def apply(key: str, dataset: str, recipient: str | None, dry_run: bool = False) 
     change nothing. Doing that for real would mean writing to a live account to
     prove that writing was unnecessary.
     """
+    preflight(key)
     changed = []
     plan = []
 
@@ -435,9 +469,23 @@ def main(argv: list[str] | None = None) -> int:
                          "refuses to run is exactly what a dry run should catch.")
     a = ap.parse_args(argv)
 
-    key = os.environ.get("HONEYCOMB_API_KEY", "").strip()
+    # Deliberately not HONEYCOMB_API_KEY. That variable holds the *ingest* key,
+    # and a gateway reads it at request time to authenticate its OTLP export --
+    # in the dev stack .dev/env is handed to the gateway container wholesale, so
+    # anything in it is readable by the data plane. A configuration key placed
+    # there would let the gateway rewrite or delete the alerting that watches it,
+    # which is the same mistake as letting it sign the policy it enforces.
+    #
+    # There is no fallback to HONEYCOMB_API_KEY on purpose. A fallback would make
+    # putting the configuration key in the wrong variable work, which is exactly
+    # how it would end up there, and the resulting exposure is silent.
+    key = os.environ.get("HONEYCOMB_CONFIG_KEY", "").strip()
     if not key:
-        raise Fatal("set HONEYCOMB_API_KEY to a key with permission to manage triggers and boards")
+        raise Fatal(
+            "set HONEYCOMB_CONFIG_KEY to a Honeycomb Configuration key.\n"
+            "  Not HONEYCOMB_API_KEY: that one holds the ingest key the gateway itself reads,\n"
+            "  and a configuration key there would let the data plane edit its own alerting."
+        )
     return apply(key, a.dataset, None if a.no_recipient else a.recipient, a.dry_run)
 
 

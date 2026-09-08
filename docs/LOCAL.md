@@ -195,6 +195,50 @@ is gitignored and must stay local. `devstack.py` prints tokens to stdout by
 design, which is exactly what a deployment must never do — this tooling is for
 local use only.
 
+## Sending telemetry to Honeycomb
+
+OTLP export is off unless you turn it on. `devstack.py` reads `OTLP_URL`,
+`OTLP_METRICS_URL` and `OTLP_HEADERS` from `.dev/env` and defaults them empty, because a dev stack
+that silently shipped traces to somebody's account would be a surprise. To point it at Honeycomb,
+add to `.dev/env`:
+
+```sh
+OTLP_URL=https://api.honeycomb.io/v1/traces
+OTLP_METRICS_URL=https://api.honeycomb.io/v1/metrics
+OTLP_HEADERS={"x-honeycomb-team":"HONEYCOMB_API_KEY"}
+HONEYCOMB_API_KEY=<an ingest key>
+```
+
+`otlp_headers` maps a header name to the **name of an environment variable**, not to a value, so no
+credential is written into the gateway's config file.
+
+### Two keys, and they must not be the same one
+
+| Variable | Kind | Used by |
+|---|---|---|
+| `HONEYCOMB_API_KEY` | Ingest | The gateway, to authenticate its OTLP export |
+| `HONEYCOMB_CONFIG_KEY` | Configuration | `honeycombtool` only, never the gateway |
+
+`.dev/env` is passed to the gateway container wholesale as `env_file`, so anything in it is readable
+by the data plane. An ingest key there is correct: it can send telemetry and nothing else. A
+**configuration** key there would let the gateway rewrite or delete the alerting that watches it,
+which is the same mistake as letting it sign the policy it enforces — and the reason `policytool`
+is not part of the gateway binary either.
+
+`honeycombtool` therefore reads `HONEYCOMB_CONFIG_KEY` and will not fall back to the other variable.
+Export it in your shell when you run the tool rather than adding it to `.dev/env`.
+
+Honeycomb mints both kinds in its UI under **Environment settings > API keys**; nothing here creates
+them, because creating a key through the API needs a more privileged key first, which only moves the
+problem. What the tool does instead is check: it calls `/1/auth` before writing anything and reports
+the team, the environment and any missing permission by name. A configuration key needs **Manage
+Triggers, Manage Boards, Manage Recipients and Run Queries** — new keys do not have all four by
+default.
+
+Both the gateway and this tooling reach any OTLP backend. Grafana Cloud takes Basic auth, Datadog
+takes `dd-api-key`, a local collector takes no header at all; only `honeycombtool.py` knows what
+Honeycomb is.
+
 ## Verifying against real providers
 
 The local stack runs against a mock, which is what makes it free and
