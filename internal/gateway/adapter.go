@@ -64,8 +64,21 @@ func upstream(ctx context.Context, c Chat, r Route, p ProviderConfig, signer *Be
 	}
 	switch r.Provider {
 	case "openai":
-		c.Model = r.Model
-		body = c
+		// Built explicitly rather than by passing the Chat struct through, because
+		// the token limit has to be max_completion_tokens: reasoning models reject
+		// max_tokens outright ("Unsupported parameter"), and legacy chat models
+		// accept either, so the newer name is the one that works for both. The
+		// system message stays inline in messages, which is where OpenAI wants it.
+		b := map[string]any{
+			"model":                 r.Model,
+			"messages":              c.Messages,
+			"stream":                c.Stream,
+			"max_completion_tokens": c.MaxTokens,
+		}
+		if c.Temperature != nil {
+			b["temperature"] = *c.Temperature
+		}
+		body = b
 		path = "/v1/chat/completions"
 	case "anthropic":
 		b := map[string]any{"model": r.Model, "messages": msgs, "max_tokens": c.MaxTokens, "stream": c.Stream}

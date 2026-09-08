@@ -1,6 +1,8 @@
 package gateway
 
 import (
+	"context"
+	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -136,5 +138,31 @@ func TestNormalizeGeminiEmptyContentIsTruncation(t *testing.T) {
 	}
 	if n.Output != 13 {
 		t.Errorf("Output = %d, want 13 thinking tokens", n.Output)
+	}
+}
+
+// OpenAI reasoning models reject max_tokens outright. Legacy chat models accept
+// either name, so max_completion_tokens is the one that works for both.
+func TestOpenAIRequestUsesMaxCompletionTokens(t *testing.T) {
+	req, err := upstream(context.Background(),
+		Chat{MaxTokens: 64, Messages: []Message{{Role: "user", Content: "hi"}}},
+		Route{Provider: "openai", Model: "gpt-5-nano"},
+		ProviderConfig{URL: "https://api.openai.com", KeyEnv: "PATH"}, nil)
+	if err != nil {
+		t.Fatalf("could not build request: %v", err)
+	}
+	raw, _ := io.ReadAll(req.Body)
+	var got map[string]any
+	if err := json.Unmarshal(raw, &got); err != nil {
+		t.Fatalf("body is not JSON: %v", err)
+	}
+	if _, present := got["max_tokens"]; present {
+		t.Error("body still sends max_tokens, which reasoning models reject")
+	}
+	if got["max_completion_tokens"] != float64(64) {
+		t.Errorf("max_completion_tokens = %v, want 64", got["max_completion_tokens"])
+	}
+	if got["model"] != "gpt-5-nano" {
+		t.Errorf("model = %v", got["model"])
 	}
 }
