@@ -21,6 +21,10 @@ coverage.out
 # Local dev stack: Ed25519 signing seed and bearer tokens
 .dev/
 
+# Provider API keys, if this convention ever moves into the repo.
+# The canonical location is ~/.switchboard/, outside any repository.
+.switchboard/
+
 .DS_Store
 
 # Private working notes — names companies, not for publication

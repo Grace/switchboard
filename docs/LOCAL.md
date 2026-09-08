@@ -144,3 +144,36 @@ A provider that answers 503 or 429 is retried three times with backoff and then
 failure would wrongly accuse the adapter. Gemini hits this most often.
 
 Cost is a few cents. Keys can be revoked afterwards, and should be.
+
+### Which key is actually in use
+
+The gateway reads each provider's key from the environment variable named by `key_env`, and
+`Config.Validate()` only checks that the variable is **non-empty**. Nothing distinguishes a present
+key from a correct one, so a stale export in `~/.zshrc` or `~/.zshenv` silently outranks whatever you
+meant to use, and the failure arrives later as a provider `401`, or a `429` mentioning credits. Both
+read as a provider fault when they are a configuration one.
+
+This is not hypothetical: two different OpenAI keys for the same account were in play during the live
+verification above, one of which reported having no credits.
+
+Compare what the shell has against what you think you are using, without printing either:
+
+```sh
+printf %s "$OPENAI_API_KEY" | shasum -a 256 | cut -c1-12
+printf %s "$(cat ~/.switchboard/openai)" | shasum -a 256 | cut -c1-12
+```
+
+Matching digests mean they agree. Note that a non-interactive shell does not source `~/.zshrc`, so an
+automated run and your terminal can legitimately disagree about the same variable.
+
+For OpenAI specifically, the response headers name the account the key belongs to, which settles
+"is this the account holding the credits" without guessing:
+
+```sh
+curl -s -D - -o /dev/null https://api.openai.com/v1/models \
+  -H "Authorization: Bearer $OPENAI_API_KEY" | grep -i '^openai-organization'
+```
+
+A `user-` prefix is a personal account with no organization attached, so organization mismatch
+errors do not apply to it. The gateway never sends an `OpenAI-Organization` header; `sk-proj-` keys
+carry their own organization and project.
