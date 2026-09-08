@@ -614,3 +614,60 @@ func TestFallsBackWhenTheBatchRouteIsMissing(t *testing.T) {
 		t.Errorf("batch route probed %d times; the fallback should be remembered", batchCalls.Load())
 	}
 }
+
+// Without configurable headers, OTLP export could only reach an unauthenticated
+// collector on loopback. Honeycomb wants x-honeycomb-team, Grafana Cloud wants
+// Basic auth, Datadog wants dd-api-key, and none were reachable.
+func TestOTLPHeadersReachBothExporters(t *testing.T) {
+	t.Setenv("HONEYCOMB_API_KEY", "hcaik_example")
+	var metricsKey, tracesKey atomic.Value
+	metricsKey.Store("")
+	tracesKey.Store("")
+	metrics := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		metricsKey.Store(r.Header.Get("x-honeycomb-team"))
+		w.WriteHeader(200)
+	}))
+	defer metrics.Close()
+	traces := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		tracesKey.Store(r.Header.Get("x-honeycomb-team"))
+		w.WriteHeader(200)
+	}))
+	defer traces.Close()
+
+	c := Config{
+		OTLPMetricsURL: metrics.URL, OTLPURL: traces.URL,
+		OTLPHeaders: map[string]string{"x-honeycomb-team": "HONEYCOMB_API_KEY"},
+	}
+	tel := &Telemetry{c: c, m: &Metrics{}, http: metrics.Client(), start: time.Now()}
+	tel.exportMetrics(context.Background())
+	tel.exportOTLP(context.Background(), Event{ID: "a", Start: 1, End: 2})
+
+	if metricsKey.Load() != "hcaik_example" {
+		t.Errorf("metrics export sent %q; the backend would reject it", metricsKey.Load())
+	}
+	if tracesKey.Load() != "hcaik_example" {
+		t.Errorf("traces export sent %q", tracesKey.Load())
+	}
+}
+
+// A header value is read from the environment at request time, so an empty
+// variable must not send an empty header that a backend would reject as
+// malformed rather than as unauthenticated.
+func TestOTLPHeaderWithEmptyEnvIsNotSent(t *testing.T) {
+	var present atomic.Bool
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, ok := r.Header["X-Honeycomb-Team"]
+		present.Store(ok)
+		w.WriteHeader(200)
+	}))
+	defer srv.Close()
+	tel := &Telemetry{
+		c:    Config{OTLPMetricsURL: srv.URL, OTLPHeaders: map[string]string{"x-honeycomb-team": "UNSET_VAR_NAME"}},
+		m:    &Metrics{},
+		http: srv.Client(), start: time.Now(),
+	}
+	tel.exportMetrics(context.Background())
+	if present.Load() {
+		t.Error("an empty environment variable produced an empty header")
+	}
+}

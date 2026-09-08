@@ -28,5 +28,6 @@
   "enable_pprof": false,
   "allow_local_http": false,
   "idempotency_ttl_seconds": 0,
-  "idempotency_bytes": 0
+  "idempotency_bytes": 0,
+  "otlp_headers": {}
 }

@@ -177,13 +177,29 @@ Each of these is backed by a run recorded in `docs/VALIDATION.md`.
    counter, gauge and the request-duration histogram over OTLP with no extra
    container. The gateway now warns at startup when neither path is configured,
    so the default silence is at least visible in the log stream.
-5. **No alerting is provisioned.** Neither template defines a CloudWatch alarm,
-   SNS topic or metric filter. `docs/DEPLOYMENT.md` now gives per-metric
-   thresholds, but the buyer applies them. This is harder than it sounds because
-   **neither template deploys the gateway**: both deploy the control plane, and
-   the sidecar is added to the customer's own task definition, so gateway alarms
-   cannot simply be added to `quickstart.yaml`. They need a separate opt-in
-   template or documented definitions applied against the buyer's own log group.
+5. **Alerting goes through Honeycomb, and the path is built but unproven.**
+   Gateway alarms hang off metrics in Honeycomb rather than CloudWatch, which is
+   now a decision rather than an omission. CloudWatch remains reachable by the
+   same mechanism whenever it is wanted.
+
+   The blocker was that OTLP export could not authenticate to anything: both
+   exporters set only `Content-Type`, so `otlp_metrics_url` worked against an
+   unauthenticated collector on loopback and nothing else. `otlp_headers` now maps
+   a header name to the **name of an environment variable**, matching how every
+   other secret in this configuration is handled, and both exporters apply it.
+   Header names are validated as HTTP tokens, so a hand-edited config cannot
+   inject CR or LF, and the map cannot override `Content-Type` or `Authorization`.
+
+   **Nothing has reached Honeycomb yet.** The `gracefulcode` team's `test`
+   environment holds 18 datasets, all `genai-*` from unrelated work, and none from
+   Switchboard. Until a dataset appears with `switchboard_` counters in it, this
+   path is tested against an `httptest` server and not against the backend it
+   exists for.
+
+   Triggers are written out in `docs/DEPLOYMENT.md` rather than created, because a
+   trigger references columns that do not exist until data lands. Creating them
+   first would be guessing at schema.
+
 6. **Anthropic prompt-cache tokens are not counted.** Responses carry
    `cache_creation_input_tokens` and `cache_read_input_tokens`; neither is
    modelled. Both are zero today, so input accounting is currently correct, but

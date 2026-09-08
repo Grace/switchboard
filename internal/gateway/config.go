@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"regexp"
 	"strings"
 	"time"
 )
@@ -21,6 +22,11 @@ type ProviderConfig struct {
 	// inferred safely from the URL.
 	Region string `json:"region,omitempty"`
 }
+
+// headerName is the RFC 7230 token charset. Anything outside it, CR and LF in
+// particular, is header injection from a file an operator edits by hand.
+var headerName = regexp.MustCompile(`^[!#$%&'*+\-.^_` + "`" + `|~0-9A-Za-z]+$`)
+
 type Config struct {
 	Listen          string                    `json:"listen"`
 	Tenant          string                    `json:"tenant"`
@@ -45,7 +51,19 @@ type Config struct {
 	// anywhere, and rewriting a path inside it would be guessing. Without this
 	// set, nothing collects /metrics: the endpoint is loopback-only and the
 	// scraping collector is an opt-in sidecar that most deployments do not run.
-	OTLPMetricsURL string             `json:"otlp_metrics_url"`
+	OTLPMetricsURL string `json:"otlp_metrics_url"`
+	// OTLPHeaders are extra headers on both OTLP exports, mapping a header name
+	// to the name of an environment variable holding its value.
+	//
+	// The value is a variable name, not the secret, because config.json is
+	// mounted from a volume and readable by anything in the task, exactly as
+	// key_env, control_token_env and local_token_env already work. A map holding
+	// literal API keys would be the first credential to sit in this file.
+	//
+	// Without this, OTLP export can only reach an unauthenticated collector on
+	// loopback: Honeycomb wants x-honeycomb-team, Grafana Cloud wants Basic auth,
+	// Datadog wants dd-api-key, and none of them were reachable.
+	OTLPHeaders    map[string]string  `json:"otlp_headers,omitempty"`
 	Marketplace    *MarketplaceConfig `json:"marketplace,omitempty"`
 	AllowLocalHTTP bool               `json:"allow_local_http"`
 	// ProviderCheckStrict makes a failed startup provider check hold /readyz at
@@ -164,6 +182,25 @@ func (c Config) Validate() error {
 	}
 	if c.OTLPMetricsURL != "" && !secureURL(c.OTLPMetricsURL, c.AllowLocalHTTP) {
 		return errors.New("otlp_metrics_url must be https, or http on loopback with allow_local_http")
+	}
+	for name, env := range c.OTLPHeaders {
+		// RFC 7230 token characters only. A name carrying CR or LF is request
+		// splitting, and this arrives from a file an operator edits by hand.
+		if !headerName.MatchString(name) {
+			return fmt.Errorf("otlp_headers: %q is not a valid header name", name)
+		}
+		// The exporters set these themselves. Allowing an override would let the
+		// map silently redirect the payload type or replace credentials.
+		switch strings.ToLower(name) {
+		case "content-type", "authorization", "host", "content-length":
+			return fmt.Errorf("otlp_headers: %q is set by the exporter and cannot be overridden", name)
+		}
+		if env == "" {
+			return fmt.Errorf("otlp_headers[%q] must name an environment variable, not hold a value", name)
+		}
+		if os.Getenv(env) == "" {
+			return fmt.Errorf("otlp_headers[%q] names %s, which is empty", name, env)
+		}
 	}
 	if len(os.Getenv(c.LocalTokenEnv)) < 32 {
 		return fmt.Errorf("%s must hold at least 32 bytes; it is the token your application presents", c.LocalTokenEnv)

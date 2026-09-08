@@ -142,3 +142,51 @@ func TestEachLimitNamesItself(t *testing.T) {
 		})
 	}
 }
+
+// otlp_headers comes from a file an operator edits by hand, so the name is
+// attacker-adjacent in a way the rest of the config is not.
+func TestOTLPHeaderNamesAreValidated(t *testing.T) {
+	t.Setenv("LOCAL_TOKEN", strings.Repeat("x", 32))
+	t.Setenv("PROVIDER_KEY", "k")
+	t.Setenv("HC_KEY", "secret")
+	base := func(h map[string]string) Config {
+		return Config{
+			Listen: "127.0.0.1:8080", Tenant: "acme", DataDir: "/data",
+			LocalTokenEnv: "LOCAL_TOKEN",
+			TrustedKeys:   map[string]string{"k1": base64.StdEncoding.EncodeToString(make([]byte, ed25519.PublicKeySize))},
+			Providers:     map[string]ProviderConfig{"openai": {URL: "https://api.openai.com", KeyEnv: "PROVIDER_KEY"}},
+			Concurrency:   2, Rate: 10, Burst: 10, RetryRate: 5, MaxAttempts: 3,
+			TimeoutSeconds: 30, QueueSize: 16, SpoolBytes: 1 << 20,
+			OTLPHeaders: h,
+		}
+	}
+	if err := base(map[string]string{"x-honeycomb-team": "HC_KEY"}).Validate(); err != nil {
+		t.Fatalf("a valid header was rejected: %v", err)
+	}
+	for _, tc := range []struct {
+		name    string
+		headers map[string]string
+		want    string
+	}{
+		// Request splitting from a hand-edited file.
+		{"crlf in name", map[string]string{"x-bad\r\nInjected": "HC_KEY"}, "not a valid header name"},
+		{"space in name", map[string]string{"x bad": "HC_KEY"}, "not a valid header name"},
+		// The exporter sets these; an override could redirect the payload or
+		// replace the control-plane credential.
+		{"content-type", map[string]string{"Content-Type": "HC_KEY"}, "cannot be overridden"},
+		{"authorization", map[string]string{"Authorization": "HC_KEY"}, "cannot be overridden"},
+		// A literal secret in the config file rather than a variable name.
+		{"empty env name", map[string]string{"x-honeycomb-team": ""}, "must name an environment variable"},
+		{"missing env", map[string]string{"x-honeycomb-team": "NOT_SET_ANYWHERE"}, "which is empty"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			err := base(tc.headers).Validate()
+			if err == nil {
+				t.Fatalf("accepted %v", tc.headers)
+			}
+			if !strings.Contains(err.Error(), tc.want) {
+				t.Errorf("error %q does not explain the problem (want %q)", err, tc.want)
+			}
+		})
+	}
+}

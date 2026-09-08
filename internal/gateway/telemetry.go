@@ -543,6 +543,7 @@ func (t *Telemetry) exportMetrics(ctx context.Context) {
 		return
 	}
 	req.Header.Set("Content-Type", "application/json")
+	t.otlpHeaders(req)
 	res, err := t.http.Do(req)
 	if err != nil {
 		t.m.ExportErrors.Add(1)
@@ -607,6 +608,18 @@ func (t *Telemetry) latencyHistogram(now, start string) map[string]any {
 	}
 }
 
+// otlpHeaders applies the configured headers, reading each value from the
+// environment at request time so no credential is held in memory longer than the
+// request or written into the configuration file. Set after the exporter's own
+// headers, and validated at startup so it cannot replace them.
+func (t *Telemetry) otlpHeaders(req *http.Request) {
+	for name, env := range t.c.OTLPHeaders {
+		if v := os.Getenv(env); v != "" {
+			req.Header.Set(name, v)
+		}
+	}
+}
+
 // OTLP/HTTP JSON encoding follows the OpenTelemetry protobuf JSON mapping.
 func (t *Telemetry) exportOTLP(ctx context.Context, e Event) {
 	span := map[string]any{"traceId": e.TraceID, "spanId": e.SpanID, "name": "switchboard.inference", "kind": 2, "startTimeUnixNano": strconv.FormatInt(e.Start, 10), "endTimeUnixNano": strconv.FormatInt(e.End, 10), "attributes": []any{map[string]any{"key": "gen_ai.provider.name", "value": map[string]any{"stringValue": e.Provider}}, map[string]any{"key": "http.response.status_code", "value": map[string]any{"intValue": strconv.Itoa(e.Status)}}}}
@@ -619,6 +632,7 @@ func (t *Telemetry) exportOTLP(ctx context.Context, e Event) {
 	body := map[string]any{"resourceSpans": []any{map[string]any{"resource": map[string]any{"attributes": []any{map[string]any{"key": "service.name", "value": map[string]any{"stringValue": "switchboard-gateway"}}}}, "scopeSpans": []any{map[string]any{"scope": map[string]any{"name": "switchboard", "version": "1.0.0"}, "spans": []any{span}}}}}}
 	req, _ := http.NewRequestWithContext(ctx, "POST", t.c.OTLPURL, bytes.NewReader(jsonBytes(body)))
 	req.Header.Set("Content-Type", "application/json")
+	t.otlpHeaders(req)
 	res, err := t.http.Do(req)
 	if err != nil {
 		t.m.ExportErrors.Add(1)

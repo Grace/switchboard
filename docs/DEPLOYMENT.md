@@ -65,6 +65,43 @@ counter below is unreadable:
   histogram. Counters and the histogram are cumulative.
 - Or add the Collector as a same-task container, per step 6 above.
 
+### Sending metrics to Honeycomb
+
+Honeycomb is the default path: the gateway already speaks OTLP, and Honeycomb ingests it directly,
+so alerting is Triggers on the counters rather than infrastructure this project has to provision.
+
+```jsonc
+"otlp_metrics_url": "https://api.honeycomb.io/v1/metrics",
+"otlp_url":         "https://api.honeycomb.io/v1/traces",
+"otlp_headers":     { "x-honeycomb-team": "HONEYCOMB_API_KEY" }
+```
+
+**The header value is the name of an environment variable, not the key.** `config.json` is mounted
+from a volume and readable by anything in the task, and this is how `key_env`, `control_token_env`
+and `local_token_env` already work. Supply `HONEYCOMB_API_KEY` the same way you supply provider keys.
+
+The gateway refuses at startup if a named variable is empty, if a header name is not a valid HTTP
+token, or if the map tries to override `Content-Type` or `Authorization`.
+
+The same mechanism reaches anything else that speaks OTLP over HTTP. Grafana Cloud takes Basic auth,
+Datadog takes `dd-api-key`, and a local collector takes no header at all.
+
+### Triggers worth creating
+
+Once metrics arrive, these four are the ones that map to something a person should do. They are
+written here rather than created in advance, because a trigger references columns that do not exist
+until data lands.
+
+| Counter | Means | Urgency |
+|---|---|---|
+| `switchboard_empty_completion_failed_total` | Every route produced no output; the caller got a 503 | **Page.** This is lost service. |
+| `switchboard_account_failover_total` | A provider account cannot serve: no credits, balance too low, quota gone | Notify. Usually a billing action, not an incident. |
+| `switchboard_usage_mismatch_total` | A provider's token totals did not add up, so billing figures may be wrong | Notify. Any non-zero value deserves a look. |
+| `switchboard_idempotent_unknown_total` | A retry was refused because the original outcome was ambiguous | Notify. Rising means real ambiguity is being caught rather than paid for twice. |
+
+`switchboard_empty_completion_recovered_total` is worth a graph rather than a trigger: it is spend
+and latency, not an outage, and budget-aware routing should drive it toward zero on its own.
+
 ### What to alarm on
 
 | Metric | Meaning | Threshold |
