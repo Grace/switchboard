@@ -145,6 +145,11 @@ type normalized struct {
 	Text          string
 	Finish        string
 	Input, Output int
+	// UsageMismatch reports that the provider's own token totals did not add up,
+	// which means this gateway's billing figure may be wrong. It is surfaced as a
+	// metric rather than an error: the request itself is fine, but a provider
+	// changing how it accounts for tokens must not silently drift revenue.
+	UsageMismatch bool
 }
 
 func finish(s string) (string, error) {
@@ -212,8 +217,15 @@ type wire struct {
 		Block string `json:"blockReason"`
 	} `json:"promptFeedback"`
 	UsageMetadata struct {
-		Input  int `json:"promptTokenCount"`
-		Output int `json:"candidatesTokenCount"`
+		Input int `json:"promptTokenCount"`
+		// Output is the visible answer only. Thinking models bill their internal
+		// reasoning separately in thoughtsTokenCount, and may omit
+		// candidatesTokenCount altogether, so this field alone under-reports
+		// output badly: an observed call billed 8 prompt + 103 thought tokens and
+		// reported candidatesTokenCount not at all.
+		Output   int `json:"candidatesTokenCount"`
+		Thoughts int `json:"thoughtsTokenCount"`
+		Total    int `json:"totalTokenCount"`
 	} `json:"usageMetadata"`
 }
 
@@ -315,7 +327,18 @@ func normalize(provider string, b []byte, stream bool) (normalized, bool, error)
 		}
 	case "gemini":
 		n.Input = w.UsageMetadata.Input
-		n.Output = w.UsageMetadata.Output
+		// Thinking tokens are billed as output, so they must be counted as output.
+		n.Output = w.UsageMetadata.Output + w.UsageMetadata.Thoughts
+		// The provider also reports a total. When it disagrees with the parts,
+		// this gateway is billing on an accounting model the provider no longer
+		// uses, so say so rather than quietly trusting the sum.
+		// Both guards matter: a stream frame carrying no usage at all reports
+		// zeroes, and one carrying a total but no prompt count is partial. Neither
+		// is a disagreement, so neither should be reported as one.
+		if t := w.UsageMetadata.Total; t > 0 && w.UsageMetadata.Input > 0 &&
+			t-w.UsageMetadata.Input != n.Output {
+			n.UsageMismatch = true
+		}
 		if w.PromptFeedback.Block != "" {
 			n.Finish = "content_filter"
 			return n, true, nil

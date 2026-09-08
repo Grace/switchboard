@@ -366,6 +366,9 @@ func (s *Server) chat(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		n, _, e := normalize(route.Provider, data, false)
+		if n.UsageMismatch {
+			s.Metrics.UsageMismatch.Add(1)
+		}
 		s.circuits[route.Provider].result(e != nil)
 		if e != nil {
 			fail(502, "unsupported or incomplete provider response; not replayed")
@@ -390,6 +393,9 @@ func (s *Server) stream(w http.ResponseWriter, res *http.Response, route Route, 
 	rc := http.NewResponseController(w)
 	finished := false
 	terminal := false
+	// Providers repeat cumulative usage on every frame, so without this a single
+	// response would be counted as several mismatches.
+	mismatchCounted := false
 	err := readSSE(res.Body, func(b []byte) error {
 		if string(b) == "[DONE]" {
 			if route.Provider != "openai" || !finished {
@@ -401,6 +407,10 @@ func (s *Server) stream(w http.ResponseWriter, res *http.Response, route Route, 
 		n, done, e := normalize(route.Provider, b, true)
 		if e != nil {
 			return e
+		}
+		if n.UsageMismatch && !mismatchCounted {
+			s.Metrics.UsageMismatch.Add(1)
+			mismatchCounted = true
 		}
 		if finished && n.Text != "" {
 			return errors.New("text after finish")

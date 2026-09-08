@@ -52,3 +52,89 @@ func TestUnexpectedTools(t *testing.T) {
 		}
 	}
 }
+
+// Gemini bills internal reasoning as output tokens, reports it in a field this
+// gateway did not model, and may omit candidatesTokenCount entirely. Reading
+// only candidatesTokenCount metered a 111-token request as zero output.
+//
+// Both bodies below are verbatim usageMetadata from real gemini-3.6-flash calls.
+func TestNormalizeGeminiCountsThinkingTokens(t *testing.T) {
+	for _, tc := range []struct {
+		name          string
+		usage         string
+		input, output int
+		mismatch      bool
+	}{{
+		// candidatesTokenCount absent altogether: the whole budget went to
+		// thinking and no visible answer was produced.
+		name:   "candidates absent",
+		usage:  `{"promptTokenCount":8,"thoughtsTokenCount":103,"totalTokenCount":111}`,
+		input:  8,
+		output: 103,
+	}, {
+		// Both present. Reading candidatesTokenCount alone would report 6
+		// against 212 tokens actually billed as output.
+		name:   "candidates and thoughts",
+		usage:  `{"promptTokenCount":6,"candidatesTokenCount":6,"thoughtsTokenCount":206,"totalTokenCount":218}`,
+		input:  6,
+		output: 212,
+	}, {
+		// A provider total that does not agree with the parts means this
+		// gateway is billing on an accounting model the provider has changed.
+		name:     "totals disagree",
+		usage:    `{"promptTokenCount":10,"candidatesTokenCount":5,"thoughtsTokenCount":5,"totalTokenCount":999}`,
+		input:    10,
+		output:   10,
+		mismatch: true,
+	}, {
+		// A stream frame with no usage at all is not a disagreement.
+		name:  "usage absent",
+		usage: `{}`,
+	}, {
+		// Nor is a partial frame carrying a total but no prompt count. Reporting
+		// either as a mismatch would make the metric noise instead of signal.
+		name:   "partial frame",
+		usage:  `{"totalTokenCount":40}`,
+		output: 0,
+	}} {
+		t.Run(tc.name, func(t *testing.T) {
+			body := `{"candidates":[{"index":0,"content":{"parts":[{"text":"ok"}]},` +
+				`"finishReason":"STOP"}],"usageMetadata":` + tc.usage + `}`
+			n, _, err := normalize("gemini", []byte(body), false)
+			if err != nil {
+				t.Fatalf("rejected a real Gemini response: %v", err)
+			}
+			if n.Input != tc.input || n.Output != tc.output {
+				t.Errorf("usage = in %d/out %d, want in %d/out %d",
+					n.Input, n.Output, tc.input, tc.output)
+			}
+			if n.UsageMismatch != tc.mismatch {
+				t.Errorf("UsageMismatch = %v, want %v", n.UsageMismatch, tc.mismatch)
+			}
+		})
+	}
+}
+
+// A thinking model can exhaust its budget before emitting any visible text,
+// returning a content object with no parts key at all. That is a truncated
+// response, not a malformed one, and must normalize rather than error.
+func TestNormalizeGeminiEmptyContentIsTruncation(t *testing.T) {
+	body := `{"candidates":[{"content":{},"finishReason":"MAX_TOKENS","index":0}],` +
+		`"usageMetadata":{"promptTokenCount":8,"thoughtsTokenCount":13,"totalTokenCount":21}}`
+	n, done, err := normalize("gemini", []byte(body), false)
+	if err != nil {
+		t.Fatalf("rejected a real truncated response: %v", err)
+	}
+	if !done {
+		t.Error("a response carrying finishReason should be complete")
+	}
+	if n.Finish != "length" {
+		t.Errorf("Finish = %q, want length", n.Finish)
+	}
+	if n.Text != "" {
+		t.Errorf("Text = %q, want empty", n.Text)
+	}
+	if n.Output != 13 {
+		t.Errorf("Output = %d, want 13 thinking tokens", n.Output)
+	}
+}
