@@ -61,6 +61,24 @@ func secureURL(s string, local bool) bool {
 	}
 	return u.Scheme == "https" || (local && u.Scheme == "http" && (u.Hostname() == "localhost" || net.ParseIP(u.Hostname()).IsLoopback()))
 }
+
+// UncollectedMetricsWarning returns the warning an operator should see when no
+// metrics path is configured, or "" when one is.
+//
+// The default state is that no counter ever leaves the task: /metrics is bound
+// to loopback with the rest of the gateway, and the collector that would scrape
+// it is an opt-in container most deployments do not run. Nothing about that is
+// visible unless something says it, so the gateway says it on every start rather
+// than leaving it to be discovered from a docs page.
+func (c Config) UncollectedMetricsWarning() string {
+	if c.OTLPMetricsURL != "" {
+		return ""
+	}
+	return "no metrics are being collected; /metrics is loopback only. " +
+		"Set otlp_metrics_url to an OTLP/HTTP metrics endpoint, or run the collector " +
+		"sidecar from deploy/collector.yaml. See docs/DEPLOYMENT.md."
+}
+
 func LoadConfig(path string) (Config, error) {
 	var c Config
 	b, e := os.ReadFile(path)

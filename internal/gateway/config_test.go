@@ -4,6 +4,7 @@ import (
 	"crypto/ed25519"
 	"crypto/rand"
 	"encoding/base64"
+	"strings"
 	"testing"
 )
 
@@ -31,5 +32,23 @@ func TestTraceContext(t *testing.T) {
 	trace, parent = traceIDs("00-00000000000000000000000000000000-0000000000000000-01")
 	if len(trace) != 32 || parent != "" {
 		t.Fatal("invalid context trusted")
+	}
+}
+
+// The default state is that no counter leaves the task. That is invisible unless
+// something says so, so this is the one thing standing between an operator and
+// silently having no telemetry at all.
+func TestUncollectedMetricsWarning(t *testing.T) {
+	if w := (Config{}).UncollectedMetricsWarning(); w == "" {
+		t.Error("no warning when nothing is collecting metrics")
+	} else {
+		for _, want := range []string{"otlp_metrics_url", "collector.yaml", "DEPLOYMENT.md"} {
+			if !strings.Contains(w, want) {
+				t.Errorf("warning does not mention %q: %s", want, w)
+			}
+		}
+	}
+	if w := (Config{OTLPMetricsURL: "https://collector.example.com/v1/metrics"}).UncollectedMetricsWarning(); w != "" {
+		t.Errorf("warned despite a configured endpoint: %s", w)
 	}
 }

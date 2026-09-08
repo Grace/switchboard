@@ -142,10 +142,9 @@ Each of these is backed by a run recorded in `docs/VALIDATION.md`.
    only, and the scraping collector is an opt-in container absent from both
    CloudFormation templates and the sample task definition, so a default
    deployment exposes no counters at all. Setting `otlp_metrics_url` pushes every
-   counter and gauge over OTLP with no extra container. **The latency histogram
-   is not exported** — it needs a different OTLP shape and bucket encoding, and
-   partial support would be worse than none. Prometheus scraping remains the way
-   to get it.
+   counter, gauge and the request-duration histogram over OTLP with no extra
+   container. The gateway now warns at startup when neither path is configured,
+   so the default silence is at least visible in the log stream.
 5. **No alerting is provisioned.** Neither template defines a CloudWatch alarm,
    SNS topic or metric filter. `docs/DEPLOYMENT.md` now gives per-metric
    thresholds, but the buyer applies them. This is harder than it sounds because

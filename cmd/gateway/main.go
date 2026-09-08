@@ -129,6 +129,9 @@ func main() {
 		}
 		stop()
 	}()
+	if w := c.UncollectedMetricsWarning(); w != "" {
+		slog.Warn(w)
+	}
 	slog.Info("gateway started", "tenant", c.Tenant, "listen", c.Listen)
 	if e = srv.ListenAndServe(); e != nil && e != http.ErrServerClosed {
 		slog.Error("listener failed")

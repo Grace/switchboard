@@ -343,6 +343,7 @@ func (t *Telemetry) exportMetrics(ctx context.Context) {
 		}
 		metrics = append(metrics, m)
 	}
+	metrics = append(metrics, t.latencyHistogram(now, start))
 	body := map[string]any{"resourceMetrics": []any{map[string]any{
 		"resource":     map[string]any{"attributes": []any{map[string]any{"key": "service.name", "value": map[string]any{"stringValue": "switchboard-gateway"}}}},
 		"scopeMetrics": []any{map[string]any{"scope": map[string]any{"name": "switchboard", "version": "1.0.0"}, "metrics": metrics}},
@@ -362,6 +363,58 @@ func (t *Telemetry) exportMetrics(ctx context.Context) {
 	res.Body.Close()
 	if res.StatusCode != 200 || bytes.Contains(b, []byte("rejectedDataPoints")) {
 		t.m.ExportErrors.Add(1)
+	}
+}
+
+// latencyHistogram encodes the request-duration histogram for OTLP.
+//
+// The one thing here that is easy to get silently wrong: Prometheus buckets are
+// cumulative and OTLP bucketCounts are not. LatencyBuckets[i] holds every request
+// at or below latencyBounds[i], including all earlier buckets, while OTLP wants
+// the count falling within each bucket plus one overflow bucket. Emitting the
+// cumulative values directly would produce a plausible-looking histogram that is
+// wrong everywhere except the first bucket.
+//
+// len(bucketCounts) must be exactly len(explicitBounds)+1 or consumers reject or
+// misread the point.
+func (t *Telemetry) latencyHistogram(now, start string) map[string]any {
+	// Read each counter once. They are individually atomic but not a consistent
+	// snapshot, so differencing re-read values could produce nonsense.
+	cumulative := make([]int64, len(latencyBounds))
+	for i := range latencyBounds {
+		cumulative[i] = t.m.LatencyBuckets[i].Load()
+	}
+	count := t.m.Completed.Load()
+	sum := t.m.LatencyMS.Load()
+
+	counts := make([]string, 0, len(latencyBounds)+1)
+	prev := int64(0)
+	for _, c := range cumulative {
+		// Clamped: a request completing between two of the loads above can leave
+		// a difference momentarily negative, which is not a real value.
+		counts = append(counts, strconv.FormatInt(max(c-prev, 0), 10))
+		prev = c
+	}
+	counts = append(counts, strconv.FormatInt(max(count-prev, 0), 10)) // the +Inf bucket
+
+	bounds := make([]any, 0, len(latencyBounds))
+	for _, b := range latencyBounds {
+		bounds = append(bounds, b)
+	}
+	return map[string]any{
+		"name": "switchboard.request_duration_milliseconds",
+		"unit": "ms",
+		"histogram": map[string]any{
+			"aggregationTemporality": 2,
+			"dataPoints": []any{map[string]any{
+				"startTimeUnixNano": start,
+				"timeUnixNano":      now,
+				"count":             strconv.FormatInt(count, 10),
+				"sum":               float64(sum),
+				"bucketCounts":      counts,
+				"explicitBounds":    bounds,
+			}},
+		},
 	}
 }
 

@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -235,5 +236,108 @@ func TestOTLPMetricsDisabledWhenURLEmpty(t *testing.T) {
 	tel.wg.Wait()
 	if called.Load() != 0 {
 		t.Errorf("exported %d times with no endpoint configured", called.Load())
+	}
+}
+
+// Prometheus buckets are cumulative; OTLP bucketCounts are not. Emitting the
+// cumulative values directly would produce a histogram that looks plausible and
+// is wrong in every bucket but the first, which is worse than not exporting one.
+func TestOTLPHistogramBucketsAreDifferenced(t *testing.T) {
+	var got []byte
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		got, _ = io.ReadAll(r.Body)
+		w.WriteHeader(200)
+	}))
+	defer srv.Close()
+
+	m := &Metrics{}
+	// latencyBounds is [100 500 1000 5000 15000 60000 90000].
+	// Two land in the first bucket, one in the second, one past every bound.
+	for _, ms := range []int64{10, 50, 300, 200000} {
+		m.ObserveLatency(ms)
+	}
+	tel := &Telemetry{c: Config{OTLPMetricsURL: srv.URL}, m: m, http: srv.Client(), start: time.Now()}
+	tel.exportMetrics(context.Background())
+
+	var body struct {
+		ResourceMetrics []struct {
+			ScopeMetrics []struct {
+				Metrics []struct {
+					Name      string `json:"name"`
+					Histogram *struct {
+						AggregationTemporality int `json:"aggregationTemporality"`
+						DataPoints             []struct {
+							Count          string   `json:"count"`
+							Sum            float64  `json:"sum"`
+							BucketCounts   []string `json:"bucketCounts"`
+							ExplicitBounds []int64  `json:"explicitBounds"`
+						} `json:"dataPoints"`
+					} `json:"histogram"`
+				} `json:"metrics"`
+			} `json:"scopeMetrics"`
+		} `json:"resourceMetrics"`
+	}
+	if err := json.Unmarshal(got, &body); err != nil {
+		t.Fatalf("not valid OTLP JSON: %v", err)
+	}
+	var h *struct {
+		Count          string   `json:"count"`
+		Sum            float64  `json:"sum"`
+		BucketCounts   []string `json:"bucketCounts"`
+		ExplicitBounds []int64  `json:"explicitBounds"`
+	}
+	var temporality int
+	for _, mt := range body.ResourceMetrics[0].ScopeMetrics[0].Metrics {
+		if mt.Name == "switchboard.request_duration_milliseconds" {
+			if mt.Histogram == nil || len(mt.Histogram.DataPoints) != 1 {
+				t.Fatal("histogram missing or has no data point")
+			}
+			temporality = mt.Histogram.AggregationTemporality
+			h = &mt.Histogram.DataPoints[0]
+		}
+	}
+	if h == nil {
+		t.Fatalf("latency histogram was not exported: %s", got)
+	}
+	if temporality != 2 {
+		t.Errorf("aggregationTemporality = %d, want 2 (cumulative)", temporality)
+	}
+	// The invariant a consumer relies on.
+	if len(h.BucketCounts) != len(h.ExplicitBounds)+1 {
+		t.Fatalf("bucketCounts=%d bounds=%d; must differ by exactly one",
+			len(h.BucketCounts), len(h.ExplicitBounds))
+	}
+	if len(h.ExplicitBounds) != len(latencyBounds) {
+		t.Errorf("bounds = %v, want %v", h.ExplicitBounds, latencyBounds)
+	}
+	// The arithmetic check that catches a cumulative-vs-per-bucket mistake even
+	// when every individual value looks reasonable.
+	var total int64
+	for _, c := range h.BucketCounts {
+		n, err := strconv.ParseInt(c, 10, 64)
+		if err != nil {
+			t.Fatalf("bucket count %q is not an integer", c)
+		}
+		if n < 0 {
+			t.Errorf("negative bucket count %d", n)
+		}
+		total += n
+	}
+	if h.Count != "4" || total != 4 {
+		t.Errorf("count=%q, buckets sum to %d; want both 4", h.Count, total)
+	}
+	// And by value, not only by sum: 10ms and 50ms both fall at or below 100.
+	if h.BucketCounts[0] != "2" {
+		t.Errorf("first bucket = %q, want 2 (10ms and 50ms)", h.BucketCounts[0])
+	}
+	if h.BucketCounts[1] != "1" {
+		t.Errorf("second bucket = %q, want 1 (300ms)", h.BucketCounts[1])
+	}
+	// 200000ms exceeds every bound and belongs in the overflow bucket.
+	if h.BucketCounts[len(h.BucketCounts)-1] != "1" {
+		t.Errorf("overflow bucket = %q, want 1 (200000ms)", h.BucketCounts[len(h.BucketCounts)-1])
+	}
+	if h.Sum != float64(m.LatencyMS.Load()) {
+		t.Errorf("sum = %v, want %d", h.Sum, m.LatencyMS.Load())
 	}
 }

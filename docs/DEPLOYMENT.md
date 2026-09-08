@@ -61,8 +61,8 @@ neither CloudFormation template nor the sample task definition. Until one of the
 counter below is unreadable:
 
 - Set `otlp_metrics_url` to your OTLP/HTTP metrics endpoint. The gateway pushes every counter and
-  gauge every 30 seconds, needing no scraper and no extra container. Counters are cumulative sums;
-  the latency histogram is **not** exported.
+  gauge every 30 seconds, needing no scraper and no extra container, including the request-duration
+  histogram. Counters and the histogram are cumulative.
 - Or add the Collector as a same-task container, per step 6 above.
 
 ### What to alarm on
