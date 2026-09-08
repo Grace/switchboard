@@ -473,6 +473,7 @@ func (s *Server) chat(w http.ResponseWriter, r *http.Request) {
 		}
 		event.Attempts++
 		event.Provider = route.Provider
+		event.Model = route.Model
 		req, e := upstream(ctx, c, route, pc, s.Bedrock)
 		if e != nil {
 			s.circuits[route.Provider].release()
@@ -501,7 +502,16 @@ func (s *Server) chat(w http.ResponseWriter, r *http.Request) {
 			errBody, _ := io.ReadAll(io.LimitReader(res.Body, 1<<16))
 			res.Body.Close()
 			wait := retryAfter(res.Header.Get("Retry-After"))
-			switch classify(status, errBody) {
+			// Recorded on the event as well as switched on, so the span carries
+			// why a provider refused rather than only that one did. The last
+			// classification wins, which means a span can show status 200 with a
+			// fault set: that is a request that succeeded by routing around a
+			// refusal, and reading it beside attempts is the whole point. A
+			// successful request that cost two providers is not the same event as
+			// one that cost one, and until now they were indistinguishable.
+			f := classify(status, errBody)
+			event.Fault = f.String()
+			switch f {
 			case faultAccount:
 				// This account cannot serve at all. The provider is healthy, so
 				// this is a cooldown rather than a health failure, but a long

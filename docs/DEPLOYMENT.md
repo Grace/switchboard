@@ -122,6 +122,28 @@ counter that only ever climbs stays above any threshold once crossed.
 `switchboard.empty_completion_recovered_total` is worth a graph rather than a trigger: it is spend
 and latency, not an outage, and budget-aware routing should drive it toward zero on its own.
 
+### Provisioning them
+
+`controlplane/honeycombtool.py` creates the recipient, both triggers and the board in any
+Honeycomb environment, and is safe to re-run: everything is matched by name and updated in place.
+
+```sh
+export HONEYCOMB_API_KEY=...        # a Configuration key, not an ingest key
+python -m controlplane.honeycombtool --dataset Metrics --recipient ops@example.com
+python -m controlplane.honeycombtool --dataset Metrics --recipient ops@example.com --dry-run
+```
+
+The key needs **Manage Triggers, Manage Boards, Manage Recipients and Run Queries**. The ingest key
+in a gateway's `otlp_headers` has none of them; it can send telemetry and nothing else.
+
+`--recipient` is required unless you pass `--no-recipient`. **A trigger with no recipient notifies
+nobody** while still appearing healthy in the trigger list, which is worse than having no trigger at
+all because it reads as coverage on a dashboard. Silence should be something you typed.
+
+The tool executes each trigger's query before exiting, and fails if one does not run. That is not
+belt-and-braces: Honeycomb accepts a trigger whose query the engine refuses, lists it as healthy,
+and never fires it. Creating a trigger is not evidence that the trigger works.
+
 ### Four conditions in two triggers
 
 A trigger query may hold only one aggregate — a second calculation is refused with `query: only one

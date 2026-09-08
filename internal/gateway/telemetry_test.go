@@ -251,8 +251,9 @@ func TestOTLPHistogramBucketsAreDifferenced(t *testing.T) {
 	defer srv.Close()
 
 	m := &Metrics{}
-	// latencyBounds is [100 500 1000 5000 15000 60000 90000].
-	// Two land in the first bucket, one in the second, one past every bound.
+	// latencyBounds is [5 25 100 500 1000 5000 15000 60000 90000].
+	// 10ms and 50ms straddle the 25ms bound, 300ms falls under 500, and
+	// 200000ms is past every bound.
 	for _, ms := range []int64{10, 50, 300, 200000} {
 		m.ObserveLatency(ms)
 	}
@@ -326,12 +327,22 @@ func TestOTLPHistogramBucketsAreDifferenced(t *testing.T) {
 	if h.Count != "4" || total != 4 {
 		t.Errorf("count=%q, buckets sum to %d; want both 4", h.Count, total)
 	}
-	// And by value, not only by sum: 10ms and 50ms both fall at or below 100.
-	if h.BucketCounts[0] != "2" {
-		t.Errorf("first bucket = %q, want 2 (10ms and 50ms)", h.BucketCounts[0])
+	// And by value, not only by sum. This is also the assertion about the floor:
+	// 10ms and 50ms are both under the old 100ms first bound, and they must land
+	// in *different* buckets. A histogram whose first bucket swallows everything
+	// fast still passes every check above, and is the state that made Honeycomb
+	// report a negative P50 — the first bucket has no lower edge, so a percentile
+	// inside it is extrapolation below zero.
+	if h.BucketCounts[1] != "1" || h.BucketCounts[2] != "1" {
+		t.Errorf("10ms and 50ms landed in buckets %q/%q, want one each in [1] and [2]; "+
+			"anything below latencyBounds[0] is unmeasurable",
+			h.BucketCounts[1], h.BucketCounts[2])
 	}
-	if h.BucketCounts[1] != "1" {
-		t.Errorf("second bucket = %q, want 1 (300ms)", h.BucketCounts[1])
+	if h.BucketCounts[0] != "0" {
+		t.Errorf("bucket at or below %dms = %q, want 0", latencyBounds[0], h.BucketCounts[0])
+	}
+	if h.BucketCounts[3] != "1" {
+		t.Errorf("bucket for 300ms = %q, want 1", h.BucketCounts[3])
 	}
 	// 200000ms exceeds every bound and belongs in the overflow bucket.
 	if h.BucketCounts[len(h.BucketCounts)-1] != "1" {
@@ -669,5 +680,131 @@ func TestOTLPHeaderWithEmptyEnvIsNotSent(t *testing.T) {
 	tel.exportMetrics(context.Background())
 	if present.Load() {
 		t.Error("an empty environment variable produced an empty header")
+	}
+}
+
+// spanAttrs decodes one exported span's attributes into a name/value map. Only
+// the two value kinds these spans use are handled; anything else would be a new
+// attribute type and should fail loudly here rather than read as absent.
+func spanAttrs(t *testing.T, body []byte) (map[string]string, map[string]any) {
+	t.Helper()
+	var b struct {
+		ResourceSpans []struct {
+			ScopeSpans []struct {
+				Spans []map[string]any `json:"spans"`
+			} `json:"scopeSpans"`
+		} `json:"resourceSpans"`
+	}
+	if err := json.Unmarshal(body, &b); err != nil {
+		t.Fatalf("not valid OTLP JSON: %v", err)
+	}
+	if len(b.ResourceSpans) == 0 || len(b.ResourceSpans[0].ScopeSpans) == 0 ||
+		len(b.ResourceSpans[0].ScopeSpans[0].Spans) == 0 {
+		t.Fatalf("no span exported: %s", body)
+	}
+	span := b.ResourceSpans[0].ScopeSpans[0].Spans[0]
+	out := map[string]string{}
+	for _, a := range span["attributes"].([]any) {
+		m := a.(map[string]any)
+		v := m["value"].(map[string]any)
+		switch {
+		case v["stringValue"] != nil:
+			out[m["key"].(string)] = v["stringValue"].(string)
+		case v["intValue"] != nil:
+			out[m["key"].(string)] = v["intValue"].(string)
+		default:
+			t.Fatalf("attribute %q has an unhandled value kind: %v", m["key"], v)
+		}
+	}
+	return out, span
+}
+
+// Honeycomb's error-rate detection reads error.type, error.message,
+// exception.type and exception.message. It does not read the span status, so a
+// span carrying a correct status and nothing else leaves the service reported as
+// having no recognised error attributes and refused monitoring entirely. That
+// failure is silent: the data looks right, and the only symptom is a service
+// that never gets watched.
+func TestFailedSpanCarriesErrorType(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		status int
+		want   string
+	}{
+		{"server error", 503, "503"},
+		{"client error", 429, "429"},
+		{"success", 200, ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var got []byte
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				got, _ = io.ReadAll(r.Body)
+				w.Write([]byte(`{}`))
+			}))
+			defer srv.Close()
+			tel := &Telemetry{c: Config{OTLPURL: srv.URL}, m: &Metrics{}, http: srv.Client()}
+			tel.exportOTLP(context.Background(), Event{
+				ID: "a", TraceID: "t", SpanID: "s", Status: tc.status, Start: 1, End: 2,
+			})
+			attrs, span := spanAttrs(t, got)
+			if attrs["error.type"] != tc.want {
+				t.Errorf("error.type = %q, want %q", attrs["error.type"], tc.want)
+			}
+			// The status block and the attribute have to agree, or one of the two
+			// consumers of this span is being told the opposite of the other.
+			if hasStatus := span["status"] != nil; hasStatus != (tc.want != "") {
+				t.Errorf("span status present = %v, but error.type = %q", hasStatus, attrs["error.type"])
+			}
+		})
+	}
+}
+
+// The routing loop knows which model answered, how many providers it took, and
+// why any of them refused. Until these were exported the span kept none of it,
+// so the metrics could say how often failover happened while no trace could say
+// what happened to one request.
+func TestSpanCarriesRoutingDecision(t *testing.T) {
+	var got []byte
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		got, _ = io.ReadAll(r.Body)
+		w.Write([]byte(`{}`))
+	}))
+	defer srv.Close()
+	tel := &Telemetry{c: Config{OTLPURL: srv.URL}, m: &Metrics{}, http: srv.Client()}
+	// A request that succeeded on its third provider after an account refusal:
+	// status 200 with a fault set is not a contradiction, it is the case worth
+	// being able to see.
+	tel.exportOTLP(context.Background(), Event{
+		ID: "a", TraceID: "t", SpanID: "s", Provider: "bedrock", Model: "claude-sonnet-4",
+		Status: 200, Attempts: 3, Fault: faultAccount.String(), Start: 1, End: 2,
+	})
+	attrs, _ := spanAttrs(t, got)
+	for k, want := range map[string]string{
+		"gen_ai.provider.name": "bedrock",
+		"gen_ai.request.model": "claude-sonnet-4",
+		"switchboard.attempts": "3",
+		"switchboard.fault":    "account",
+	} {
+		if attrs[k] != want {
+			t.Errorf("%s = %q, want %q", k, attrs[k], want)
+		}
+	}
+}
+
+// The four names are a query surface: a dashboard or trigger filtering on
+// "account" keeps working only while this mapping holds. Renaming one is a
+// breaking change to anything built on it, so it should take a deliberate edit
+// here rather than happening as a side effect of touching the enum.
+func TestFaultNamesAreStable(t *testing.T) {
+	for f, want := range map[fault]string{
+		faultTerminal:  "terminal",
+		faultRateLimit: "rate_limit",
+		faultAccount:   "account",
+		faultDegraded:  "degraded",
+		fault(99):      "unknown",
+	} {
+		if got := f.String(); got != want {
+			t.Errorf("fault(%d).String() = %q, want %q", int(f), got, want)
+		}
 	}
 }

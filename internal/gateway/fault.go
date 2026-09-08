@@ -46,6 +46,27 @@ const (
 	faultDegraded
 )
 
+// String is what reaches telemetry as switchboard.fault. These four names are
+// the only provider-neutral vocabulary the gateway has: OpenAI says 429,
+// Anthropic says overloaded_error, Bedrock says ThrottlingException and Gemini
+// says RESOURCE_EXHAUSTED, and without this reduction a question like "how many
+// requests failed because an account could not pay" has to be asked once per
+// provider and rewritten whenever one changes its wording. Keep the values
+// stable and lowercase; they are a query surface, not a log line.
+func (f fault) String() string {
+	switch f {
+	case faultTerminal:
+		return "terminal"
+	case faultRateLimit:
+		return "rate_limit"
+	case faultAccount:
+		return "account"
+	case faultDegraded:
+		return "degraded"
+	}
+	return "unknown"
+}
+
 // accountPhrases are lifted verbatim from real provider responses. They will
 // drift, and there is no version to pin, so treat a miss as expected rather than
 // exceptional: the consequence is a failover that did not happen, not a wrong

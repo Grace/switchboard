@@ -77,11 +77,20 @@ type Metrics struct {
 	// runtime has kept rather than objects the program is holding, which a heap
 	// profile would not explain.
 	Goroutines, HeapAlloc, HeapObjects, HeapSys atomic.Int64
-	LatencyBuckets                              [7]atomic.Int64
+	LatencyBuckets                              [len(latencyBounds)]atomic.Int64
 	LogDropped                                  *atomic.Int64
 }
 
-var latencyBounds = [7]int64{100, 500, 1000, 5000, 15000, 60000, 90000}
+// The first bucket of an explicit-bounds histogram has no lower bound, so
+// whatever sits below latencyBounds[0] is unmeasurable: a percentile drawn from
+// that bucket extrapolates below zero and Honeycomb duly reports a negative
+// duration. ObserveLatency runs from a defer in Server.chat on every request,
+// not only on inference, so 5 and 25 are not padding. Auth rejections, policy
+// errors, refused requests and idempotent replays all finish in single-digit
+// milliseconds, and with a floor of 100 they were indistinguishable from each
+// other and from a fast completion. Everything from 100 up is unchanged, so a
+// query written against le="100" or above still means what it did.
+var latencyBounds = [9]int64{5, 25, 100, 500, 1000, 5000, 15000, 60000, 90000}
 
 func (m *Metrics) ObserveLatency(ms int64) {
 	m.LatencyMS.Add(ms)
@@ -184,6 +193,15 @@ type Event struct {
 	Attempts  int    `json:"attempts"`
 	Start     int64  `json:"start_ns"`
 	End       int64  `json:"end_ns"`
+	// Span-only, and json:"-" is load-bearing rather than tidiness. The control
+	// plane declares its Event model with extra="forbid", so one unrecognised
+	// key does not degrade an event, it rejects it: every event would fail
+	// validation and all control-plane telemetry would stop. Spans reach the
+	// OTLP endpoint directly without passing through the control plane, so these
+	// two carry to Honeycomb regardless. Sending either upstream is a separate
+	// change that has to deploy the control plane first.
+	Model string `json:"-"`
+	Fault string `json:"-"`
 }
 
 func randomID(n int) string {
@@ -622,12 +640,54 @@ func (t *Telemetry) otlpHeaders(req *http.Request) {
 
 // OTLP/HTTP JSON encoding follows the OpenTelemetry protobuf JSON mapping.
 func (t *Telemetry) exportOTLP(ctx context.Context, e Event) {
-	span := map[string]any{"traceId": e.TraceID, "spanId": e.SpanID, "name": "switchboard.inference", "kind": 2, "startTimeUnixNano": strconv.FormatInt(e.Start, 10), "endTimeUnixNano": strconv.FormatInt(e.End, 10), "attributes": []any{map[string]any{"key": "gen_ai.provider.name", "value": map[string]any{"stringValue": e.Provider}}, map[string]any{"key": "http.response.status_code", "value": map[string]any{"intValue": strconv.Itoa(e.Status)}}}}
+	attrs := []any{
+		map[string]any{"key": "gen_ai.provider.name", "value": map[string]any{"stringValue": e.Provider}},
+		map[string]any{"key": "http.response.status_code", "value": map[string]any{"intValue": strconv.Itoa(e.Status)}},
+		// What the routing loop decided, which the span used to drop on the floor.
+		// The metrics already count how often failover happens; without these,
+		// nothing answers what happened to one particular request, which is the
+		// only question a trace exists to answer. All three are read from values
+		// the request already had, so this costs nothing to produce.
+		//
+		// gen_ai.request.model is the model sent upstream, which is what semconv
+		// means by "requested" — of the provider, not of the gateway. attempts and
+		// fault stay under switchboard.* because they describe routing, and no
+		// OpenTelemetry convention covers a router yet; an experimental namespace
+		// is what OpenTelemetry asks for while that is true.
+		map[string]any{"key": "switchboard.attempts", "value": map[string]any{"intValue": strconv.Itoa(e.Attempts)}},
+	}
+	if e.Model != "" {
+		attrs = append(attrs, map[string]any{"key": "gen_ai.request.model", "value": map[string]any{"stringValue": e.Model}})
+	}
+	if e.Fault != "" {
+		attrs = append(attrs, map[string]any{"key": "switchboard.fault", "value": map[string]any{"stringValue": e.Fault}})
+	}
+	span := map[string]any{"traceId": e.TraceID, "spanId": e.SpanID, "name": "switchboard.inference", "kind": 2, "startTimeUnixNano": strconv.FormatInt(e.Start, 10), "endTimeUnixNano": strconv.FormatInt(e.End, 10), "attributes": attrs}
 	if e.ParentID != "" {
 		span["parentSpanId"] = e.ParentID
 	}
 	if e.Status >= 400 {
 		span["status"] = map[string]any{"code": 2}
+		// The span status above is correct and not enough on its own: Honeycomb's
+		// error-rate detection reads error.type, error.message, exception.type and
+		// exception.message, and ignores the status. A service whose spans carry
+		// only a status is reported as having no recognised error attributes and
+		// is refused monitoring, which is a silent gap of exactly the kind this
+		// telemetry exists to close.
+		//
+		// The value is the status code, per OTel's HTTP convention for an error
+		// with no exception class behind it. It is also the honest taxonomy here:
+		// every fail() in server.go picks a distinct status for a distinct cause,
+		// so a second vocabulary would only restate the first at higher
+		// cardinality on the field a rate is aggregated over.
+		//
+		// error.message is deliberately absent. Some fail() messages are derived
+		// from a provider response or from decoding the request body, and
+		// docs/SECURITY.md promises neither appears in product telemetry. One
+		// recognised attribute is enough to be monitored; it is not worth a
+		// written guarantee.
+		span["attributes"] = append(span["attributes"].([]any),
+			map[string]any{"key": "error.type", "value": map[string]any{"stringValue": strconv.Itoa(e.Status)}})
 	}
 	body := map[string]any{"resourceSpans": []any{map[string]any{"resource": map[string]any{"attributes": []any{map[string]any{"key": "service.name", "value": map[string]any{"stringValue": "switchboard-gateway"}}}}, "scopeSpans": []any{map[string]any{"scope": map[string]any{"name": "switchboard", "version": "1.0.0"}, "spans": []any{span}}}}}}
 	req, _ := http.NewRequestWithContext(ctx, "POST", t.c.OTLPURL, bytes.NewReader(jsonBytes(body)))

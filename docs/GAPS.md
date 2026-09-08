@@ -192,8 +192,8 @@ Each of these is backed by a run recorded in `docs/VALIDATION.md`.
    inject CR or LF, and the map cannot override `Content-Type` or `Authorization`.
 
    **Verified against Honeycomb on 2026-09-08.** Pointing the dev stack at
-   `api.honeycomb.io` produced two datasets in the `gracefulcode` team's `test`
-   environment within a minute: `metrics`, carrying 28 `switchboard.*` columns,
+   `api.honeycomb.io` produced two datasets in a test environment within a
+   minute: `metrics`, carrying 28 `switchboard.*` columns,
    and `switchboard-gateway`, carrying spans with `gen_ai.provider.name`,
    `duration_ms` and `trace.trace_id`. The 28 are 20 counters, 7 gauges and the
    request-duration histogram, which is exactly the list `series()` builds in
@@ -248,11 +248,80 @@ Each of these is backed by a run recorded in `docs/VALIDATION.md`.
    drawn from it is extrapolation into negative time. Honeycomb's own value axis
    confirms it: the range tops out at exactly 100, the first bound.
 
-   The fix is a lower floor — bounds at 5, 10, 25 and 50 ms before the existing
-   100 — which changes the Prometheus exposition as well as OTLP and so is a
-   decision rather than a patch. Until then the distribution is readable for
-   shape and the counts are right, but no latency SLO or percentile alarm built
-   on this column means anything. The board panel says so on its face.
+   **Fixed as far as it can be, which is not all the way.** `latencyBounds` now
+   starts at 5 ms rather than 100, and `LatencyBuckets` is sized from
+   `len(latencyBounds)` so the array and the bounds cannot drift apart. The
+   change is purely additive: every previous bound survives, so a query written
+   against `le="100"` or above still means what it did. Measured after the
+   change, on traffic mixing successful mock completions with 401, 400 and 503
+   rejections: **P95 and P99 came back at 62.5 ms, where every percentile used
+   to be -100. P50 is still -5.**
+
+   That residue is structural rather than a missed spot. The first bucket of an
+   explicit-bounds histogram has no lower edge wherever the floor is put, so
+   whatever fraction of traffic falls beneath the lowest bound always yields a
+   negative estimate for that fraction. Here the sub-millisecond rejections are
+   about half the requests, so the median still lands inside it. Lowering the
+   floor again would move the problem rather than remove it.
+
+   The cause underneath is that one histogram measures two populations: requests
+   that reached a provider and took tens of milliseconds or more, and requests
+   refused locally in microseconds. `ObserveLatency` is called from a `defer` in
+   `Server.chat`, so every rejection sits in there alongside the inference.
+   Splitting them, or excluding requests that never reached a provider, is what
+   would make a median mean something; that is a design change and is not done.
+   Until then read the tail, read the heatmap for shape, and do not put a latency
+   SLO on the median. The board panel says so on its face.
+
+   **Traces carried a correct error signal that nothing could consume.** Spans
+   set the OTLP status to `code: 2` on any 4xx or 5xx and always had, and it
+   arrives in Honeycomb as `status_code`. Honeycomb's anomaly detection does not
+   read it. Asked directly, the account named the fields it does read:
+   `error`, `error.message`, `error.type`, `exception.message`, `exception.type`.
+   The service was therefore reported as having no recognised error attributes
+   and refused monitoring outright, which is a gap that looks like working
+   telemetry from every angle except the one that matters.
+
+   Failed spans now carry `error.type`, valued as the status code, which is what
+   OTel's HTTP convention prescribes when there is no exception class and is also
+   the honest taxonomy here: every `fail()` in `server.go` picks a distinct status
+   for a distinct cause. `error.message` is deliberately not emitted, because some
+   of those messages are derived from a provider response or from decoding the
+   request body, and `docs/SECURITY.md` promises neither appears in product
+   telemetry. One recognised attribute is enough to be monitored and is not worth
+   a written guarantee. Confirmed against the live dataset: `error.type` appears,
+   and Honeycomb derived a boolean `error` column from it unprompted, so two of
+   the five fields are now populated.
+
+   The signal had not left `ineligible` at the time of writing, and its
+   `updated_at` still predated the data. Eligibility also wants a rolling window
+   of continuous coverage, which a dev stack running in bursts does not produce;
+   the separate **presence** signal is ineligible for that reason alone and no
+   code change reaches it.
+
+   **Spans now carry the routing decision.** `gen_ai.request.model`,
+   `switchboard.attempts` and `switchboard.fault`, all read from values the
+   routing loop already had and discarded. Before this the metrics could say how
+   often failover happened while no trace could say what happened to one request.
+   `switchboard.fault` is the interesting one: `fault.go` already reduces four
+   providers' incompatible failure vocabularies (`ThrottlingException`, `429`,
+   `RESOURCE_EXHAUSTED`, `overloaded_error`) to `terminal` / `rate_limit` /
+   `account` / `degraded`, and that classification was being used for a routing
+   decision and then thrown away. A span may show status 200 with a fault set:
+   that is a request that succeeded by routing around a refusal, and reading it
+   beside `attempts` is the point.
+
+   Both new `Event` fields are `json:"-"`. The control plane declares its event
+   model `extra="forbid"`, so one unrecognised key does not degrade an event, it
+   rejects it, and every event would fail. Spans reach the OTLP endpoint without
+   passing through the control plane, so this costs nothing. Verified after the
+   change: control-plane telemetry still returns 200.
+
+   The namespace is `switchboard.*` rather than `gen_ai.routing.*` deliberately.
+   No OpenTelemetry convention covers a router yet, and an experimental namespace
+   is what OpenTelemetry asks for while that is true. If these four fault
+   categories are still the right four after real traffic across four providers,
+   that is the piece with any claim on going upstream.
 
 6. **Anthropic prompt-cache tokens are not counted.** Responses carry
    `cache_creation_input_tokens` and `cache_read_input_tokens`; neither is
