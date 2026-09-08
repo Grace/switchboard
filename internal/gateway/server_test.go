@@ -352,3 +352,50 @@ func TestEmptyStreamFailsOverBeforeAnyByteIsSent(t *testing.T) {
 		t.Errorf("EmptyCompletion = %d, want 1", s.Metrics.EmptyCompletion.Load())
 	}
 }
+
+// pprof exposes whatever is in memory, which here means provider API keys read
+// from the environment into request headers, plus prompt and completion text.
+// These two properties are the reason it is safe to ship at all, so they are
+// tested rather than assumed.
+func TestPprofIsOffByDefault(t *testing.T) {
+	s := testServer(t, map[string]ProviderConfig{"openai": {URL: "https://api.openai.com", KeyEnv: "PROVIDER_KEY"}})
+	r := httptest.NewRequest("GET", "/debug/pprof/heap", nil)
+	r.Header.Set("Authorization", "Bearer "+strings.Repeat("x", 32))
+	w := httptest.NewRecorder()
+	s.Handler().ServeHTTP(w, r)
+	if w.Code != 404 {
+		t.Fatalf("pprof answered %d in a default build; it must not be routed at all", w.Code)
+	}
+}
+
+// The gateway shares a network namespace with the customer's application. If an
+// enabled pprof were readable without the local token, that application could
+// read provider credentials out of this process, which is precisely what the
+// local-token design exists to prevent.
+func TestPprofRequiresTheLocalToken(t *testing.T) {
+	s := testServer(t, map[string]ProviderConfig{"openai": {URL: "https://api.openai.com", KeyEnv: "PROVIDER_KEY"}})
+	s.C.EnablePprof = true
+	h := s.Handler()
+
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, httptest.NewRequest("GET", "/debug/pprof/heap", nil))
+	if w.Code != 401 {
+		t.Fatalf("unauthenticated pprof returned %d; a co-located process could read the heap", w.Code)
+	}
+
+	w = httptest.NewRecorder()
+	bad := httptest.NewRequest("GET", "/debug/pprof/heap", nil)
+	bad.Header.Set("Authorization", "Bearer "+strings.Repeat("z", 32))
+	h.ServeHTTP(w, bad)
+	if w.Code != 401 {
+		t.Fatalf("pprof accepted a wrong token, returning %d", w.Code)
+	}
+
+	w = httptest.NewRecorder()
+	ok := httptest.NewRequest("GET", "/debug/pprof/heap", nil)
+	ok.Header.Set("Authorization", "Bearer "+strings.Repeat("x", 32))
+	h.ServeHTTP(w, ok)
+	if w.Code != 200 {
+		t.Fatalf("pprof refused the local token, returning %d", w.Code)
+	}
+}

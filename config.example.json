@@ -38,5 +38,6 @@
   "otlp_url": "",
   "otlp_metrics_url": "",
   "provider_check_strict": false,
+  "enable_pprof": false,
   "allow_local_http": false
 }

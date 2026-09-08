@@ -10,6 +10,23 @@ The control plane stores SHA-256 hashes of high-entropy random bearer tokens, no
 
 RLS guards accidental missing filters; it is not isolation from a fully compromised runtime database session, which can change its own `app.tenant` setting. For that threat model use separate database credentials/databases or an external authorization proxy per tenant. Similarly, a compromised signing control plane can sign malicious routing policies within the gateway's locally constrained provider URLs. Signatures protect distribution integrity, not a compromised signer.
 
+## Runtime profiling
+
+`enable_pprof` exposes Go runtime profiles at `/debug/pprof/`. It is **off by default and
+authenticated when on**, which is deliberately stricter than `/metrics`.
+
+The difference is what each exposes. `/metrics` publishes counters, which are safe to read from
+anywhere inside the task boundary. A heap profile publishes whatever is in memory: provider API keys,
+which the gateway reads from its environment into request headers, along with prompt and completion
+text. Other containers in the task share the gateway's network namespace, so an unauthenticated
+pprof would let the colocated application read provider credentials out of the gateway process. That
+is exactly what the local-token design exists to prevent, so pprof requires the same bearer token as
+`/v1/chat/completions`.
+
+Enable it to diagnose a specific problem and turn it off afterwards. Anyone holding the local token
+can read the heap while it is on, so the token's blast radius is larger with pprof enabled than
+without it.
+
 ## Policy format
 
 Envelope fields: `key_id`, base64 `payload`, base64 Ed25519 `signature`. Signed bytes are:

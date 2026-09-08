@@ -52,6 +52,14 @@ type Config struct {
 	// being withheld from routing is the right default for a gateway whose whole
 	// purpose is to keep serving when one provider cannot.
 	ProviderCheckStrict bool `json:"provider_check_strict"`
+	// EnablePprof exposes Go runtime profiles for debugging. Off by default, and
+	// authenticated when on, because a heap profile contains whatever is in
+	// memory: provider API keys read from the environment into request headers,
+	// prompt text and completion text. The gateway shares a network namespace
+	// with the customer's application, so an unauthenticated pprof would let
+	// that application read provider credentials out of this process, which is
+	// the one thing the local-token design exists to prevent.
+	EnablePprof bool `json:"enable_pprof"`
 }
 
 func secureURL(s string, local bool) bool {

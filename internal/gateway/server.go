@@ -10,6 +10,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"net/http/pprof"
 	"os"
 	"strconv"
 	"strings"
@@ -238,6 +239,29 @@ func (s *Server) Handler() http.Handler {
 		w.WriteHeader(200)
 	})
 	mux.Handle("GET /metrics", s.Metrics)
+	if s.C.EnablePprof {
+		// Authenticated, unlike /metrics. Counters are safe to expose on
+		// loopback; a heap dump is not, because it carries provider keys and
+		// prompt text to anything sharing the task's network namespace.
+		//
+		// Registered explicitly rather than by importing net/http/pprof for its
+		// init side effect, which installs on DefaultServeMux, a mux this server
+		// never serves.
+		guard := func(h http.HandlerFunc) http.HandlerFunc {
+			return func(w http.ResponseWriter, r *http.Request) {
+				if !s.authorized(r) {
+					problem(w, 401, "unauthorized")
+					return
+				}
+				h(w, r)
+			}
+		}
+		mux.HandleFunc("GET /debug/pprof/", guard(pprof.Index))
+		mux.HandleFunc("GET /debug/pprof/cmdline", guard(pprof.Cmdline))
+		mux.HandleFunc("GET /debug/pprof/profile", guard(pprof.Profile))
+		mux.HandleFunc("GET /debug/pprof/symbol", guard(pprof.Symbol))
+		mux.HandleFunc("GET /debug/pprof/trace", guard(pprof.Trace))
+	}
 	mux.HandleFunc("POST /v1/chat/completions", s.chat)
 	mux.HandleFunc("GET /runtime", func(w http.ResponseWriter, r *http.Request) {
 		if !s.authorized(r) {

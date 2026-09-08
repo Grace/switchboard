@@ -216,6 +216,11 @@ def cmd_init(args):
         "otlp_url": "",
         # Required for plain http to loopback; the gateway refuses it otherwise.
         "allow_local_http": True,
+        # Local only. pprof exposes memory contents, including provider keys and
+        # prompt text; this stack already keeps its signing seed and tokens in
+        # plaintext, so it is the right place for it and the wrong place for
+        # anything real.
+        "enable_pprof": True,
     }
     with open(args.config, "w") as f:
         json.dump(config, f, indent=2)
