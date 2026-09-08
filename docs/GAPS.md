@@ -69,6 +69,25 @@ Each of these is backed by a run recorded in `docs/VALIDATION.md`.
     successes, where five failures gave 1,803 against 595. The code is
     self-consistent; `docs/ARCHITECTURE.md` was imprecise and has been corrected.
 
+16. **Account-level provider failures now fail over.** Three real refusals were
+    measured and are now classified from the response body rather than the
+    status code alone: OpenAI out of credits (429 with no `Retry-After` and no
+    rate-limit headers), Anthropic balance too low (400, not 402 or 429), and
+    Gemini quota exhausted (429). Each withholds that provider for 60 seconds
+    and tries the next route, counted as `switchboard_account_failover_total`.
+    Classification fails safe: an unrecognised 400 stays terminal, because a
+    genuinely malformed request would be refused identically everywhere and
+    replaying it would multiply the waste rather than avoid it. A terminal
+    rejection now carries the provider's own reason instead of a bare
+    "provider rejected request".
+17. **Providers are checked at startup.** Once the first signed policy verifies,
+    each provider it routes to receives one real 8-token completion using a model
+    the policy names. A failure withholds that provider and logs at ERROR;
+    `provider_check_strict` additionally holds `/readyz` at 503 so the platform
+    replaces the task. A completion is used rather than an auth-only endpoint
+    because `GET /v1/models` returned 200 on a key whose account had no credits,
+    minutes before a completion on the same key returned 429.
+
 ## Still open
 
 1. **Deployment is proven for the quickstart only.** `quickstart.yaml` has been
@@ -88,19 +107,14 @@ Each of these is backed by a run recorded in `docs/VALIDATION.md`.
    green suite does not always mean Gemini was actually reached; and model names
    proved to be a live dependency rather than a constant, with two of the three
    originally targeted models retired out from under the tests.
-3. **Provider errors that should probably fail over do not.** Three real cases,
-   all landing on the same path:
-   - OpenAI reasoning models report *truncation* as HTTP 400, not as
-     `finish_reason: length`.
-   - Anthropic reports *billing exhaustion* as HTTP 400, not 402 or 429.
-   - A real OpenAI 429 carried no `Retry-After` and no `x-ratelimit-*` headers,
-     so `retryAfter()` returns 0 and the breaker releases immediately, causing
-     the gateway to re-attempt an exhausted provider on every request.
-
-   `server.go` maps 400 and 422 to "provider rejected request" with no failover,
-   which is right for a genuinely malformed request and wrong for an
-   account-level failure on one provider when another is configured and funded.
-   Changing this alters routing semantics, so it is recorded rather than done.
+3. **Empty completions are billed but not delivered, in one remaining shape.**
+   A reasoning model can spend an entire token budget on hidden reasoning and
+   return no visible text. The gateway now fails over and counts
+   `switchboard_empty_completion_total`, but `ParseChat` still defaults
+   `max_tokens` to 1024, and gpt-5-nano was measured returning zero characters
+   at exactly that budget for an ordinary prompt. Raising the default would cost
+   every caller money to protect against one model family, so the default is
+   unchanged until the new metric shows how often this happens in practice.
 4. **Anthropic prompt-cache tokens are not counted.** Responses carry
    `cache_creation_input_tokens` and `cache_read_input_tokens`; neither is
    modelled. Both are zero today, so input accounting is currently correct, but

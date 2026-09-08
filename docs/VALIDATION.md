@@ -390,3 +390,70 @@ recur here. Anthropic's streaming path rejects unknown event types outright; all
 stream emitted (`message_start`, `content_block_start`, `content_block_delta`, `content_block_stop`,
 `message_delta`, `message_stop`, `ping`) are in its allowed set, with `content_block.type: text` and
 `delta.type: text_delta` as expected.
+
+## 2026-09-07 — account-level failover, and empty completions
+
+Live verification of the adapters left three provider refusals recorded but unhandled. Investigating
+them found a fourth that was worse, because it looked like success.
+
+### The measured refusals
+
+| Provider | Condition | Response | Old behaviour |
+|---|---|---|---|
+| OpenAI | No credits | `429`, no `Retry-After`, no `x-ratelimit-*` | Circuit released, retried every request forever |
+| Anthropic | Balance too low | **`400`**, not 402 or 429 | `fail(400)`, provider recorded healthy, no failover |
+| Gemini | Quota exhausted | `429` "exceeded your current quota" | Same as OpenAI |
+| OpenAI reasoning | Budget too small | `400` about `max_tokens` | `fail(400, "provider rejected request")` |
+
+The Anthropic case is the one that mattered. A 400 was read as "this request is malformed", so a
+caller got an opaque error while a funded provider sat unused in the same signed policy.
+
+### Empty completions: measured, and worse
+
+Investigating the fourth row showed the `400` only occurs at `max_tokens: 1`. From 4 upward the same
+model returns **HTTP 200, `finish_reason: length`, and zero visible characters**, having spent the
+whole budget on hidden reasoning. Measured on `gpt-5-nano`, prompt "Write a long paragraph about the
+sea":
+
+```
+budget 1024   finish=length   0 chars      1024 reasoning   billed 1024
+budget 2048   finish=stop     1469 chars    832 reasoning   billed 1159
+budget 4096   finish=stop     2060 chars    640 reasoning   billed 1082
+```
+
+1024 is `ParseChat`'s own default. The gateway reported these as **200 successes** and metered the
+full budget, so a caller could pay for 1024 tokens and receive nothing. It is prompt-dependent —
+"reply with ok" needed 64 reasoning tokens against the same model — so no fixed budget avoids it.
+
+### What changed
+
+Refusals are now classified from the body, because the status code cannot separate an account that
+cannot pay from a request that is malformed (`internal/gateway/fault.go`). An account fault withholds
+that provider for 60 seconds and tries the next route; a terminal fault keeps the previous behaviour
+and now carries the provider's own reason. **Classification fails safe**: an unrecognised 400 stays
+terminal. A missed billing phrase costs a failover that could have happened; a wrongly matched one
+would replay a bad request across every configured provider, which is worse.
+
+Empty completions fail over and are counted. On the streaming path the frame carrying a truncation
+finish reason is held back until text arrives, so a stream that produces nothing has sent no bytes
+and can still fail over without breaking the no-replay-after-acceptance rule.
+
+Providers are checked once at startup, after the first signed policy verifies, with a real 8-token
+completion to each provider the policy routes to. An auth-only check was rejected on evidence:
+`GET /v1/models` returned 200 on the no-credits OpenAI key minutes before a completion on that same
+key returned 429. A check that passes while every real request fails is worse than no check.
+
+New counters: `switchboard_account_failover_total`, `switchboard_empty_completion_total`,
+`switchboard_provider_probe_failed_total`. Reasoning tokens are now carried through `normalize()`,
+which is the leading indicator: reasoning approaching the caller's budget predicts the empty
+completion before it happens.
+
+### Tests
+
+Classification is driven by verbatim captured bodies rather than invented ones, since the whole
+mechanism is string matching against real wording. Coverage includes the direction that matters most:
+an unrecognised 400 must **not** fail over, and an account fault must not increment the breaker's
+failure count, because the provider is healthy and only the account is not.
+
+Not changed: `ParseChat`'s 1024 default. Raising it would cost every caller money to protect against
+one model family, and the operator can now see the problem instead. Recorded in `docs/GAPS.md`.

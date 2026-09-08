@@ -145,6 +145,42 @@ failure would wrongly accuse the adapter. Gemini hits this most often.
 
 Cost is a few cents. Keys can be revoked afterwards, and should be.
 
+### The startup provider check
+
+Once the first signed policy verifies, the gateway sends one 8-token completion to each provider the
+policy routes to, using a model that policy names. A failure withholds that provider from routing for
+60 seconds and logs at ERROR; the existing half-open probe lets it return on its own once the account
+is funded or the key replaced, with no restart.
+
+Setting `"provider_check_strict": true` additionally holds `/readyz` at 503, so the platform's own
+health check replaces the task rather than letting it serve requests that will all fail upstream.
+Default is `false`, because a gateway whose purpose is to keep serving when one provider is
+unavailable should not refuse to start over one.
+
+It sends a real completion rather than hitting an auth-only endpoint deliberately. `GET /v1/models`
+returned 200 on an OpenAI key whose account had no credits, minutes before a completion on the same
+key returned 429. A check that passes while every real request fails is worse than no check, because
+it turns an obvious failure into a confident one.
+
+### When a model returns nothing
+
+Reasoning models spend their token budget on hidden reasoning before writing any answer, and reserve
+nothing for the answer itself. If the budget runs out first, the provider returns HTTP 200 with
+`finish_reason: length` and empty content, and bills for every token. Measured on `gpt-5-nano`:
+
+```
+max_tokens 1024   0 characters      1024 reasoning tokens   billed 1024
+max_tokens 2048   1469 characters    832 reasoning tokens   billed 1159
+```
+
+The gateway fails over to the next route rather than returning an empty answer, and counts
+`switchboard_empty_completion_total`. If every route does the same, the caller gets a 503 saying so
+rather than a generic routing failure, because the fix is theirs: raise `max_tokens`.
+
+There is no budget that avoids this generally. The same model answered "reply with ok" using 64
+reasoning tokens, so the requirement is prompt-dependent. Watch the ratio of reasoning tokens to the
+caller's budget: it approaches 1.0 before the output goes empty.
+
 ### Which key is actually in use
 
 The gateway reads each provider's key from the environment variable named by `key_env`, and
