@@ -12,7 +12,7 @@ It runs beside your application in the same task, exposes one OpenAI-compatible
 endpoint on loopback, and routes to OpenAI, Anthropic or Gemini according to a
 signed policy it cannot itself edit.
 
-**Release status: production-oriented release candidate, not production-certified.** This is a fresh implementation of the architecture described in the earlier Switchboard conversation. The v0.2 ZIP was unavailable, so compatibility with its implementation or persisted data has not been verified. Read [validation](docs/VALIDATION.md) and [remaining gaps](docs/GAPS.md) before deployment.
+**Release status: production-oriented release candidate, not production-certified.** This is a fresh implementation of the Switchboard architecture and has not been verified for compatibility with any earlier version's implementation or persisted data. Read [validation](docs/VALIDATION.md) and [remaining gaps](docs/GAPS.md) before deployment.
 
 ## What is implemented
 
