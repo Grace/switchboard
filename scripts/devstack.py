@@ -213,7 +213,14 @@ def cmd_init(args):
         "timeout_seconds": 60,
         "queue_size": 4096,
         "spool_bytes": 67108864,
-        "otlp_url": "",
+        # Empty by default: OTLP export is opt-in, and a dev stack that
+        # silently shipped traces somewhere would be a surprise. Set OTLP_URL,
+        # OTLP_METRICS_URL and OTLP_HEADERS in .dev/env to point it at a real
+        # backend — OTLP_HEADERS maps a header name to the name of the
+        # environment variable holding its value, never to the value itself.
+        "otlp_url": os.environ.get("OTLP_URL", ""),
+        "otlp_metrics_url": os.environ.get("OTLP_METRICS_URL", ""),
+        "otlp_headers": json.loads(os.environ.get("OTLP_HEADERS", "{}")),
         # Required for plain http to loopback; the gateway refuses it otherwise.
         "allow_local_http": True,
         # Local only. pprof exposes memory contents, including provider keys and

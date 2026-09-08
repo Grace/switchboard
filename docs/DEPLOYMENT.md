@@ -92,14 +92,24 @@ Once metrics arrive, these four are the ones that map to something a person shou
 written here rather than created in advance, because a trigger references columns that do not exist
 until data lands.
 
-| Counter | Means | Urgency |
-|---|---|---|
-| `switchboard_empty_completion_failed_total` | Every route produced no output; the caller got a 503 | **Page.** This is lost service. |
-| `switchboard_account_failover_total` | A provider account cannot serve: no credits, balance too low, quota gone | Notify. Usually a billing action, not an incident. |
-| `switchboard_usage_mismatch_total` | A provider's token totals did not add up, so billing figures may be wrong | Notify. Any non-zero value deserves a look. |
-| `switchboard_idempotent_unknown_total` | A retry was refused because the original outcome was ambiguous | Notify. Rising means real ambiguity is being caught rather than paid for twice. |
+**The column names differ by path, and this is the detail that breaks triggers.** The Prometheus
+exposition on `/metrics` separates words with underscores — `switchboard_empty_completion_failed_total`.
+The OTLP exporter emits `switchboard.` plus the name, so what actually arrives in Honeycomb is
+dotted. Build a trigger from the `/metrics` spelling and it references a column that is not there.
+The table below uses the Honeycomb spelling.
 
-`switchboard_empty_completion_recovered_total` is worth a graph rather than a trigger: it is spend
+| Column (Honeycomb) | Means | Urgency |
+|---|---|---|
+| `switchboard.empty_completion_failed_total` | Every route produced no output; the caller got a 503 | **Page.** This is lost service. |
+| `switchboard.account_failover_total` | A provider account cannot serve: no credits, balance too low, quota gone | Notify. Usually a billing action, not an incident. |
+| `switchboard.usage_mismatch_total` | A provider's token totals did not add up, so billing figures may be wrong | Notify. Any non-zero value deserves a look. |
+| `switchboard.idempotent_unknown_total` | A retry was refused because the original outcome was ambiguous | Notify. Rising means real ambiguity is being caught rather than paid for twice. |
+
+These are cumulative counters, so aggregate with `RATE_SUM` and fire above zero. `COUNT` measures
+how often the exporter reported rather than what it reported, and `MAX` on a counter that only ever
+climbs stays above any threshold once crossed.
+
+`switchboard.empty_completion_recovered_total` is worth a graph rather than a trigger: it is spend
 and latency, not an outage, and budget-aware routing should drive it toward zero on its own.
 
 ### What to alarm on

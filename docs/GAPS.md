@@ -190,15 +190,32 @@ Each of these is backed by a run recorded in `docs/VALIDATION.md`.
    Header names are validated as HTTP tokens, so a hand-edited config cannot
    inject CR or LF, and the map cannot override `Content-Type` or `Authorization`.
 
-   **Nothing has reached Honeycomb yet.** The `gracefulcode` team's `test`
-   environment holds 18 datasets, all `genai-*` from unrelated work, and none from
-   Switchboard. Until a dataset appears with `switchboard_` counters in it, this
-   path is tested against an `httptest` server and not against the backend it
-   exists for.
+   **Verified against Honeycomb on 2026-09-08.** Pointing the dev stack at
+   `api.honeycomb.io` produced two datasets in the `gracefulcode` team's `test`
+   environment within a minute: `metrics`, carrying all 30 `switchboard.*`
+   counters and the latency histogram, and `switchboard-gateway`, carrying spans
+   with `gen_ai.provider.name`, `duration_ms` and `trace.trace_id`. Both
+   exporters authenticate through `otlp_headers`, so the path is no longer
+   exercised only against an `httptest` server.
 
-   Triggers are written out in `docs/DEPLOYMENT.md` rather than created, because a
-   trigger references columns that do not exist until data lands. Creating them
-   first would be guessing at schema.
+   Waiting for data was the right call, and it caught a real defect: **the two
+   paths spell the counters differently.** `/metrics` emits
+   `switchboard_empty_completion_failed_total`; OTLP emits
+   `switchboard.empty_completion_failed_total`. Every trigger in
+   `docs/DEPLOYMENT.md` had been written in the `/metrics` spelling, so all four
+   would have referenced columns that do not exist. The table is corrected.
+
+   **Two of the four triggers exist**, on
+   `switchboard.empty_completion_failed_total` and
+   `switchboard.account_failover_total`. The other two could not be created: the
+   API returned "Failed to save trigger" for both, and for a minimal probe
+   trigger on an unrelated column, which points at an account-level cap rather
+   than anything wrong with the queries.
+
+   **Neither existing trigger notifies anyone.** The team has no notification
+   recipients configured, so both evaluate and neither pages. That is worse than
+   having no trigger, because it reads as coverage on a dashboard. Adding a
+   recipient is the remaining work.
 
 6. **Anthropic prompt-cache tokens are not counted.** Responses carry
    `cache_creation_input_tokens` and `cache_read_input_tokens`; neither is
