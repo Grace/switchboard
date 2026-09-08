@@ -68,3 +68,37 @@ jobs:
       - run: terraform -chdir=deploy/terraform/controlplane validate
       - run: terraform -chdir=deploy/terraform/postgres init -backend=false
       - run: terraform -chdir=deploy/terraform/postgres validate
+  # Every commit in a pull request must carry a Signed-off-by trailer certifying
+  # the DCO. Hand-rolled rather than a marketplace action: it is a dozen lines,
+  # and a repository whose argument is a minimal trusted dependency graph should
+  # not pull a third party into CI to read a git trailer.
+  dco:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0
+      - name: Check sign-off
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+          HEAD: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          missing=0
+          # --no-merges: a merge commit carries no sign-off trailer and cannot be
+          # given one without rewriting the merge, so flagging it would produce a
+          # failure with no remedy the printed advice can fix.
+          for sha in $(git rev-list --no-merges "$BASE".."$HEAD"); do
+            if ! git log -1 --format=%B "$sha" | git interpret-trailers --parse | grep -qi '^Signed-off-by:'; then
+              echo "::error::missing Signed-off-by: $sha $(git log -1 --format=%s "$sha")"
+              missing=1
+            fi
+          done
+          if [ "$missing" -ne 0 ]; then
+            echo "Sign off with 'git commit -s'. To fix the most recent commit:"
+            echo "  git commit -s --amend --no-edit && git push --force-with-lease"
+            echo "For several, rebase and sign off each. See CONTRIBUTING.md."
+            exit 1
+          fi
+          echo "All commits signed off."

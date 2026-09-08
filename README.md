@@ -73,6 +73,7 @@ functionality — in this codebase, the AWS Marketplace entitlement check in
 The auditability argument is unaffected: every line is readable, and the
 dependency graph is 4 direct and 12 indirect modules, all AWS-published.
 
-Contributions are not currently accepted. A DCO will be added before any
-external contribution is taken, so that the copyright position stays
-unambiguous.
+Contributions are not currently accepted. When that changes,
+[CONTRIBUTING.md](CONTRIBUTING.md) sets the terms: sign-off under the
+[DCO](DCO), plus a grant permitting relicensing and use in Switchboard
+Recordkeeper, which is closed source. Contributors keep their copyright.
