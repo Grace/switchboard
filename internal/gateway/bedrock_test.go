@@ -282,3 +282,76 @@ func TestBedrockStreamRefusesUnsupportedBlocks(t *testing.T) {
 		t.Fatal("a tool-use block was accepted on the streaming path")
 	}
 }
+
+// The streaming translation against the real service. Unit fixtures encode the
+// framing correctly but assert only what was assumed about Bedrock's event type
+// names and payload shapes; this is the test that can contradict those
+// assumptions. Skipped unless enabled, because it costs money and credentials.
+func TestBedrockStreamAgainstRealService(t *testing.T) {
+	if os.Getenv("SWITCHBOARD_BEDROCK_LIVE") != "1" {
+		t.Skip("set SWITCHBOARD_BEDROCK_LIVE=1 to exercise the real Bedrock API")
+	}
+	ctx := context.Background()
+	signer, err := NewBedrockSigner(ctx, "us-east-1")
+	if err != nil {
+		t.Fatalf("no signer: %v", err)
+	}
+	route := Route{Provider: "bedrock", Model: "us.amazon.nova-micro-v1:0"}
+	req, err := upstream(ctx,
+		Chat{Stream: true, MaxTokens: 64, Messages: []Message{{Role: "user", Content: "Count: one two three"}}},
+		route, ProviderConfig{URL: "https://bedrock-runtime.us-east-1.amazonaws.com", Region: "us-east-1"}, signer)
+	if err != nil {
+		t.Fatalf("could not build a signed streaming request: %v", err)
+	}
+	if !strings.HasSuffix(req.URL.Path, "/converse-stream") {
+		t.Fatalf("wrong operation: %s", req.URL.Path)
+	}
+	res, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("request failed: %v", err)
+	}
+	defer res.Body.Close()
+	if res.StatusCode != 200 {
+		b, _ := io.ReadAll(io.LimitReader(res.Body, 4096))
+		t.Fatalf("bedrock returned %d: %s", res.StatusCode, b)
+	}
+	// The content type the gateway keys on to choose the translator.
+	if ct := res.Header.Get("Content-Type"); !strings.Contains(strings.ToLower(ct), "eventstream") {
+		t.Errorf("content type is %q; stream() selects the translator on this", ct)
+	}
+
+	var text strings.Builder
+	var final normalized
+	frames, done := 0, false
+	err = readSSE(bedrockSSE(res.Body, 8<<20), func(b []byte) error {
+		n, complete, e := normalize("bedrock", b, true)
+		if e != nil {
+			return e
+		}
+		frames++
+		text.WriteString(n.Text)
+		if complete {
+			final, done = n, true
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("a real bedrock stream did not translate: %v", err)
+	}
+	if !done {
+		t.Fatal("real stream never reported completion")
+	}
+	if text.String() == "" {
+		t.Error("real stream produced no text")
+	}
+	if final.Finish == "" {
+		t.Error("real stream carried no finish reason")
+	}
+	// The assumption most likely to be wrong, and the reason this test exists:
+	// that metadata arrives after messageStop and survives the terminal frame.
+	if final.Input == 0 && final.Output == 0 {
+		t.Error("token usage was lost; metadata did not survive past the stop reason")
+	}
+	t.Logf("live bedrock stream: %d frames, finish=%s, in=%d out=%d, text=%q",
+		frames, final.Finish, final.Input, final.Output, text.String())
+}

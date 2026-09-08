@@ -161,24 +161,21 @@ Each of these is backed by a run recorded in `docs/VALIDATION.md`.
    than the default. `Chat.Temperature` is optional and was nil throughout
    testing, so this has not been hit, but a caller setting it against a
    reasoning model would get a 400. Not fixed blind.
-8. **Bedrock streaming is implemented but unverified against the live service.**
-   All four providers now claim streaming. Bedrock's AWS event-stream framing is
-   translated into server-sent events at the provider boundary by `bedrockSSE`,
-   so the deadline, finish tracking, empty-completion detection and the refusal
-   to replay after acceptance apply to it identically. The translator holds the
-   stop reason back and emits it together with token usage, because Bedrock sends
-   those as two events and the pipeline stops at the first frame reporting
-   completion, which would otherwise have reported every streamed Bedrock request
-   as costing nothing.
+8. **Bedrock streaming, verified against the real service.** All four providers
+   stream. Bedrock's AWS event-stream framing is translated into server-sent
+   events at the provider boundary by `bedrockSSE`, so the generation deadline,
+   finish tracking, empty-completion detection and the refusal to replay after
+   acceptance apply to it identically rather than gaining an exception.
 
-   Tests encode fixtures with the real `eventstream` encoder rather than
-   hand-written bytes, so the framing is exercised. **What they cannot prove is
-   that Bedrock sends the event type names and payload shapes assumed**
-   (`contentBlockDelta`, `messageStop`, `metadata`, and a `metadata` event
-   arriving after `messageStop`). That needs `SWITCHBOARD_BEDROCK_LIVE=1` against
-   real credentials, which were unavailable when this was written. This is
-   precisely the class of assumption that live testing caught for the other three
-   adapters, so treat it as unverified rather than working.
+   The translator holds the stop reason back and emits it together with token
+   usage, because Bedrock sends those as two separate events and the pipeline
+   terminates on the first frame reporting completion. Without that, every
+   streamed Bedrock request would have reported zero tokens. A live run confirms
+   it: 17 frames, `finish=stop`, `in=5 out=47`, with usage intact.
+
+   What remains unexercised on this path: tool and reasoning blocks are refused
+   rather than flattened, and that refusal has only been tested with synthetic
+   frames, because Nova Micro does not emit them for these prompts.
 9. **Soak duration.** The longest run is 60 seconds. Nothing addresses memory
    growth, file-descriptor leaks, spool behavior over hours, or policy rotation
    mid-flight.

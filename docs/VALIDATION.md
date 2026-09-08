@@ -529,3 +529,30 @@ suite repeatedly, not an account problem; it was wrongly reported as needing bil
 account had prepay credit throughout. Google's 503 "high demand" was real. The distinction matters
 because "the provider is unreliable" and "the test harness is hammering it" call for different
 responses, and only the second was true here.
+
+## 2026-09-08 — Bedrock streaming against the real service
+
+Bedrock was the one provider that could not stream, so a streaming request skipped the route
+entirely. It now streams, and the translation was checked against the live service rather than only
+against fixtures.
+
+```
+17 frames, finish=stop, in=5 out=47
+text="It looks like you're counting up to three. Here's the continuation from where you left off: ..."
+```
+
+`out=47` is the figure that mattered. Bedrock ends a stream with `messageStop` carrying the stop
+reason and then `metadata` carrying token usage, and the gateway terminates a stream on the first
+frame reporting completion. Emitting `messageStop` as it arrived would have ended the stream before
+usage was ever read and reported every streamed Bedrock request as costing nothing, which is the same
+defect as the Gemini metering bug found the previous day. The translator holds the stop reason back
+and emits it with usage as a single terminal frame.
+
+The unit tests encode fixtures with the real `eventstream` encoder, which exercises the framing but
+can only assert what was assumed about event type names and ordering. This live run is what
+contradicts or confirms those assumptions, and it confirms them: `contentBlockDelta`, `messageStop`
+and `metadata` all arrive as expected, with `metadata` after `messageStop`, and the response carries
+`Content-Type` containing `eventstream`, which is what `stream()` keys on to select the translator.
+
+Still unexercised: tool and reasoning blocks are refused rather than flattened on the streaming path,
+tested only with synthetic frames, because Nova Micro does not emit them for these prompts.
