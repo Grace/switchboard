@@ -610,3 +610,58 @@ The next step is a pprof endpoint on the existing loopback listener, which is wh
 already sits unauthenticated for the same reason, and a repeat of this run with heap profiles taken
 at intervals. Until then this is a measured fact without an explanation, which is still worth more
 than the 60 second runs that could not see it at all.
+
+## 2026-09-08 — the memory growth, diagnosed and the earlier reading retracted
+
+The previous entry recorded resident memory rising from 7.4 MiB to 26.9 MiB over a 30 minute soak,
+called it the most important open item, and projected passing 300 MiB in eight hours. **That
+conclusion was wrong.** It was drawn from `docker stats` alone, without decomposing what that number
+contains, and the strength of the language was not supported by the evidence behind it.
+
+pprof was added to measure it. What the instruments say:
+
+| Measurement | Result |
+|---|---|
+| Go `Sys`, every byte the runtime holds from the OS | +0.25 MB over 3 minutes |
+| `HeapAlloc`, live objects | flat, slightly declining |
+| `Mallocs` minus `Frees` | 22,337, exactly equal to `HeapObjects` |
+| Goroutines | 13 idle, 34 at one minute, 24 at six minutes |
+| Heap profile diff, 1 min to 6 min | **negative**, minus 1,040 kB |
+
+No object retention, no goroutine growth, and the Go process accounts for roughly 2.4 MB across 30
+minutes rather than 19.5 MB. So the memory was never Go's.
+
+The container's own cgroup accounting locates it:
+
+```
+             anon        slab_reclaimable   slab_unreclaimable   RSS
+01:11:06    8.79 MB          4.60 MB               0           13.18 MiB
+01:11:58    8.65 MB          5.13 MB               0           13.49 MiB
+01:13:08    8.65 MB          5.79 MB               0           14.30 MiB
+```
+
+`anon`, the process itself, is flat. Resident growth tracks `slab_reclaimable`, and nothing is
+unreclaimable. A page cache hypothesis was tested and rejected on the way: `file` was zero.
+
+### Cause
+
+The telemetry spool writes one file per event into `DataDir/spool` and unlinks it once the control
+plane acknowledges the id. At 20 requests per second that is 40 dentry operations per second, and the
+kernel caches the resulting dentries and inodes against this container's cgroup. Roughly 0.55 MB per
+minute, which is about 16.5 MB across 30 minutes and matches the 19.5 MB originally reported.
+
+### What it means, stated at the strength the evidence supports
+
+Reclaimable slab counts toward a container memory limit, and the kernel frees it under pressure
+instead of killing the process. There is no out-of-memory risk of the kind claimed. What is true is
+that container memory graphs will show apparently unbounded growth, which will alarm an operator who
+has not read this. Batching the spool into segment files rather than one file per event would remove
+the churn if that becomes worth doing.
+
+### The lesson, which is the same one as Gemini
+
+`docker stats` was treated as if it measured the process. It measures a cgroup, which includes kernel
+memory the process merely caused to be allocated. One number was read confidently without asking what
+was inside it, exactly as a single provider error string was read confidently the day before. The
+30 minute soak that produced the number was still worth running; the reading of it was not worth
+publishing without decomposing it first.

@@ -176,25 +176,37 @@ Each of these is backed by a run recorded in `docs/VALIDATION.md`.
    What remains unexercised on this path: tool and reasoning blocks are refused
    rather than flattened, and that refusal has only been tested with synthetic
    frames, because Nova Micro does not emit them for these prompts.
-9. **Resident memory grows linearly under sustained load, cause unknown.** A 30
-   minute run at 20 requests per second served 35,988 requests with one transport
-   error, p99 latency of 43 ms and a disk spool that never exceeded 19 events.
-   Resident memory went from 7.4 MiB to 26.9 MiB, near perfectly linearly, and
-   did not fall when load stopped. That is growth proportional to requests
-   served, not a working set settling.
+9. **Spool file churn grows reclaimable kernel slab. Not a leak, and the earlier
+   claim that it was is retracted.** A 30 minute soak measured resident memory
+   rising from 7.4 MiB to 26.9 MiB and this file previously called that the most
+   important open item, projecting an out-of-memory kill within a day. That was
+   wrong. It read `docker stats` without decomposing what the number contains.
 
-   No cause is claimed and none should be inferred: there is no pprof endpoint,
-   so heap and goroutine profiles cannot be taken. **This is the single most
-   important open item.** A sidecar that grows without bound is replaced by its
-   platform on a schedule set by the leak, and no amount of failover or metering
-   correctness compensates for that. Fixing it starts with exposing pprof on the
-   existing loopback listener, where `/metrics` already sits for the same reason,
-   and repeating the run with profiles taken at intervals.
+   Measured with pprof and the container's own cgroup accounting:
 
-   Runs longer than 30 minutes, policy rotation mid-flight and file-descriptor
-   growth all remain unmeasured. File descriptors could not be counted at all
-   from the host, because the gateway image is distroless and Docker Desktop runs
-   the container inside a VM.
+   | | growing? |
+   |---|---|
+   | Go `Sys`, all memory the runtime holds | +0.25 MB in 3 minutes |
+   | `HeapAlloc`, live objects | flat, slightly down |
+   | `Mallocs` minus `Frees` | equals `HeapObjects` exactly |
+   | goroutines | 34 then 24, down |
+   | cgroup `anon`, the process | flat at 8.65 MB |
+   | cgroup `slab_reclaimable` | **4.60 to 5.79 MB in 2 minutes** |
+   | cgroup `slab_unreclaimable` | zero throughout |
+
+   Resident growth tracks slab, and slab is entirely reclaimable. The telemetry
+   spool writes one file per event and unlinks it after the control plane
+   acknowledges, so 20 requests per second churns 40 dentry operations per
+   second, and the kernel caches those dentries and inodes against this cgroup.
+   At roughly 0.55 MB per minute that accounts for about 16.5 MB across 30
+   minutes, which matches the 19.5 MB originally reported.
+
+   The consequence is real but different: reclaimable slab counts toward a
+   container memory limit, and the kernel frees it under pressure rather than
+   killing the process. It will look like unbounded growth in any monitoring that
+   watches container memory, which is worth documenting for operators. Batching
+   the spool into segment files rather than one file per event would remove the
+   churn, and is the fix if this ever needs one.
 10. **No idempotency.** There is no exactly-once guarantee, replay cache or
    ledger. A 429 or 503 retry cannot prove the absence of upstream billing.
    Clients must disable automatic retries.
