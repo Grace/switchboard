@@ -113,14 +113,14 @@ func upstream(ctx context.Context, c Chat, r Route, p ProviderConfig, signer *Be
 			path = "/v1beta/models/" + r.Model + ":streamGenerateContent?alt=sse"
 		}
 	case "bedrock":
-		// Streaming is AWS event-stream framing rather than SSE and the
-		// incremental decode path is not built yet. Refusing here is honest:
-		// the alternative is accepting the request and mishandling the frames.
-		if c.Stream {
-			return nil, errStreamUnsupported
-		}
 		body = bedrockBody(c, system, msgs)
-		path = "/model/" + url.PathEscape(r.Model) + "/converse"
+		// Converse and ConverseStream are separate operations rather than a flag
+		// on the body, unlike the other three providers.
+		op := "/converse"
+		if c.Stream {
+			op = "/converse-stream"
+		}
+		path = "/model/" + url.PathEscape(r.Model) + op
 	default:
 		return nil, errors.New("unknown adapter")
 	}
@@ -255,8 +255,11 @@ type wire struct {
 
 func normalize(provider string, b []byte, stream bool) (normalized, bool, error) {
 	if provider == "bedrock" {
-		// Only the complete-response shape reaches here: the streaming path is
-		// refused in upstream() until event-stream decoding is wired.
+		if stream {
+			// Frames here have already been translated out of AWS event-stream
+			// framing by bedrockSSE, so they arrive as ordinary SSE payloads.
+			return normalizeBedrockStream(b)
+		}
 		n, e := normalizeBedrock(b)
 		return n, true, e
 	}

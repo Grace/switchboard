@@ -1,0 +1,133 @@
+AWSTemplateFormatVersion: '2010-09-09'
+
+Description: >-
+  A role GitHub Actions assumes by OpenID Connect to publish Switchboard images,
+  so no long-lived AWS access key exists anywhere. Creates the role only. The
+  account's GitHub OIDC provider is a prerequisite because an account can hold at
+  most one, which makes it shared infrastructure rather than something a stack
+  should own. See the Outputs for the command that creates it.
+
+Metadata:
+  AWSToolsMetrics:
+    AWSAgentToolkit: aws-cloudformation@2
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label: {default: Who may assume the role}
+        Parameters: [OidcProviderArn, GitHubOwner, GitHubRepository, AllowedRefPattern]
+      - Label: {default: What it may do}
+        Parameters: [GatewayRepositoryName, ControlPlaneRepositoryName]
+
+Parameters:
+  OidcProviderArn:
+    Type: String
+    AllowedPattern: '^arn:aws[a-z-]*:iam::\d{12}:oidc-provider/token\.actions\.githubusercontent\.com$'
+    Description: >-
+      ARN of the account's existing GitHub OIDC provider. If the account has none,
+      create it first with the command in this stack's Outputs. IAM retrieves the
+      certificate thumbprint itself, so none is supplied here.
+
+  GitHubOwner:
+    Type: String
+    Default: Grace
+    AllowedPattern: '^[A-Za-z0-9](?:[A-Za-z0-9]|-(?=[A-Za-z0-9])){0,38}$'
+    Description: GitHub user or organisation that owns the repository.
+
+  GitHubRepository:
+    Type: String
+    Default: switchboard
+    AllowedPattern: '^[A-Za-z0-9._-]{1,100}$'
+    Description: Repository name. The role is usable only from this repository.
+
+  AllowedRefPattern:
+    Type: String
+    Default: 'ref:refs/tags/v*'
+    Description: >-
+      Which refs may assume the role, matched against the OIDC subject claim.
+      The default admits release tags only, so a workflow on a branch cannot
+      publish. Widen deliberately: 'ref:refs/heads/main' would let any push to
+      main publish an image, and '*' would let any ref in the repository do so.
+
+  GatewayRepositoryName:
+    Type: String
+    Default: switchboard-gateway
+    AllowedPattern: '^[a-z0-9][a-z0-9._/-]{1,255}$'
+    Description: ECR repository for the gateway image.
+
+  ControlPlaneRepositoryName:
+    Type: String
+    Default: switchboard-controlplane
+    AllowedPattern: '^[a-z0-9][a-z0-9._/-]{1,255}$'
+    Description: >-
+      ECR repository for the control plane image. Named separately rather than
+      as a list because CloudFormation cannot build one ARN per element, and a
+      wildcard would widen the grant beyond the two repositories intended.
+
+Resources:
+  # Trust is the whole security boundary here. Two conditions matter and both are
+  # required: the audience must be the STS audience GitHub is configured to
+  # request, and the subject must match this repository and an allowed ref. A
+  # subject condition of 'repo:owner/*:*' would let any workflow in any of the
+  # owner's repositories assume this role, which is the usual way these are
+  # misconfigured.
+  PublishRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-publish'
+      Description: Assumed by GitHub Actions to publish Switchboard container images.
+      MaxSessionDuration: 3600
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Federated: !Ref OidcProviderArn
+            Action: sts:AssumeRoleWithWebIdentity
+            Condition:
+              StringEquals:
+                'token.actions.githubusercontent.com:aud': sts.amazonaws.com
+              StringLike:
+                'token.actions.githubusercontent.com:sub': !Sub 'repo:${GitHubOwner}/${GitHubRepository}:${AllowedRefPattern}'
+      Policies:
+        - PolicyName: publish-images
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # Account scoped by design: this action takes no resource and
+              # returns only a token usable against repositories the statements
+              # below already permit.
+              - Effect: Allow
+                Action: ecr:GetAuthorizationToken
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - ecr:BatchCheckLayerAvailability
+                  - ecr:CompleteLayerUpload
+                  - ecr:InitiateLayerUpload
+                  - ecr:PutImage
+                  - ecr:UploadLayerPart
+                  - ecr:BatchGetImage
+                  - ecr:GetDownloadUrlForLayer
+                  - ecr:DescribeImages
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:ecr:${AWS::Region}:${AWS::AccountId}:repository/${GatewayRepositoryName}'
+                  - !Sub 'arn:${AWS::Partition}:ecr:${AWS::Region}:${AWS::AccountId}:repository/${ControlPlaneRepositoryName}' 
+
+Outputs:
+  RoleArn:
+    Description: Set this as the role-to-assume in the release workflow.
+    Value: !GetAtt PublishRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-RoleArn'
+
+  CreateProviderCommand:
+    Description: >-
+      Run this once per account if OidcProviderArn does not yet exist. IAM
+      retrieves and maintains the certificate thumbprint itself.
+    Value: >-
+      aws iam create-open-id-connect-provider
+      --url https://token.actions.githubusercontent.com
+      --client-id-list sts.amazonaws.com
+
+  TrustedSubject:
+    Description: The exact subject claim this role accepts. Read it before deploying.
+    Value: !Sub 'repo:${GitHubOwner}/${GitHubRepository}:${AllowedRefPattern}'

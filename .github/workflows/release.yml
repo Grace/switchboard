@@ -1,0 +1,90 @@
+name: release
+
+# Tags only. A branch push must not be able to publish an image, and the OIDC
+# role's trust policy enforces the same rule independently: even if this trigger
+# were widened by mistake, AWS would refuse the credential.
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      # Required for both halves of the keyless story: assuming the AWS role
+      # without a stored access key, and signing without a stored private key.
+      id-token: write
+    env:
+      GATEWAY_REPO: switchboard-gateway
+      CONTROL_REPO: switchboard-controlplane
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      # No long-lived AWS access key exists. The role is created by
+      # deploy/cloudformation/github-oidc.yaml and its ARN is not a secret, so it
+      # is a repository variable rather than a repository secret.
+      - uses: aws-actions/configure-aws-credentials@61815dcd50bd041e203e49132bacad1fd04d2708 # v5
+        with:
+          role-to-assume: ${{ vars.AWS_PUBLISH_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      - uses: sigstore/cosign-installer@398d4b0eeef1380460a10c8013a76f728fb906ac # v3
+
+      - name: Log in to ECR
+        id: ecr
+        run: |
+          set -euo pipefail
+          registry="$(aws sts get-caller-identity --query Account --output text).dkr.ecr.${AWS_REGION}.amazonaws.com"
+          aws ecr get-login-password --region "$AWS_REGION" \
+            | docker login --username AWS --password-stdin "$registry"
+          echo "registry=$registry" >> "$GITHUB_OUTPUT"
+        env:
+          AWS_REGION: ${{ vars.AWS_REGION }}
+
+      # SBOM and provenance come from buildx itself rather than a third-party
+      # action. This repository's argument is a small, wholly reviewable
+      # dependency graph, and pulling an extra supply-chain tool into the
+      # supply-chain job to describe the supply chain is a poor trade.
+      - name: Build, push, sign
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME}"
+          for image in gateway:"$GATEWAY_REPO" controlplane:"$CONTROL_REPO"; do
+            name="${image%%:*}"; repo="${image##*:}"
+            ref="${{ steps.ecr.outputs.registry }}/$repo:$tag"
+            echo "::group::$ref"
+            docker buildx build \
+              --file "Dockerfile.$name" \
+              --tag "$ref" \
+              --sbom=true \
+              --provenance=mode=max \
+              --push \
+              .
+            # Sign by digest, not by tag: a tag can be moved to point at
+            # different content after signing, a digest cannot.
+            digest="$(docker buildx imagetools inspect "$ref" --format '{{.Manifest.Digest}}')"
+            cosign sign --yes "${{ steps.ecr.outputs.registry }}/$repo@$digest"
+            echo "$name $digest" >> "$GITHUB_STEP_SUMMARY"
+            echo "::endgroup::"
+          done
+
+      # Proves the signature is verifiable by someone who has only the public
+      # record, which is the property being claimed. A sign step that is never
+      # verified only proves the command exited zero.
+      - name: Verify what was just signed
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME}"
+          for repo in "$GATEWAY_REPO" "$CONTROL_REPO"; do
+            ref="${{ steps.ecr.outputs.registry }}/$repo:$tag"
+            digest="$(docker buildx imagetools inspect "$ref" --format '{{.Manifest.Digest}}')"
+            cosign verify \
+              --certificate-identity-regexp "^https://github.com/${GITHUB_REPOSITORY}/" \
+              --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+              "${{ steps.ecr.outputs.registry }}/$repo@$digest"
+          done

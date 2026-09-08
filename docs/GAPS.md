@@ -161,11 +161,24 @@ Each of these is backed by a run recorded in `docs/VALIDATION.md`.
    than the default. `Chat.Temperature` is optional and was nil throughout
    testing, so this has not been hit, but a caller setting it against a
    reasoning model would get a 400. Not fixed blind.
-8. **Bedrock does not stream.** Bedrock returns AWS event-stream framing rather
-   than server-sent events, and that decode path is not built. A streaming
-   request skips a bedrock route at selection time and tries the next provider,
-   so a policy with another route still serves it; a policy whose only route is
-   bedrock returns the ordinary 503. Nonstreaming Bedrock is complete.
+8. **Bedrock streaming is implemented but unverified against the live service.**
+   All four providers now claim streaming. Bedrock's AWS event-stream framing is
+   translated into server-sent events at the provider boundary by `bedrockSSE`,
+   so the deadline, finish tracking, empty-completion detection and the refusal
+   to replay after acceptance apply to it identically. The translator holds the
+   stop reason back and emits it together with token usage, because Bedrock sends
+   those as two events and the pipeline stops at the first frame reporting
+   completion, which would otherwise have reported every streamed Bedrock request
+   as costing nothing.
+
+   Tests encode fixtures with the real `eventstream` encoder rather than
+   hand-written bytes, so the framing is exercised. **What they cannot prove is
+   that Bedrock sends the event type names and payload shapes assumed**
+   (`contentBlockDelta`, `messageStop`, `metadata`, and a `metadata` event
+   arriving after `messageStop`). That needs `SWITCHBOARD_BEDROCK_LIVE=1` against
+   real credentials, which were unavailable when this was written. This is
+   precisely the class of assumption that live testing caught for the other three
+   adapters, so treat it as unverified rather than working.
 9. **Soak duration.** The longest run is 60 seconds. Nothing addresses memory
    growth, file-descriptor leaks, spool behavior over hours, or policy rotation
    mid-flight.
@@ -179,13 +192,20 @@ Each of these is backed by a run recorded in `docs/VALIDATION.md`.
 12. **Scale and operations.** Rate limits and circuit state are per process, not
    fleet-wide. There is no retention policy, partitioning, dashboard, SLO, audit
    export or restore drill. The spool caps at 100 events per tick.
-13. **Supply chain, remaining.** No SBOM generation and no image signing, and
-   there is no release workflow at all — images are built and pushed by hand.
-   Python and Go dependency graphs are pinned and scanned, GitHub Actions are
-   pinned by commit SHA, and both images report zero scan findings. Signing and
-   SBOM are what a buyer's security review asks for rather than a listing
-   requirement; the enforced requirement is freedom from known vulnerabilities,
-   which is met.
+13. **The release pipeline exists but has never run.**
+    `.github/workflows/release.yml` builds both images on a `v*` tag, attaches
+    SBOM and provenance attestations using buildx's own attestation support
+    rather than a third-party action, signs each image by digest with keyless
+    cosign, and verifies the signature it just made. Images are no longer
+    specified as built by hand.
+
+    **None of it has executed.** It needs the OIDC role from
+    `deploy/cloudformation/github-oidc.yaml`, which is written but not deployed,
+    and it could not be rehearsed locally: the attestation flags require buildx
+    0.10 or later on the `docker-container` driver, and the machine it was
+    written on has 0.8.2 on the `docker` driver. What is verified is that the
+    workflow parses, that every action is pinned to a SHA confirmed to be a real
+    commit, and that the trigger admits tags only.
 14. **Infrastructure assumptions.** `controlplane.yaml` requires an existing VPC,
     subnets, IAM roles, KMS keys, ECS cluster and load balancer target group.
     `quickstart.yaml` removes all of those except the certificate.

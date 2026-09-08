@@ -547,7 +547,18 @@ func (s *Server) chat(w http.ResponseWriter, r *http.Request) {
 	fail(503, "routes unavailable or retry budget exhausted")
 }
 func (s *Server) stream(w http.ResponseWriter, res *http.Response, route Route, id string, created int64) error {
-	if !strings.HasPrefix(strings.ToLower(res.Header.Get("Content-Type")), "text/event-stream") {
+	body := res.Body
+	ct := strings.ToLower(res.Header.Get("Content-Type"))
+	switch {
+	case strings.HasPrefix(ct, "text/event-stream"):
+	case route.Provider == "bedrock" && strings.Contains(ct, "eventstream"):
+		// Bedrock speaks AWS event-stream framing. Translating it here rather
+		// than teaching this function a second wire format keeps the deadline,
+		// finish tracking, empty-completion detection and no-replay rule below
+		// applying to all four providers identically.
+		body = bedrockSSE(res.Body, 8<<20)
+		defer body.Close()
+	default:
 		problem(w, 502, "expected provider event stream")
 		return errors.New("wrong content type")
 	}
@@ -569,7 +580,7 @@ func (s *Server) stream(w http.ResponseWriter, res *http.Response, route Route, 
 	// Providers repeat cumulative usage on every frame, so without this a single
 	// response would be counted as several mismatches.
 	mismatchCounted := false
-	err := readSSE(res.Body, func(b []byte) error {
+	err := readSSE(body, func(b []byte) error {
 		if string(b) == "[DONE]" {
 			if route.Provider != "openai" || !finished {
 				return errors.New("premature DONE")

@@ -1,12 +1,18 @@
 package gateway
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"io"
 	"net/http"
 	"os"
 	"strings"
 	"testing"
+
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/aws/protocol/eventstream"
+	v4 "github.com/aws/aws-sdk-go-v2/aws/signer/v4"
 )
 
 func TestBedrockFinishMapping(t *testing.T) {
@@ -88,25 +94,37 @@ func TestNormalizeBedrockHappyPath(t *testing.T) {
 	}
 }
 
-// Streaming is refused at route selection so the request falls through to a
-// provider that can serve it, rather than failing the whole request.
-func TestBedrockDoesNotClaimStreaming(t *testing.T) {
-	if streams("bedrock") {
-		t.Fatal("bedrock claims streaming support it does not have")
-	}
-	for _, p := range []string{"openai", "anthropic", "gemini"} {
+// All four providers stream now. Bedrock's event-stream framing is translated at
+// the provider boundary, so route selection no longer has to skip it.
+func TestAllProvidersClaimStreaming(t *testing.T) {
+	for _, p := range []string{"openai", "anthropic", "gemini", "bedrock"} {
 		if !streams(p) {
 			t.Fatalf("%s should stream", p)
 		}
 	}
 }
 
-func TestBedrockStreamRequestIsRefused(t *testing.T) {
-	_, err := upstream(context.Background(), Chat{Stream: true, MaxTokens: 8},
-		Route{Provider: "bedrock", Model: "us.amazon.nova-micro-v1:0"},
-		ProviderConfig{URL: "https://bedrock-runtime.us-east-1.amazonaws.com", Region: "us-east-1"}, nil)
-	if err == nil {
-		t.Fatal("a streaming bedrock request was accepted")
+// Converse and ConverseStream are separate operations rather than a flag on the
+// body, so the wrong path would silently return a non-streaming response.
+func TestBedrockStreamUsesTheStreamingOperation(t *testing.T) {
+	signer := &BedrockSigner{signer: v4.NewSigner(), creds: staticCreds{}, region: "us-east-1"}
+	for _, tc := range []struct {
+		stream bool
+		want   string
+	}{
+		{false, "/converse"},
+		{true, "/converse-stream"},
+	} {
+		req, err := upstream(context.Background(), Chat{Stream: tc.stream, MaxTokens: 8,
+			Messages: []Message{{Role: "user", Content: "hi"}}},
+			Route{Provider: "bedrock", Model: "us.amazon.nova-micro-v1:0"},
+			ProviderConfig{URL: "https://bedrock-runtime.us-east-1.amazonaws.com", Region: "us-east-1"}, signer)
+		if err != nil {
+			t.Fatalf("stream=%v: %v", tc.stream, err)
+		}
+		if !strings.HasSuffix(req.URL.Path, tc.want) {
+			t.Errorf("stream=%v: path %q, want suffix %q", tc.stream, req.URL.Path, tc.want)
+		}
 	}
 }
 
@@ -159,4 +177,108 @@ func TestBedrockAgainstRealService(t *testing.T) {
 		t.Fatalf("empty normalized response: %+v", got)
 	}
 	t.Logf("live bedrock: text=%q finish=%s in=%d out=%d", got.Text, got.Finish, got.Input, got.Output)
+}
+
+// staticCreds lets the signing path run in a test without resolving real AWS
+// credentials, so path construction is testable without an AWS account.
+type staticCreds struct{}
+
+func (staticCreds) Retrieve(context.Context) (aws.Credentials, error) {
+	return aws.Credentials{AccessKeyID: "AKIAEXAMPLE", SecretAccessKey: "secret", Source: "test"}, nil
+}
+
+// bedrockFrame encodes one AWS event-stream message the way the real service
+// does, so the translator is exercised against the actual framing rather than a
+// hand-written approximation of it.
+func bedrockFrame(t *testing.T, w io.Writer, eventType string, payload string) {
+	t.Helper()
+	enc := eventstream.NewEncoder()
+	if err := enc.Encode(w, eventstream.Message{
+		Headers: eventstream.Headers{
+			{Name: ":event-type", Value: eventstream.StringValue(eventType)},
+			{Name: ":message-type", Value: eventstream.StringValue("event")},
+		},
+		Payload: []byte(payload),
+	}); err != nil {
+		t.Fatalf("encoding %s: %v", eventType, err)
+	}
+}
+
+// The behaviour worth protecting: Bedrock sends the stop reason and the token
+// usage as two separate events, and the pipeline stops at the first frame
+// reporting completion. Emitting messageStop as it arrives would end the stream
+// before usage was seen and report every streamed request as costing nothing.
+func TestBedrockStreamCarriesUsagePastTheStopReason(t *testing.T) {
+	var raw bytes.Buffer
+	bedrockFrame(t, &raw, "messageStart", `{"role":"assistant"}`)
+	bedrockFrame(t, &raw, "contentBlockDelta", `{"delta":{"text":"one "},"contentBlockIndex":0}`)
+	bedrockFrame(t, &raw, "contentBlockDelta", `{"delta":{"text":"two"},"contentBlockIndex":0}`)
+	bedrockFrame(t, &raw, "contentBlockStop", `{"contentBlockIndex":0}`)
+	bedrockFrame(t, &raw, "messageStop", `{"stopReason":"end_turn"}`)
+	bedrockFrame(t, &raw, "metadata", `{"usage":{"inputTokens":11,"outputTokens":7,"totalTokens":18}}`)
+
+	var text strings.Builder
+	var got normalized
+	frames, done := 0, false
+	err := readSSE(bedrockSSE(io.NopCloser(&raw), 1<<20), func(b []byte) error {
+		n, complete, e := normalize("bedrock", b, true)
+		if e != nil {
+			return e
+		}
+		frames++
+		text.WriteString(n.Text)
+		if complete {
+			got, done = n, true
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("translating a real event stream failed: %v", err)
+	}
+	if text.String() != "one two" {
+		t.Errorf("text = %q, want %q", text.String(), "one two")
+	}
+	if !done {
+		t.Fatal("stream never reported completion")
+	}
+	if got.Finish != "stop" {
+		t.Errorf("finish = %q, want stop", got.Finish)
+	}
+	// The point of the test.
+	if got.Input != 11 || got.Output != 7 {
+		t.Errorf("usage = in %d/out %d, want 11/7; usage was lost past the stop reason",
+			got.Input, got.Output)
+	}
+	if frames != 3 {
+		t.Errorf("frames = %d, want 3 (two deltas and one terminal)", frames)
+	}
+}
+
+// A stream that ends without a stop reason is truncation, and must not be
+// presented as a complete answer.
+func TestBedrockStreamWithoutStopReasonFails(t *testing.T) {
+	var raw bytes.Buffer
+	bedrockFrame(t, &raw, "contentBlockDelta", `{"delta":{"text":"partial"}}`)
+	err := readSSE(bedrockSSE(io.NopCloser(&raw), 1<<20), func(b []byte) error {
+		_, _, e := normalize("bedrock", b, true)
+		return e
+	})
+	if err == nil {
+		t.Fatal("a truncated bedrock stream was accepted as complete")
+	}
+}
+
+// Tools and reasoning are refused on the streaming path exactly as they are on
+// the complete-response path; flattening them would discard content silently.
+func TestBedrockStreamRefusesUnsupportedBlocks(t *testing.T) {
+	var raw bytes.Buffer
+	bedrockFrame(t, &raw, "contentBlockStart", `{"start":{"toolUse":{"name":"x"}},"contentBlockIndex":0}`)
+	bedrockFrame(t, &raw, "messageStop", `{"stopReason":"end_turn"}`)
+	err := readSSE(bedrockSSE(io.NopCloser(&raw), 1<<20), func(b []byte) error {
+		_, _, e := normalize("bedrock", b, true)
+		return e
+	})
+	if err == nil {
+		t.Fatal("a tool-use block was accepted on the streaming path")
+	}
 }

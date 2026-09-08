@@ -36,18 +36,11 @@ import (
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
 )
 
-// errStreamUnsupported is returned when a route would need a streaming shape
-// this adapter does not implement yet. It is a routing fact, not a provider
-// failure, so it must not count against the circuit breaker.
-var errStreamUnsupported = errors.New("streaming is not supported for this provider")
-
-// streams reports whether a provider can serve a streaming request. Bedrock
-// streams over AWS event-stream framing rather than server-sent events and that
-// decode path is not built yet, so a streaming request skips the route and tries
-// the next one instead of failing. A policy whose only route is bedrock will
-// return the ordinary "routes unavailable" 503 for streaming requests, which is
-// accurate.
-func streams(provider string) bool { return provider != "bedrock" }
+// streams reports whether a provider can serve a streaming request. All four do:
+// Bedrock's AWS event-stream framing is translated into server-sent events at
+// the provider boundary by bedrockSSE, so the rest of the pipeline sees one wire
+// format and the no-replay-after-acceptance rule applies unchanged.
+func streams(string) bool { return true }
 
 // BedrockSigner signs outbound Bedrock requests. It is nil unless a bedrock
 // provider is configured, which keeps the common case free of AWS credential
@@ -197,6 +190,129 @@ func decodeBedrockStream(r io.Reader, limit int64) (normalized, error) {
 	}
 	n.Text = text.String()
 	return n, nil
+}
+
+// bedrockSSE translates AWS event-stream framing into the server-sent events the
+// rest of this package reads, so streaming Bedrock costs no new machinery in
+// stream(): the deadline, the finish tracking, the empty-completion detection and
+// the refusal to replay after acceptance all keep working as written.
+//
+// It does one thing beyond translation, and it matters. Bedrock ends a stream
+// with messageStop carrying the stop reason and then metadata carrying token
+// usage. The pipeline terminates on the first frame that reports completion, so
+// emitting messageStop as it arrives would end the stream before usage was ever
+// seen and report every streamed Bedrock request as costing nothing. The stop
+// reason is therefore held back and emitted together with usage as one terminal
+// frame.
+func bedrockSSE(body io.ReadCloser, limit int64) io.ReadCloser {
+	pr, pw := io.Pipe()
+	go func() {
+		defer body.Close()
+		pw.CloseWithError(translateBedrockStream(body, pw, limit))
+	}()
+	return pr
+}
+
+// frames the translator emits are ordinary Converse field shapes rather than an
+// invented envelope, so normalize can decode them with the same bedrockWire it
+// already uses: a delta carries delta.text, and the terminal frame carries
+// stopReason and usage.
+func translateBedrockStream(r io.Reader, w io.Writer, limit int64) error {
+	dec := eventstream.NewDecoder()
+	payload := make([]byte, 0, 8192)
+	var stop string
+	var usage []byte
+	written := int64(0)
+	emit := func(v any) error {
+		b, err := json.Marshal(v)
+		if err != nil {
+			return err
+		}
+		_, err = fmt.Fprintf(w, "data: %s\n\n", b)
+		return err
+	}
+	for {
+		msg, err := dec.Decode(io.LimitReader(r, limit), payload)
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return fmt.Errorf("malformed bedrock event stream: %w", err)
+		}
+		var kind string
+		for _, h := range msg.Headers {
+			if h.Name == ":event-type" {
+				kind = h.Value.String()
+			}
+		}
+		var e bedrockWire
+		if len(msg.Payload) > 0 {
+			if err := json.Unmarshal(msg.Payload, &e); err != nil {
+				return fmt.Errorf("malformed bedrock event payload: %w", err)
+			}
+		}
+		switch kind {
+		case "contentBlockStart":
+			// Tools and reasoning are unsupported here, exactly as in the
+			// nonstreaming path. Flattening them to text would discard content
+			// the caller never agreed to lose.
+			if bytes.Contains(msg.Payload, []byte(`"toolUse"`)) ||
+				bytes.Contains(msg.Payload, []byte(`"reasoningContent"`)) {
+				return errors.New("bedrock returned an unsupported content block")
+			}
+		case "contentBlockDelta":
+			if e.Delta.Text == "" {
+				continue
+			}
+			written += int64(len(e.Delta.Text))
+			if written > limit {
+				return errors.New("bedrock stream exceeded the response limit")
+			}
+			if err := emit(map[string]any{"delta": map[string]any{"text": e.Delta.Text}}); err != nil {
+				return err
+			}
+		case "messageStop":
+			// Held, not emitted: see the note above.
+			stop = e.StopReason
+		case "metadata":
+			usage = msg.Payload
+		}
+	}
+	if stop == "" {
+		return errors.New("bedrock stream ended without a stop reason")
+	}
+	final := map[string]any{"stopReason": stop}
+	if len(usage) > 0 {
+		var u struct {
+			Usage json.RawMessage `json:"usage"`
+		}
+		if json.Unmarshal(usage, &u) == nil && len(u.Usage) > 0 {
+			final["usage"] = json.RawMessage(u.Usage)
+		}
+	}
+	return emit(final)
+}
+
+// normalizeBedrockStream reads one translated frame. Completion is signalled by
+// the terminal frame carrying a stop reason, which is also the frame carrying
+// usage, so a caller that stops at the first completion still gets token counts.
+func normalizeBedrockStream(b []byte) (normalized, bool, error) {
+	var n normalized
+	var w bedrockWire
+	if err := json.Unmarshal(b, &w); err != nil {
+		return n, false, err
+	}
+	n.Text = w.Delta.Text
+	n.Input, n.Output = w.Usage.Input, w.Usage.Output
+	if w.StopReason == "" {
+		return n, false, nil
+	}
+	f, err := bedrockFinish(w.StopReason)
+	if err != nil {
+		return n, false, err
+	}
+	n.Finish = f
+	return n, true, nil
 }
 
 // normalizeBedrock handles a complete (nonstreaming) Converse response.
