@@ -643,6 +643,22 @@ The container's own cgroup accounting locates it:
 `anon`, the process itself, is flat. Resident growth tracks `slab_reclaimable`, and nothing is
 unreclaimable. A page cache hypothesis was tested and rejected on the way: `file` was zero.
 
+The complete profile set, taken across the whole load period rather than the two points above,
+removes any remaining doubt:
+
+```
+cgroup delta over the run        Go heap in-use
+  anon               +0.13 MB      before load   3391 kB
+  slab_reclaimable   +2.01 MB      t = 1 min     2895 kB
+  slab_unreclaimable +0.00 MB      t = 6 min     1855 kB
+                                   t = 11 min    1855 kB
+```
+
+The Go heap fell and then plateaued exactly, identical at six and eleven minutes, while slab kept
+climbing. 94% of the growth is reclaimable slab and 6% is the process. The heap diff from one minute
+to eleven is minus 1,040 kB, all of it `net/http` initialisation buffers and the async log writer's
+startup allocation being released rather than anything accumulating.
+
 ### Cause
 
 The telemetry spool writes one file per event into `DataDir/spool` and unlinks it once the control
