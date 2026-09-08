@@ -177,7 +177,8 @@ Each of these is backed by a run recorded in `docs/VALIDATION.md`.
    counter, gauge and the request-duration histogram over OTLP with no extra
    container. The gateway now warns at startup when neither path is configured,
    so the default silence is at least visible in the log stream.
-5. **Alerting goes through Honeycomb, and the path is built but unproven.**
+5. **Alerting goes through Honeycomb. The export path is proven; the alerts on
+   top of it are half-built.**
    Gateway alarms hang off metrics in Honeycomb rather than CloudWatch, which is
    now a decision rather than an omission. CloudWatch remains reachable by the
    same mechanism whenever it is wanted.
@@ -192,11 +193,13 @@ Each of these is backed by a run recorded in `docs/VALIDATION.md`.
 
    **Verified against Honeycomb on 2026-09-08.** Pointing the dev stack at
    `api.honeycomb.io` produced two datasets in the `gracefulcode` team's `test`
-   environment within a minute: `metrics`, carrying all 30 `switchboard.*`
-   counters and the latency histogram, and `switchboard-gateway`, carrying spans
-   with `gen_ai.provider.name`, `duration_ms` and `trace.trace_id`. Both
-   exporters authenticate through `otlp_headers`, so the path is no longer
-   exercised only against an `httptest` server.
+   environment within a minute: `metrics`, carrying 28 `switchboard.*` columns,
+   and `switchboard-gateway`, carrying spans with `gen_ai.provider.name`,
+   `duration_ms` and `trace.trace_id`. The 28 are 20 counters, 7 gauges and the
+   request-duration histogram, which is exactly the list `series()` builds in
+   `internal/gateway/telemetry.go` — nothing is lost between the exporter and the
+   backend. Both exporters authenticate through `otlp_headers`, so the path is no
+   longer exercised only against an `httptest` server.
 
    Waiting for data was the right call, and it caught a real defect: **the two
    paths spell the counters differently.** `/metrics` emits
@@ -205,12 +208,28 @@ Each of these is backed by a run recorded in `docs/VALIDATION.md`.
    `docs/DEPLOYMENT.md` had been written in the `/metrics` spelling, so all four
    would have referenced columns that do not exist. The table is corrected.
 
-   **Two of the four triggers exist**, on
-   `switchboard.empty_completion_failed_total` and
-   `switchboard.account_failover_total`. The other two could not be created: the
-   API returned "Failed to save trigger" for both, and for a minimal probe
-   trigger on an unrelated column, which points at an account-level cap rather
-   than anything wrong with the queries.
+   **Two of the four triggers exist. Both were dead until 2026-09-08, and looked
+   fine.** They were created aggregating with `RATE_SUM`, which Honeycomb does
+   not permit on a Metrics dataset: running that query by hand returns
+   `aggregate operation not allowed in Metrics dataset: RATE_SUM`. A trigger
+   holding a query the engine refuses cannot evaluate, so both displayed as
+   healthy and neither could ever have fired. Both now aggregate with `SUM`,
+   which on a cumulative counter is the increase over the trigger window, and
+   that query was run against the live dataset before the change was made rather
+   than assumed. This is the same failure mode as the column-spelling defect
+   above and it is worth stating plainly: **Honeycomb accepts a trigger it will
+   not run, and says nothing afterwards.** The only reliable check is to execute
+   the trigger's own query.
+
+   **The other two triggers are blocked by the plan, not by the queries.** The
+   API answers a third create with `exceeded maximum 2 triggers for this team's
+   plan`. The MCP tooling in front of it reported only `Failed to save trigger`,
+   which is what made this look like a query problem for as long as it did;
+   calling the API directly gave the real message immediately. So
+   `switchboard.usage_mismatch_total` and `switchboard.idempotent_unknown_total`
+   have no trigger, and getting one costs a Honeycomb plan change. Of the four,
+   the two that exist are the two worth having if the cap stays: lost service and
+   a provider account that cannot serve.
 
    **Neither existing trigger notifies anyone.** The team has no notification
    recipients configured, so both evaluate and neither pages. That is worse than

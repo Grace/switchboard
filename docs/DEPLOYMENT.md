@@ -88,9 +88,11 @@ Datadog takes `dd-api-key`, and a local collector takes no header at all.
 
 ### Triggers worth creating
 
-Once metrics arrive, these four are the ones that map to something a person should do. They are
-written here rather than created in advance, because a trigger references columns that do not exist
-until data lands.
+These four map to something a person should do. Two of them exist in the `gracefulcode` `test`
+environment; the other two do not, and the reason is a plan limit rather than anything about the
+queries. The Honeycomb API answers a third create with `exceeded maximum 2 triggers for this
+team's plan`, so a third and fourth trigger cost a plan change, not a config change. Pick the two
+that matter most for the account you are deploying into.
 
 **The column names differ by path, and this is the detail that breaks triggers.** The Prometheus
 exposition on `/metrics` separates words with underscores — `switchboard_empty_completion_failed_total`.
@@ -105,9 +107,19 @@ The table below uses the Honeycomb spelling.
 | `switchboard.usage_mismatch_total` | A provider's token totals did not add up, so billing figures may be wrong | Notify. Any non-zero value deserves a look. |
 | `switchboard.idempotent_unknown_total` | A retry was refused because the original outcome was ambiguous | Notify. Rising means real ambiguity is being caught rather than paid for twice. |
 
-These are cumulative counters, so aggregate with `RATE_SUM` and fire above zero. `COUNT` measures
-how often the exporter reported rather than what it reported, and `MAX` on a counter that only ever
-climbs stays above any threshold once crossed.
+These are cumulative counters. Aggregate with **`SUM`** and fire above zero: on a Metrics dataset
+Honeycomb applies the counter's own temporal aggregation before yours, so `SUM` over the trigger
+window is the increase during that window rather than the running total.
+
+**Do not use `RATE_SUM` here**, whatever a rate-shaped counter suggests. Honeycomb refuses it on a
+Metrics dataset outright — `aggregate operation not allowed in Metrics dataset: RATE_SUM` — and the
+refusal is easy to miss, because tooling sitting in front of the API may surface nothing more than
+`Failed to save trigger`. A trigger already holding a `RATE_SUM` query is worse still: it displays
+as healthy and never evaluates, because the query it runs is one the engine will not accept. Check
+an existing trigger by running its query by hand; if the query errors, the trigger is dead.
+
+`COUNT` measures how often the exporter reported rather than what it reported, and `MAX` on a
+counter that only ever climbs stays above any threshold once crossed.
 
 `switchboard.empty_completion_recovered_total` is worth a graph rather than a trigger: it is spend
 and latency, not an outage, and budget-aware routing should drive it toward zero on its own.
