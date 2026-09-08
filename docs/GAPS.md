@@ -176,9 +176,25 @@ Each of these is backed by a run recorded in `docs/VALIDATION.md`.
    What remains unexercised on this path: tool and reasoning blocks are refused
    rather than flattened, and that refusal has only been tested with synthetic
    frames, because Nova Micro does not emit them for these prompts.
-9. **Soak duration.** The longest run is 60 seconds. Nothing addresses memory
-   growth, file-descriptor leaks, spool behavior over hours, or policy rotation
-   mid-flight.
+9. **Resident memory grows linearly under sustained load, cause unknown.** A 30
+   minute run at 20 requests per second served 35,988 requests with one transport
+   error, p99 latency of 43 ms and a disk spool that never exceeded 19 events.
+   Resident memory went from 7.4 MiB to 26.9 MiB, near perfectly linearly, and
+   did not fall when load stopped. That is growth proportional to requests
+   served, not a working set settling.
+
+   No cause is claimed and none should be inferred: there is no pprof endpoint,
+   so heap and goroutine profiles cannot be taken. **This is the single most
+   important open item.** A sidecar that grows without bound is replaced by its
+   platform on a schedule set by the leak, and no amount of failover or metering
+   correctness compensates for that. Fixing it starts with exposing pprof on the
+   existing loopback listener, where `/metrics` already sits for the same reason,
+   and repeating the run with profiles taken at intervals.
+
+   Runs longer than 30 minutes, policy rotation mid-flight and file-descriptor
+   growth all remain unmeasured. File descriptors could not be counted at all
+   from the host, because the gateway image is distroless and Docker Desktop runs
+   the container inside a VM.
 10. **No idempotency.** There is no exactly-once guarantee, replay cache or
    ledger. A 429 or 503 retry cannot prove the absence of upstream billing.
    Clients must disable automatic retries.
@@ -206,6 +222,95 @@ Each of these is backed by a run recorded in `docs/VALIDATION.md`.
 14. **Infrastructure assumptions.** `controlplane.yaml` requires an existing VPC,
     subnets, IAM roles, KMS keys, ECS cluster and load balancer target group.
     `quickstart.yaml` removes all of those except the certificate.
+
+15. **Onboarding cost, once a real provider is involved.** The mock path is
+    not the problem and should not be confused with it: `make dev-up`,
+    `make dev-smoke`, `make dev-down` is three commands, and the user
+    hand-authors nothing. `scripts/dev-up.sh` generates the keypair and the
+    tokens into `.dev/env`, runs migrations, provisions the tenant and
+    principals, publishes a signed policy and writes `config.json`.
+
+    The cliff is the next heading. `docs/LOCAL.md`, "Using real providers
+    instead", says to "point a provider at its real base URL in the generated
+    `config.json`, supply the matching key, and publish a policy naming a real
+    model." Each clause is an undocumented job. The generated `config.json`
+    lives in the `switchboard_gwconfig` volume and has no host path, so it
+    cannot be opened. The key is hardcoded at `docker-compose.dev.yml:116` as
+    `unused-local-placeholder`. Publishing means hand-authoring six fields with
+    correct Unix timestamps, bumping `version` past the stored one or taking a
+    409, recovering `BOOTSTRAP_ADMIN_TOKEN` from `.dev/env`, and reading `422
+    invalid policy`, which names no field.
+
+    **The control plane is on that path for one reason: nothing else can sign.**
+    `controlplane/policy.py::sign(p, key_id, seed)` takes a dict, a key id and
+    32 bytes, touches no database, and is called from exactly one place,
+    `app.py:161`, inside the `PUT /v1/policy` handler. Reaching those seven
+    lines requires Postgres, migrations, two roles, a tenant and an admin
+    principal. The gateway needs none of it — `cmd/gateway/main.go:67-75`
+    restores an envelope from `data_dir/policy.json` at startup and
+    `server.go` readiness consults only the local policy. What forbids a
+    file-only first request is `config.go:101-107`, which refuses to start
+    without a valid `control_url` and a 32-byte `CONTROL_TOKEN` even when
+    neither is ever used.
+
+    Three of these are broken rather than merely laborious:
+
+    - **`config.example.json` cannot be used as shipped.** Its `trusted_keys`
+      value, `REPLACE_WITH_BASE64_ED25519_PUBLIC_KEY`, is not valid base64, so
+      it fails `invalid trust key`. It declares all four providers, and
+      although bedrock is exempt and carries its region, the other three each
+      require their key environment variable to be non-empty before the process
+      will start. An example configuration that is guaranteed to fail is worse
+      than none.
+    - **Nothing derives a public key from a signing seed.**
+      `deploy/cloudformation/quickstart.yaml` describes the seed secret with
+      "Read the public key from the control plane, never this." There is no
+      such endpoint; the control plane serves healthz, readyz, policy,
+      telemetry, audit and principals. `docs/SECURITY.md` likewise says to
+      export only the public key, and no tool does. The template generates the
+      seed in a Lambda and never emits the public half at all. The only ways to
+      obtain the pinnable value are to read the secret the template tells you
+      not to read, or to have run `devstack.py keys` yourself. **This is a
+      documentation defect as much as a missing command: the instruction as
+      written cannot be followed.**
+    - **`Config` has no defaults.** `config.go:98-99` collapses `tenant`,
+      `data_dir` and eight numeric limits into one `invalid configuration
+      limits`, naming none of them.
+
+    Lesser friction, recorded so it is not rediscovered: the gateway is
+    loopback-only by design, so `scripts/dev-smoke.py` is the only client and
+    there is no documented way to send a custom prompt; four correlated secrets
+    exist with only `.dev/env` relating them; the 15-second policy poll and
+    readiness wait make a hand-rolled first attempt look like a hang; and
+    `asm-exec`, referenced by `.env.example` and `docs/DEPLOYMENT.md`, is not in
+    this repository and is nowhere explained.
+
+    Not a defect: `adapter.go:34` rejects any `model` but `preferred`, so the
+    first thing an OpenAI SDK user types fails. That is the signed policy doing
+    its job. The error message is the gap, not the rule.
+
+    Three decisions are deliberately open rather than forgotten:
+
+    - **A file-only first-request mode.** Expose the existing `sign` over a
+      command line, write the envelope straight to `data_dir/policy.json`, and
+      make `control_url` and `control_token_env` optional when a local policy is
+      present. That removes Postgres, migrations, roles, tenants, principals and
+      the control plane from the first-request path. Every part of this already
+      works except the validation that forbids it.
+    - **Whether the numeric limits should default.** Defaults would reduce the
+      file to the fields carrying a real decision. Against that: a silent
+      default is a production setting nobody chose, and this is a component
+      whose argument is that you can read what it will do. Splitting the lumped
+      error is worth doing either way.
+    - **A public-key-from-seed command**, which is needed whatever is decided
+      above, because two shipped documents currently instruct the reader to do
+      something impossible.
+
+    Whatever is built should be assembled from what exists rather than written
+    fresh: `devstack.py keys` already emits the keypair, `controlplane.policy`
+    already signs without a database, `controlplane.migrate` is importable,
+    `dev-smoke.py` is a working client, and the gateway already has
+    `--init-data-dir` and `--healthcheck`.
 
 ## Blocked externally
 

@@ -556,3 +556,57 @@ and `metadata` all arrive as expected, with `metadata` after `messageStop`, and 
 
 Still unexercised: tool and reasoning blocks are refused rather than flattened on the streaming path,
 tested only with synthetic frames, because Nova Micro does not emit them for these prompts.
+
+## 2026-09-08 — 30 minute soak, and the memory growth it found
+
+The longest previous run was 60 seconds. This is the first run long enough to say anything about
+behaviour over time, and it found something.
+
+Local stack, mock provider, 30 minutes at 20 requests per second, 8 workers, 40% streaming:
+
+```
+requests        35,988  (20.0/s)
+succeeded       35,987
+failed          1       (0.00%, a single transport error)
+sse frames      57,596
+latency         p50 2ms   p95 8ms   p99 43ms
+```
+
+Throughput, latency and backpressure are all clean. The disk spool stayed between 6 and 19 events for
+the entire run and never grew, so telemetry delivery kept pace with production.
+
+### Resident memory grows linearly and does not plateau
+
+```
+   2s   7.4 MiB
+ 326s  11.2 MiB
+ 649s  14.9 MiB
+ 972s  18.2 MiB
+1294s  21.5 MiB
+1617s  25.0 MiB
+1779s  26.9 MiB
+```
+
+Roughly 0.65 MiB per minute, near perfectly linear, about 3.7 times the starting figure in half an
+hour. The increments between samples are 3.84, 3.71, 3.27, 3.29 and 3.54 MiB, which is growth
+proportional to requests served rather than a heap settling into a working set. A working set
+plateaus; this does not.
+
+Extrapolating is not evidence, but it frames the risk: at this rate a task passes 300 MiB inside
+eight hours and approaches a gigabyte in a day. A sidecar with a modest ECS memory limit would be
+replaced by the platform on a schedule set by its own leak.
+
+**It is not released when load stops.** With the generator stopped, zero active requests, an empty
+spool and idle CPU, resident memory held at 26.89 MiB across three samples a minute apart.
+
+### Not diagnosed
+
+No cause is claimed. The gateway exposes no pprof endpoint, so heap and goroutine profiles cannot be
+taken from outside the process, and the only per-request goroutine in the code path is `bedrockSSE`,
+which this run never exercised because the mock provider speaks the OpenAI shape. Guessing at a cause
+from a memory curve would be the same mistake as diagnosing a provider from one error string.
+
+The next step is a pprof endpoint on the existing loopback listener, which is where `/metrics`
+already sits unauthenticated for the same reason, and a repeat of this run with heap profiles taken
+at intervals. Until then this is a measured fact without an explanation, which is still worth more
+than the 60 second runs that could not see it at all.
