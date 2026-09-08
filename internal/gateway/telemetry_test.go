@@ -341,3 +341,104 @@ func TestOTLPHistogramBucketsAreDifferenced(t *testing.T) {
 		t.Errorf("sum = %v, want %d", h.Sum, m.LatencyMS.Load())
 	}
 }
+
+// The runtime gauges exist to attribute the linear memory growth recorded in
+// docs/VALIDATION.md. They are sampled rather than counted, so the thing worth
+// asserting is that a consumer sees live values and that both export paths
+// agree on their type.
+func TestRuntimeGaugesAreExported(t *testing.T) {
+	m := &Metrics{}
+	w := httptest.NewRecorder()
+	m.ServeHTTP(w, httptest.NewRequest("GET", "/metrics", nil))
+	out := w.Body.String()
+
+	for _, name := range []string{"goroutines", "heap_alloc_bytes", "heap_objects", "heap_sys_bytes"} {
+		if !strings.Contains(out, "# TYPE switchboard_"+name+" gauge") {
+			t.Errorf("%s is not declared as a gauge", name)
+		}
+	}
+	// A zero here would mean the sample never ran: a live process always has at
+	// least the goroutine running this test.
+	if m.Goroutines.Load() < 1 {
+		t.Errorf("goroutines = %d, want at least 1", m.Goroutines.Load())
+	}
+	if m.HeapAlloc.Load() < 1 || m.HeapSys.Load() < 1 || m.HeapObjects.Load() < 1 {
+		t.Errorf("heap gauges not sampled: alloc=%d objects=%d sys=%d",
+			m.HeapAlloc.Load(), m.HeapObjects.Load(), m.HeapSys.Load())
+	}
+}
+
+// series() samples on every call rather than once, so a scrape reports the
+// process as it is now and not as it was when the struct was built.
+func TestRuntimeGaugesResampleOnEveryRead(t *testing.T) {
+	m := &Metrics{}
+	const sentinel = -1
+	for i := 0; i < 2; i++ {
+		m.Goroutines.Store(sentinel)
+		m.HeapAlloc.Store(sentinel)
+		m.series()
+		if m.Goroutines.Load() == sentinel || m.HeapAlloc.Load() == sentinel {
+			t.Fatalf("read %d did not resample: goroutines=%d heap_alloc=%d",
+				i+1, m.Goroutines.Load(), m.HeapAlloc.Load())
+		}
+	}
+}
+
+// The series list exists so the Prometheus endpoint and the OTLP exporter
+// cannot drift. A gauge exported as a cumulative sum would be read as a running
+// total and misinterpreted, so assert the shape rather than only the name.
+func TestRuntimeGaugesExportAsGaugesOverOTLP(t *testing.T) {
+	var got []byte
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		got, _ = io.ReadAll(r.Body)
+		w.WriteHeader(200)
+	}))
+	defer srv.Close()
+
+	tel := &Telemetry{c: Config{OTLPMetricsURL: srv.URL}, m: &Metrics{}, http: srv.Client(), start: time.Now()}
+	tel.exportMetrics(context.Background())
+
+	var body struct {
+		ResourceMetrics []struct {
+			ScopeMetrics []struct {
+				Metrics []struct {
+					Name  string          `json:"name"`
+					Sum   json.RawMessage `json:"sum"`
+					Gauge *struct {
+						DataPoints []struct {
+							AsInt string `json:"asInt"`
+						} `json:"dataPoints"`
+					} `json:"gauge"`
+				} `json:"metrics"`
+			} `json:"scopeMetrics"`
+		} `json:"resourceMetrics"`
+	}
+	if err := json.Unmarshal(got, &body); err != nil {
+		t.Fatalf("exported body is not valid OTLP JSON: %v\n%s", err, got)
+	}
+	want := map[string]bool{
+		"switchboard.goroutines": false, "switchboard.heap_alloc_bytes": false,
+		"switchboard.heap_objects": false, "switchboard.heap_sys_bytes": false,
+	}
+	for _, mt := range body.ResourceMetrics[0].ScopeMetrics[0].Metrics {
+		if _, ok := want[mt.Name]; !ok {
+			continue
+		}
+		if mt.Sum != nil {
+			t.Errorf("%s exported as a sum; it is a gauge", mt.Name)
+		}
+		if mt.Gauge == nil || len(mt.Gauge.DataPoints) != 1 {
+			t.Errorf("%s has no gauge data point", mt.Name)
+			continue
+		}
+		if v, err := strconv.ParseInt(mt.Gauge.DataPoints[0].AsInt, 10, 64); err != nil || v < 1 {
+			t.Errorf("%s = %q, want a positive sampled value", mt.Name, mt.Gauge.DataPoints[0].AsInt)
+		}
+		want[mt.Name] = true
+	}
+	for name, seen := range want {
+		if !seen {
+			t.Errorf("%s missing from the OTLP payload", name)
+		}
+	}
+}

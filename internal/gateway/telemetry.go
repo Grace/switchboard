@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -49,8 +50,20 @@ type Metrics struct {
 	AccountFailover atomic.Int64
 	// ProviderProbeFailed counts providers rejected by the startup check.
 	ProviderProbeFailed atomic.Int64
-	LatencyBuckets      [7]atomic.Int64
-	LogDropped          *atomic.Int64
+	// Goroutines, HeapAlloc, HeapObjects and HeapSys are sampled from the
+	// runtime rather than counted, and exist to make unbounded growth
+	// attributable. A 30-minute soak found resident memory rising linearly with
+	// requests served and not falling when load stopped; these four separate the
+	// three explanations that observation leaves open.
+	//
+	// Goroutines rising with requests is a goroutine leak and needs nothing
+	// further. HeapObjects and HeapAlloc rising together is object retention.
+	// HeapSys rising while HeapAlloc stays flat is fragmentation or memory the
+	// runtime has kept rather than objects the program is holding, which a heap
+	// profile would not explain.
+	Goroutines, HeapAlloc, HeapObjects, HeapSys atomic.Int64
+	LatencyBuckets                              [7]atomic.Int64
+	LogDropped                                  *atomic.Int64
 }
 
 var latencyBounds = [7]int64{100, 500, 1000, 5000, 15000, 60000, 90000}
@@ -74,7 +87,31 @@ type series struct {
 	v          *atomic.Int64
 }
 
+// sampleRuntime refreshes the four runtime gauges. ReadMemStats stops the
+// world, which is normally the argument against calling it, but series() is
+// read only by a Prometheus scrape and by the exporter every metricInterval, so
+// the pause is tens of microseconds a couple of times a minute. That reasoning
+// depends on the heap staying small: the pause scales with heap size, and a
+// heap large enough to make this expensive is one these gauges should have
+// caught long before. runtime/metrics is the non-stop-the-world alternative if
+// that ever stops being true, at the cost of a samples slice and string lookups
+// that buy nothing at this cadence.
+func (m *Metrics) sampleRuntime() {
+	var ms runtime.MemStats
+	runtime.ReadMemStats(&ms)
+	m.Goroutines.Store(int64(runtime.NumGoroutine()))
+	m.HeapAlloc.Store(int64(ms.HeapAlloc))
+	m.HeapObjects.Store(int64(ms.HeapObjects))
+	m.HeapSys.Store(int64(ms.HeapSys))
+}
+
+// series has a side effect: it samples the runtime gauges before returning, so
+// every consumer sees current values. That is here rather than in the two
+// callers for the same reason the list itself is here — a caller that forgot to
+// sample would export stale numbers, which is the drift this list exists to
+// prevent, and harder to notice than a missing metric.
 func (m *Metrics) series() []series {
+	m.sampleRuntime()
 	s := []series{
 		{"requests_total", "counter", &m.Requests},
 		{"errors_total", "counter", &m.Errors},
@@ -94,6 +131,10 @@ func (m *Metrics) series() []series {
 		{"spool_bytes", "gauge", &m.SpoolUsed},
 		{"spool_events", "gauge", &m.SpoolCount},
 		{"active_requests", "gauge", &m.Active},
+		{"goroutines", "gauge", &m.Goroutines},
+		{"heap_alloc_bytes", "gauge", &m.HeapAlloc},
+		{"heap_objects", "gauge", &m.HeapObjects},
+		{"heap_sys_bytes", "gauge", &m.HeapSys},
 	}
 	if m.LogDropped != nil {
 		s = append(s, series{"log_dropped_total", "counter", m.LogDropped})
