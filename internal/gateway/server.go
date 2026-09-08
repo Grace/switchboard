@@ -158,7 +158,10 @@ type Server struct {
 	slots       chan struct{}
 	rate, retry *bucket
 	circuits    map[string]*circuit
-	Draining    atomic.Bool
+	// Idem is nil unless idempotency_ttl_seconds is set. Nil means the feature is
+	// off and a key is refused, which is the behaviour before it existed.
+	Idem     *idemStore
+	Draining atomic.Bool
 	// unhealthy holds providers the startup check rejected, and is cleared per
 	// provider by a real request succeeding through it. A plain latch would have
 	// meant readiness could never follow routing back to healthy: the breaker's
@@ -329,10 +332,15 @@ func (s *Server) chat(w http.ResponseWriter, r *http.Request) {
 		fail(503, "no valid routing policy or draining")
 		return
 	}
-	// Exactly-once generation cannot be guaranteed across provider APIs or task loss.
-	// Reject this header instead of falsely acknowledging an idempotency contract.
-	if r.Header.Get("Idempotency-Key") != "" {
-		fail(400, "idempotency keys are unsupported; do not automatically replay ambiguous inference failures")
+	// Exactly-once generation still cannot be guaranteed across provider APIs or
+	// task loss. With a store configured the key narrows the window in which that
+	// ambiguity costs money; without one, refusing is more honest than accepting
+	// a header whose contract nothing here would keep.
+	idemKey := r.Header.Get("Idempotency-Key")
+	idemSettled := false
+	if idemKey != "" && s.Idem == nil {
+		fail(400, "idempotency keys are unsupported; set idempotency_ttl_seconds to enable them, "+
+			"and do not automatically replay ambiguous inference failures")
 		return
 	}
 	if !s.rate.allow() {
@@ -362,6 +370,32 @@ func (s *Server) chat(w http.ResponseWriter, r *http.Request) {
 	if e != nil {
 		fail(400, e.Error())
 		return
+	}
+	// Claimed after the body is read, because an entry binds to the body hash: the
+	// same key with a different request is a client bug, and answering it with the
+	// first response would be silently wrong.
+	if idemKey != "" {
+		prior, ie := s.Idem.begin(idemKey, b)
+		switch {
+		case errors.Is(ie, errIdemMismatch):
+			fail(422, "this Idempotency-Key was already used with a different request body")
+			return
+		case errors.Is(ie, errIdemConflict):
+			fail(409, "this Idempotency-Key is in use, or its original outcome is unknown and "+
+				"replaying it could charge a second time")
+			return
+		case prior != nil:
+			s.replay(w, prior, id, start.Unix(), &event)
+			return
+		}
+		// Nothing recorded an outcome yet. A path that returns without doing so
+		// leaves a running entry, which expires with the TTL rather than being
+		// held forever.
+		defer func() {
+			if !idemSettled {
+				s.Idem.release(idemKey)
+			}
+		}()
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), time.Duration(s.C.TimeoutSeconds)*time.Second)
 	defer cancel()
@@ -419,6 +453,7 @@ func (s *Server) chat(w http.ResponseWriter, r *http.Request) {
 			} else {
 				s.circuits[route.Provider].result(true)
 			}
+			idemSettled = s.settleUnknown(idemKey, hashBody(b))
 			fail(502, "provider transport failed; outcome unknown, no automatic replay")
 			return
 		}
@@ -480,6 +515,7 @@ func (s *Server) chat(w http.ResponseWriter, r *http.Request) {
 			}
 			return
 		}
+		var streamed streamResult
 		// A 200 means this provider authenticated and served, which is stronger
 		// evidence than the startup check and supersedes a rejection from it.
 		s.markHealthy(route.Provider)
@@ -491,7 +527,7 @@ func (s *Server) chat(w http.ResponseWriter, r *http.Request) {
 
 		// Acceptance (HTTP 200) commits this generation. No body/stream error may fail over.
 		if c.Stream {
-			err := s.stream(w, res, route, id, start.Unix())
+			err := s.stream(w, res, route, id, start.Unix(), &streamed)
 			res.Body.Close()
 			if errors.Is(err, errStreamEmpty) {
 				// The provider answered and said nothing, without sending a
@@ -508,8 +544,18 @@ func (s *Server) chat(w http.ResponseWriter, r *http.Request) {
 			s.circuits[route.Provider].result(err != nil)
 			if err != nil {
 				event.Status = 502
-			} else if len(empties) > 0 {
-				s.Metrics.EmptyCompletionRecovered.Add(1)
+				idemSettled = s.settleUnknown(idemKey, hashBody(b))
+			} else {
+				if len(empties) > 0 {
+					s.Metrics.EmptyCompletionRecovered.Add(1)
+				}
+				if idemKey != "" {
+					s.Idem.finish(idemKey, &idemEntry{
+						State: idemDone, BodyHash: hashBody(b), Stored: time.Now().Unix(),
+						Status: 200, Stream: true, Text: streamed.text, Finish: streamed.finish,
+					})
+					idemSettled = true
+				}
 			}
 			return
 		}
@@ -517,6 +563,7 @@ func (s *Server) chat(w http.ResponseWriter, r *http.Request) {
 		res.Body.Close()
 		if e != nil || len(data) > 8<<20 {
 			s.circuits[route.Provider].result(true)
+			idemSettled = s.settleUnknown(idemKey, hashBody(b))
 			fail(502, "incomplete provider response; not replayed")
 			return
 		}
@@ -526,6 +573,7 @@ func (s *Server) chat(w http.ResponseWriter, r *http.Request) {
 		}
 		s.circuits[route.Provider].result(e != nil)
 		if e != nil {
+			idemSettled = s.settleUnknown(idemKey, hashBody(b))
 			fail(502, "unsupported or incomplete provider response; not replayed")
 			return
 		}
@@ -551,8 +599,16 @@ func (s *Server) chat(w http.ResponseWriter, r *http.Request) {
 			s.Metrics.EmptyCompletionRecovered.Add(1)
 		}
 		event.Status = 200
+		body := jsonBytes(completion(id, route, n, start.Unix()))
+		if idemKey != "" {
+			s.Idem.finish(idemKey, &idemEntry{
+				State: idemDone, BodyHash: hashBody(b), Stored: time.Now().Unix(),
+				Status: 200, Response: body,
+			})
+			idemSettled = true
+		}
 		w.Header().Set("Content-Type", "application/json")
-		w.Write(jsonBytes(completion(id, route, n, start.Unix())))
+		w.Write(body)
 		return
 	}
 	w.Header().Set("Retry-After", "1")
@@ -570,7 +626,7 @@ func (s *Server) chat(w http.ResponseWriter, r *http.Request) {
 	}
 	fail(503, "routes unavailable or retry budget exhausted")
 }
-func (s *Server) stream(w http.ResponseWriter, res *http.Response, route Route, id string, created int64) error {
+func (s *Server) stream(w http.ResponseWriter, res *http.Response, route Route, id string, created int64, out *streamResult) error {
 	body := res.Body
 	ct := strings.ToLower(res.Header.Get("Content-Type"))
 	switch {
@@ -637,6 +693,12 @@ func (s *Server) stream(w http.ResponseWriter, res *http.Response, route Route, 
 				return e
 			}
 			wrote = true
+			if out != nil {
+				out.text += n.Text
+				if n.Finish != "" {
+					out.finish = n.Finish
+				}
+			}
 		}
 		if done && route.Provider != "openai" {
 			if !finished {
@@ -811,4 +873,46 @@ func Healthcheck(addr string) int {
 		return 1
 	}
 	return 0
+}
+
+// streamResult carries what a completed stream said, so an idempotent replay can
+// deliver the same answer. It is the assembled content rather than the provider's
+// frames: replay gives the same answer, not the original timing.
+type streamResult struct {
+	text   string
+	finish string
+}
+
+// settleUnknown marks a key ambiguous. Deliberately sticky: releasing it would
+// let a retry pay a second time for work that may already have happened, which is
+// the exact failure an idempotency key is bought to prevent.
+//
+// The body hash is carried through. Without it the entry no longer matches its
+// own request, and a retry is refused as a body mismatch rather than as the
+// ambiguity it actually is, which tells the caller the wrong thing.
+func (s *Server) settleUnknown(key string, bodyHash string) bool {
+	if key == "" {
+		return false
+	}
+	s.Idem.finish(key, &idemEntry{State: idemUnknown, BodyHash: bodyHash, Stored: time.Now().Unix()})
+	return true
+}
+
+// replay serves a stored outcome without contacting any provider.
+func (s *Server) replay(w http.ResponseWriter, e *idemEntry, id string, created int64, event *Event) {
+	event.Status = e.Status
+	// Named so a caller can tell a replay from a fresh generation; without it the
+	// two are indistinguishable and a retry looks like it cost money.
+	w.Header().Set("X-Switchboard-Replayed", "true")
+	if !e.Stream {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(e.Status)
+		w.Write(e.Response)
+		return
+	}
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("X-Accel-Buffering", "no")
+	writeSSE(w, chunk(id, Route{}, normalized{Text: e.Text, Finish: e.Finish}, created))
+	fmt.Fprint(w, "data: [DONE]\n\n")
 }

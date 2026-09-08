@@ -26,5 +26,7 @@
   "otlp_metrics_url": "",
   "provider_check_strict": false,
   "enable_pprof": false,
-  "allow_local_http": false
+  "allow_local_http": false,
+  "idempotency_ttl_seconds": 0,
+  "idempotency_bytes": 0
 }

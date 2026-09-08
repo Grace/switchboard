@@ -10,6 +10,21 @@ The control plane stores SHA-256 hashes of high-entropy random bearer tokens, no
 
 RLS guards accidental missing filters; it is not isolation from a fully compromised runtime database session, which can change its own `app.tenant` setting. For that threat model use separate database credentials/databases or an external authorization proxy per tenant. Similarly, a compromised signing control plane can sign malicious routing policies within the gateway's locally constrained provider URLs. Signatures protect distribution integrity, not a compromised signer.
 
+## Idempotency and content at rest
+
+Provider response bodies, prompts and completions are not logged and are not in product telemetry.
+**Enabling `idempotency_ttl_seconds` changes what is at rest**, and that is the one place this
+statement needs qualifying: an idempotency entry stores the request body hash and the response
+content so a duplicate key can be answered without calling the provider again.
+
+Entries are written to `<data_dir>/idempotency`, mode 0600, bounded by `idempotency_bytes` and
+expiring with the TTL. While the feature is on, the data directory holds customer content and
+deserves the same protection as the signing seed: encrypted storage, restricted mounts, and no
+sharing with untrusted containers in the task.
+
+It is off by default. A change to what a deployment stores should be chosen, not inherited from an
+upgrade.
+
 ## Runtime profiling
 
 `enable_pprof` exposes Go runtime profiles at `/debug/pprof/`. It is **off by default and

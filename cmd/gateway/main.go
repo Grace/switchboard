@@ -132,6 +132,19 @@ func main() {
 	}
 	background, stop := context.WithCancel(context.Background())
 	s := gateway.New(c, p, m, t)
+	if c.IdempotencyTTLSeconds > 0 {
+		store, e := gateway.NewIdemStore(
+			filepath.Join(c.DataDir, "idempotency"),
+			time.Duration(c.IdempotencyTTLSeconds)*time.Second, c.IdempotencyBytes, m)
+		if e != nil {
+			fatal("idempotency store unavailable", "error", e)
+		}
+		s.Idem = store
+		// Says what it costs. Entries hold request and response content, so the
+		// data directory now deserves the same protection as the signing seed.
+		slog.Info("idempotency enabled; request and response content is stored in the data directory",
+			"ttl_seconds", c.IdempotencyTTLSeconds, "limit_bytes", c.IdempotencyBytes)
+	}
 	s.Bedrock = bedrock
 	t.Start(background)
 	// Nothing to poll in file-only operation. Starting the poller would log a

@@ -21,7 +21,7 @@ func TestStreams(t *testing.T) {
 			s := testServer(t, nil)
 			w := httptest.NewRecorder()
 			res := &http.Response{Header: http.Header{"Content-Type": []string{"text/event-stream"}}, Body: io.NopCloser(strings.NewReader(stream))}
-			if e := s.stream(w, res, Route{provider, "test"}, "id", 1); e != nil {
+			if e := s.stream(w, res, Route{provider, "test"}, "id", 1, nil); e != nil {
 				t.Fatal(e)
 			}
 			if !strings.Contains(w.Body.String(), "hello") || strings.Count(w.Body.String(), "[DONE]") != 1 {
@@ -34,7 +34,7 @@ func TestStreamTruncation(t *testing.T) {
 	s := testServer(t, nil)
 	w := httptest.NewRecorder()
 	res := &http.Response{Header: http.Header{"Content-Type": []string{"text/event-stream"}}, Body: io.NopCloser(strings.NewReader("data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\n"))}
-	if s.stream(w, res, Route{"openai", "test"}, "id", 1) == nil || strings.Contains(w.Body.String(), "[DONE]") || !strings.Contains(w.Body.String(), "stream_error") {
+	if s.stream(w, res, Route{"openai", "test"}, "id", 1, nil) == nil || strings.Contains(w.Body.String(), "[DONE]") || !strings.Contains(w.Body.String(), "stream_error") {
 		t.Fatal(w.Body.String())
 	}
 }

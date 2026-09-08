@@ -50,6 +50,16 @@ type Metrics struct {
 	AccountFailover atomic.Int64
 	// ProviderProbeFailed counts providers rejected by the startup check.
 	ProviderProbeFailed atomic.Int64
+	// IdempotentReplay counts responses served from the idempotency store rather
+	// than from a provider. Every one is a generation not paid for twice.
+	IdempotentReplay atomic.Int64
+	// IdempotentConflict counts keys refused because they were still in use, or
+	// reused with a different request body.
+	IdempotentConflict atomic.Int64
+	// IdempotentUnknown counts retries refused because the original outcome is
+	// genuinely unknown. A rising figure here means real ambiguity is being
+	// caught rather than silently paid for twice.
+	IdempotentUnknown atomic.Int64
 	// Goroutines, HeapAlloc, HeapObjects and HeapSys are sampled from the
 	// runtime rather than counted, and exist to make unbounded growth
 	// attributable. A 30-minute soak found resident memory rising linearly with
@@ -123,6 +133,9 @@ func (m *Metrics) series() []series {
 		{"empty_completion_failed_total", "counter", &m.EmptyCompletionFailed},
 		{"account_failover_total", "counter", &m.AccountFailover},
 		{"provider_probe_failed_total", "counter", &m.ProviderProbeFailed},
+		{"idempotent_replay_total", "counter", &m.IdempotentReplay},
+		{"idempotent_conflict_total", "counter", &m.IdempotentConflict},
+		{"idempotent_unknown_total", "counter", &m.IdempotentUnknown},
 		{"rejected_total", "counter", &m.Rejected},
 		{"telemetry_dropped_total", "counter", &m.Dropped},
 		{"telemetry_disk_errors_total", "counter", &m.DiskErrors},

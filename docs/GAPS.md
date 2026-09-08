@@ -207,9 +207,30 @@ Each of these is backed by a run recorded in `docs/VALIDATION.md`.
    watches container memory, which is worth documenting for operators. Batching
    the spool into segment files rather than one file per event would remove the
    churn, and is the fix if this ever needs one.
-10. **No idempotency.** There is no exactly-once guarantee, replay cache or
-   ledger. A 429 or 503 retry cannot prove the absence of upstream billing.
-   Clients must disable automatic retries.
+10. **Idempotency keys, bounded and off by default.** `Idempotency-Key` is
+    honoured when `idempotency_ttl_seconds` is set. A duplicate key returns the
+    original response without calling the provider; the same key with a different
+    body is refused with 422; a key whose original outcome is genuinely unknown
+    refuses the retry with 409 rather than risk charging twice.
+
+    That last case is the point. Four paths in `chat()` end with generation
+    ambiguous, and the entry is deliberately sticky there. An unambiguous failure
+    such as a provider 400 releases the key instead, so a caller who can fix the
+    request is not blocked by their own typo.
+
+    **Exactly-once generation across provider APIs remains impossible**, and
+    nothing here claims otherwise. What changed is the window in which the
+    ambiguity costs money. Entries survive a process restart, because they are in
+    `data_dir` under the existing exclusive lock, but **not task replacement**,
+    since that directory is ephemeral unless mounted on EFS. A retry landing on a
+    replacement task is a new request. Anything stronger needs durable shared
+    storage, which is a different product decision.
+
+    Off by default because entries hold request and response content, which is a
+    new category of data at rest; `docs/SECURITY.md` says so plainly rather than
+    leaving the earlier "not logged or in telemetry" statement to imply more than
+    it covers.
+
 11. **Security operations.** Bearer RBAC exists; SSO, MFA, human-user lifecycle,
    external authorization, hardware-backed signing and automated key renewal do
    not. Row level security defends against query mistakes, not against a

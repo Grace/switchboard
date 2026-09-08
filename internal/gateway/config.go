@@ -61,6 +61,13 @@ type Config struct {
 	// that application read provider credentials out of this process, which is
 	// the one thing the local-token design exists to prevent.
 	EnablePprof bool `json:"enable_pprof"`
+	// IdempotencyTTLSeconds enables idempotency keys and sets how long an entry
+	// is replayable. Zero disables the feature, which is the default: entries
+	// hold request and response content, and a change to what sits at rest
+	// should not arrive silently in an upgrade.
+	IdempotencyTTLSeconds int `json:"idempotency_ttl_seconds"`
+	// IdempotencyBytes bounds that store the way spool_bytes bounds the spool.
+	IdempotencyBytes int64 `json:"idempotency_bytes"`
 }
 
 func secureURL(s string, local bool) bool {
@@ -129,6 +136,14 @@ func (c Config) Validate() error {
 		if l.v < l.min || l.v > l.max {
 			return fmt.Errorf("%s is %d; it must be between %d and %d", l.name, l.v, l.min, l.max)
 		}
+	}
+	if c.IdempotencyTTLSeconds < 0 || c.IdempotencyTTLSeconds > 86400 {
+		return fmt.Errorf("idempotency_ttl_seconds is %d; it must be between 0 (disabled) and 86400",
+			c.IdempotencyTTLSeconds)
+	}
+	if c.IdempotencyTTLSeconds > 0 && (c.IdempotencyBytes < 1<<20 || c.IdempotencyBytes > 10<<30) {
+		return fmt.Errorf("idempotency_bytes is %d; with idempotency enabled it must be between %d and %d",
+			c.IdempotencyBytes, 1<<20, int64(10)<<30)
 	}
 	// An empty control_url is file-only operation: the gateway serves a policy
 	// restored from data_dir and never polls. Requiring a control plane that is

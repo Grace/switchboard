@@ -30,7 +30,23 @@ OpenAI uses Chat Completions, Anthropic uses Messages, and Gemini uses `generate
 
 429/503 failover still cannot establish provider-side exactly-once execution or equivalent model behavior. Select only routes approved for the workload, retention rules and regional requirements. `Retry-After` from a provider is not waited out: this release moves to a different approved provider with short jitter, bounded by the retry budget. No route is retried twice in one request.
 
-`Idempotency-Key` is explicitly rejected. This gateway does not cache generated content or claim cross-provider idempotency. Disable automatic SDK retries (`max_retries=0` in the OpenAI Python client). Use application operation IDs and an application-owned transactional outbox for external side effects. Tools are entirely unsupported, including tool history, so no tool invocation can be silently translated or executed here.
+`Idempotency-Key` is rejected unless `idempotency_ttl_seconds` is set, and is off by default because entries hold request and response content. See [security](SECURITY.md).
+
+With it enabled, a key gives you this and no more:
+
+| Situation | Response |
+|---|---|
+| Same key, same body, original finished | The original response, with `X-Switchboard-Replayed: true`. No provider call. |
+| Same key, still running | `409` |
+| Same key, original outcome unknown | `409`, naming the ambiguity. Deliberately sticky: replaying could charge twice. |
+| Same key, **different** body | `422` |
+| Key expired or evicted | Treated as new |
+
+**Exactly-once generation is still impossible** across provider APIs, and this does not claim it. Entries live in the gateway's data directory, so they survive a process restart but **not task replacement**, and they expire. A retry landing on a replacement task is a new request and can charge again.
+
+A replayed stream carries the same answer, not the original frame timing: it arrives as one chunk followed by `[DONE]`.
+
+Disable automatic SDK retries (`max_retries=0` in the OpenAI Python client) whether or not you use keys; the gateway never replays upstream on your behalf. Use application operation IDs and an application-owned transactional outbox for external side effects. Tools are entirely unsupported, including tool history, so no tool invocation can be silently translated or executed here.
 
 ## Control plane
 
