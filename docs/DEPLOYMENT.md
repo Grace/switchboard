@@ -183,6 +183,29 @@ since that text is what arrives in the notification.
 }
 ```
 
+### Anomaly detection will say your service is ineligible, and that is expected
+
+Honeycomb can watch a service's error rate without a threshold, and it will refuse to watch a new
+deployment. **It requires roughly 85% data coverage** and re-checks eligibility **weekly**, so
+expect `ineligible` for at least the first week, and indefinitely for a service whose traffic is
+intermittent. The banner it shows is written by the last weekly check, so it can describe a state
+that has already been fixed; read the coverage percentage on the Presence tab rather than the
+sentence on the Error Rate tab.
+
+Two consequences worth knowing before you read that banner as a fault in the gateway:
+
+- Coverage counts spans, and spans are emitted per request. A gateway that is running but idle
+  produces none, so uptime alone does not accumulate coverage. Real traffic does.
+- Its error rate is computed from `error`, `error.message`, `error.type`, `exception.message` and
+  `exception.type` — **not** from the span status. The gateway emits `error.type` on every 4xx and
+  5xx and Honeycomb derives `error` from it, so nothing needs configuring; but a service that only
+  sets a span status will be told it has no recognised error attributes, which is a confusing way
+  to be told a true thing.
+
+The triggers above carry none of this. They evaluate on their own schedule with no coverage
+requirement, which is the reason to set them up rather than wait for detection to turn itself on.
+It will, once coverage recovers, and nothing needs re-configuring when it does.
+
 ### What to alarm on
 
 | Metric | Meaning | Threshold |

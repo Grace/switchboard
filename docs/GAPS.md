@@ -293,11 +293,25 @@ Each of these is backed by a run recorded in `docs/VALIDATION.md`.
    and Honeycomb derived a boolean `error` column from it unprompted, so two of
    the five fields are now populated.
 
-   The signal had not left `ineligible` at the time of writing, and its
-   `updated_at` still predated the data. Eligibility also wants a rolling window
-   of continuous coverage, which a dev stack running in bursts does not produce;
-   the separate **presence** signal is ineligible for that reason alone and no
-   code change reaches it.
+   **The service still reads ineligible, and that is now a deployment property
+   rather than an open defect.** Honeycomb re-evaluates eligibility weekly. The
+   evaluation that produced "doesn't have any recognized error attributes" ran at
+   `2026-09-08T08:00:04Z`; `error.type` first arrived at `17:35Z`, more than nine
+   hours later. The banner therefore describes a state that no longer exists, and
+   the API still reports that same `updated_at`. The next evaluation is a week
+   out, so nothing observable can change before it, and the fix cannot be
+   confirmed by watching the status flip.
+
+   The coverage bar is the harder gate and it is quantified: the **presence**
+   signal reports that detection **needs 85% data coverage and the service is at
+   0%**. Coverage of a trace dataset means spans arriving in most evaluation
+   windows, and spans are emitted per request, so a gateway that is running but
+   idle produces none. A dev stack driven in bursts is structurally incapable of
+   reaching 85%. Only a service that is deployed and actually serving satisfies
+   it, which also means anomaly detection is not something a new deployment has
+   on day one. Triggers are: they evaluate on their own schedule with no coverage
+   requirement at all, which is the argument for having built them rather than
+   waiting.
 
    **Spans now carry the routing decision.** `gen_ai.request.model`,
    `switchboard.attempts` and `switchboard.fault`, all read from values the
