@@ -325,8 +325,10 @@ entirely**. Two real responses:
 ```
 
 The first normalized to `out=0` against 103 tokens billed. The second normalized to `out=6` against
-212 — a 97% under-report. Marketplace metering depends on this figure, so this was a revenue defect,
-not a cosmetic one.
+212 — a 97% under-report. This is an accuracy defect rather than a revenue one: `RegisterUsage`
+meters per ECS task per hour and never sees a token count, and nothing bills off
+`switchboard_usage_mismatch_total`. It would become a revenue defect under a usage-based metering
+dimension, which the current startup-only registration cannot support.
 
 Fixed by modelling `thoughtsTokenCount` and `totalTokenCount` and billing on
 `candidatesTokenCount + thoughtsTokenCount`. Because a provider can change its accounting again, the
