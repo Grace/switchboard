@@ -221,6 +221,13 @@ def cmd_init(args):
         "otlp_url": os.environ.get("OTLP_URL", ""),
         "otlp_metrics_url": os.environ.get("OTLP_METRICS_URL", ""),
         "otlp_headers": json.loads(os.environ.get("OTLP_HEADERS", "{}")),
+        # Zero means off, and off is the default here for the same reason it is
+        # the default in the product: capture writes prompts and completions to
+        # the data directory, and a dev stack that started doing that because
+        # someone pulled would be exactly the surprise the flag exists to avoid.
+        # Set CAPTURE_TTL_SECONDS in .dev/env to try replay.
+        "capture_ttl_seconds": int(os.environ.get("CAPTURE_TTL_SECONDS", "0")),
+        "capture_bytes": int(os.environ.get("CAPTURE_BYTES", str(64 << 20))),
         # Required for plain http to loopback; the gateway refuses it otherwise.
         "allow_local_http": True,
         # Local only. pprof exposes memory contents, including provider keys and

@@ -86,7 +86,29 @@ type Config struct {
 	IdempotencyTTLSeconds int `json:"idempotency_ttl_seconds"`
 	// IdempotencyBytes bounds that store the way spool_bytes bounds the spool.
 	IdempotencyBytes int64 `json:"idempotency_bytes"`
+	// CaptureTTLSeconds enables replay capture and sets how long a record lives.
+	// Zero disables it, and zero is the default, for the same reason the
+	// idempotency store defaults off and more so: a record holds the prompt as
+	// received and the completion as returned, and that is the one thing this
+	// gateway otherwise never writes down. Nobody should discover after an
+	// upgrade that their prompts are on a disk.
+	//
+	// Records never leave the machine. They are not attached to an event, not
+	// exported over OTLP, and not sent to the control plane; see capture.go.
+	CaptureTTLSeconds int `json:"capture_ttl_seconds"`
+	// CaptureBytes bounds the capture store. When it is full, writes are refused
+	// rather than the oldest records evicted: dropping the oldest evidence at the
+	// moment the most is being produced is the wrong instinct for a store that
+	// exists to answer questions about the past.
+	CaptureBytes int64 `json:"capture_bytes"`
 }
+
+// captureRecordLimit bounds a single record. The request body is already capped
+// at 1 MiB by MaxBytesReader in the chat handler, so a prompt cannot exceed
+// that; the rest of the allowance is for the completion, which has no equivalent
+// ceiling. A record larger than this is refused whole, never truncated -- a
+// half-written prompt reads as a complete one.
+const captureRecordLimit = 8 << 20
 
 func secureURL(s string, local bool) bool {
 	u, e := url.Parse(s)
@@ -158,6 +180,14 @@ func (c Config) Validate() error {
 	if c.IdempotencyTTLSeconds < 0 || c.IdempotencyTTLSeconds > 86400 {
 		return fmt.Errorf("idempotency_ttl_seconds is %d; it must be between 0 (disabled) and 86400",
 			c.IdempotencyTTLSeconds)
+	}
+	if c.CaptureTTLSeconds < 0 || c.CaptureTTLSeconds > 604800 {
+		return fmt.Errorf("capture_ttl_seconds is %d; must be 0 (off) to 604800 (seven days)",
+			c.CaptureTTLSeconds)
+	}
+	if c.CaptureTTLSeconds > 0 && (c.CaptureBytes < 1<<20 || c.CaptureBytes > 100<<30) {
+		return fmt.Errorf("capture_bytes is %d; must be %d to %d when capture is enabled",
+			c.CaptureBytes, 1<<20, int64(100)<<30)
 	}
 	if c.IdempotencyTTLSeconds > 0 && (c.IdempotencyBytes < 1<<20 || c.IdempotencyBytes > 10<<30) {
 		return fmt.Errorf("idempotency_bytes is %d; with idempotency enabled it must be between %d and %d",

@@ -145,6 +145,37 @@ func main() {
 		slog.Info("idempotency enabled; request and response content is stored in the data directory",
 			"ttl_seconds", c.IdempotencyTTLSeconds, "limit_bytes", c.IdempotencyBytes)
 	}
+	if c.CaptureTTLSeconds > 0 {
+		store, e := gateway.NewCaptureStore(
+			filepath.Join(c.DataDir, "capture"),
+			time.Duration(c.CaptureTTLSeconds)*time.Second, c.CaptureBytes, m)
+		if e != nil {
+			fatal("capture store unavailable", "error", e)
+		}
+		s.Capture = store
+		// Warn, not Info. Idempotency stores content as a side effect of doing
+		// its job; capture stores it as the whole job, and it is the only thing
+		// in this gateway that writes a prompt to a disk. An operator who has
+		// this on should be able to see that they do without reading a config.
+		slog.Warn("capture enabled; prompts and completions are written to the data directory",
+			"dir", filepath.Join(c.DataDir, "capture"),
+			"ttl_seconds", c.CaptureTTLSeconds, "limit_bytes", c.CaptureBytes)
+		go func() {
+			// A gateway that stays up for a week would otherwise hold a week of
+			// prompts under a one-day TTL, because nothing in the serving path
+			// ever reads these files and so nothing ever notices one expiring.
+			tick := time.NewTicker(time.Minute)
+			defer tick.Stop()
+			for {
+				select {
+				case <-background.Done():
+					return
+				case <-tick.C:
+					store.Sweep()
+				}
+			}
+		}()
+	}
 	s.Bedrock = bedrock
 	t.Start(background)
 	// Nothing to poll in file-only operation. Starting the poller would log a

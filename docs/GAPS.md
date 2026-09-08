@@ -337,15 +337,37 @@ Each of these is backed by a run recorded in `docs/VALIDATION.md`.
    categories are still the right four after real traffic across four providers,
    that is the piece with any claim on going upstream.
 
-6. **Anthropic prompt-cache tokens are not counted.** Responses carry
+6. **Replay is bounded in ways worth knowing before relying on it.** Every
+   event now carries `policy_version`, and the control plane keeps every signed
+   envelope, so any request's routing decision is reconstructible with
+   `controlplane/replay.py` - which policy was live, its route order, and whether
+   the provider that answered was one that policy allowed. That part has no
+   retention limit beyond telemetry's own.
+
+   Content is different. `capture_ttl_seconds` is off by default, so **nothing
+   before it was switched on can ever be replayed with its prompt**, and nothing
+   past the TTL survives. Records are local to the gateway that served the
+   request, so a fleet has no single place to look and a task that has been
+   replaced has taken its captures with it. Telemetry is delivered asynchronously
+   and dropped rather than retried forever, so a request whose event never
+   arrived is unreplayable even if its capture is on disk.
+
+   The deployment-ordering constraint is real and was observed rather than
+   theorised: the control plane's event model forbids unknown fields, so a
+   gateway sending `policy_version` to a control plane that predates it has every
+   event rejected at per-element validation and dropped. **Deploy the control
+   plane first.** `scripts/dev-up.sh` did not rebuild the control plane image at
+   all, which is how this was found.
+
+7. **Anthropic prompt-cache tokens are not counted.** Responses carry
    `cache_creation_input_tokens` and `cache_read_input_tokens`; neither is
    modelled. Both are zero today, so input accounting is currently correct, but
    enabling prompt caching would under-count input.
-7. **Reasoning models constrain `temperature`.** They reject any value other
+8. **Reasoning models constrain `temperature`.** They reject any value other
    than the default. `Chat.Temperature` is optional and was nil throughout
    testing, so this has not been hit, but a caller setting it against a
    reasoning model would get a 400. Not fixed blind.
-8. **Bedrock streaming, verified against the real service.** All four providers
+9. **Bedrock streaming, verified against the real service.** All four providers
    stream. Bedrock's AWS event-stream framing is translated into server-sent
    events at the provider boundary by `bedrockSSE`, so the generation deadline,
    finish tracking, empty-completion detection and the refusal to replay after
@@ -360,7 +382,7 @@ Each of these is backed by a run recorded in `docs/VALIDATION.md`.
    What remains unexercised on this path: tool and reasoning blocks are refused
    rather than flattened, and that refusal has only been tested with synthetic
    frames, because Nova Micro does not emit them for these prompts.
-9. **Spool file churn grows reclaimable kernel slab. Not a leak, and the earlier
+10. **Spool file churn grows reclaimable kernel slab. Not a leak, and the earlier
    claim that it was is retracted.** A 30 minute soak measured resident memory
    rising from 7.4 MiB to 26.9 MiB and this file previously called that the most
    important open item, projecting an out-of-memory kill within a day. That was
@@ -391,7 +413,7 @@ Each of these is backed by a run recorded in `docs/VALIDATION.md`.
    watches container memory, which is worth documenting for operators. Batching
    the spool into segment files rather than one file per event would remove the
    churn, and is the fix if this ever needs one.
-10. **Idempotency keys, bounded and off by default.** `Idempotency-Key` is
+11. **Idempotency keys, bounded and off by default.** `Idempotency-Key` is
     honoured when `idempotency_ttl_seconds` is set. A duplicate key returns the
     original response without calling the provider; the same key with a different
     body is refused with 422; a key whose original outcome is genuinely unknown
@@ -415,14 +437,14 @@ Each of these is backed by a run recorded in `docs/VALIDATION.md`.
     leaving the earlier "not logged or in telemetry" statement to imply more than
     it covers.
 
-11. **Security operations.** Bearer RBAC exists; SSO, MFA, human-user lifecycle,
+12. **Security operations.** Bearer RBAC exists; SSO, MFA, human-user lifecycle,
    external authorization, hardware-backed signing and automated key renewal do
    not. Row level security defends against query mistakes, not against a
    compromised shared database session.
-12. **Scale and operations.** Rate limits and circuit state are per process, not
+13. **Scale and operations.** Rate limits and circuit state are per process, not
    fleet-wide. There is no retention policy, partitioning, dashboard, SLO, audit
    export or restore drill.
-13. **A release pipeline has run three times; the current rewrite has not.**
+14. **A release pipeline has run three times; the current rewrite has not.**
     An earlier heading here said the pipeline had never run, and that was wrong
     in the direction that matters: it understated what already ships.
 
@@ -462,11 +484,11 @@ Each of these is backed by a run recorded in `docs/VALIDATION.md`.
     Engine 20.10.17. What is verified is that the workflow parses, that every
     action is pinned to a SHA confirmed to be a real commit, and that the trigger
     admits tags only.
-14. **Infrastructure assumptions.** `controlplane.yaml` requires an existing VPC,
+15. **Infrastructure assumptions.** `controlplane.yaml` requires an existing VPC,
     subnets, IAM roles, KMS keys, ECS cluster and load balancer target group.
     `quickstart.yaml` removes all of those except the certificate.
 
-15. **Onboarding, largely closed.** `docs/LOCAL.md` now documents a file-only
+16. **Onboarding, largely closed.** `docs/LOCAL.md` now documents a file-only
     path to a first real provider request that needs no Postgres, no migrations,
     no database roles, no tenant, no principals and no control plane. It was
     verified by following it from a clean directory, using nothing that is not on

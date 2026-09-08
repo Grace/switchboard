@@ -24,7 +24,7 @@ mkdir -p .dev
 if [ ! -s .dev/env ]; then
   : > .dev/env                     # placeholder so compose can parse env_file
   echo "building images"
-  $COMPOSE build devtools gateway >/dev/null
+  $COMPOSE build devtools gateway controlplane >/dev/null
   echo "generating signing key and tokens"
   $COMPOSE run --rm --no-deps -T dbinit scripts/devstack.py keys > .dev/env.tmp
   mv .dev/env.tmp .dev/env
@@ -38,7 +38,7 @@ set -a
 . ./.dev/env
 set +a
 
-$COMPOSE build devtools gateway >/dev/null
+$COMPOSE build devtools gateway controlplane >/dev/null
 echo "starting postgres"
 $COMPOSE up -d postgres
 echo "applying migrations and creating the runtime login"

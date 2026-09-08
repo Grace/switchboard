@@ -193,6 +193,18 @@ type Event struct {
 	Attempts  int    `json:"attempts"`
 	Start     int64  `json:"start_ns"`
 	End       int64  `json:"end_ns"`
+	// PolicyVersion carries a real JSON tag, unlike the two span-only fields
+	// below, because it has to reach the control plane: that is where the
+	// policies table lives, and the whole value of recording it is the join.
+	// Every signed envelope is kept by (tenant, version) forever, so this one
+	// number turns a request into a provable routing decision - which policy was
+	// live, what its route order was, and therefore why this provider answered.
+	// A policy also forbids a repeated provider, so (version, provider)
+	// determines the model too, and nothing further needs storing.
+	//
+	// Recorded before any route is chosen, so a request refused by policy has it
+	// as surely as one that reached a provider.
+	PolicyVersion int64 `json:"policy_version,omitempty"`
 	// Span-only, and json:"-" is load-bearing rather than tidiness. The control
 	// plane declares its Event model with extra="forbid", so one unrecognised
 	// key does not degrade an event, it rejects it: every event would fail
@@ -655,6 +667,12 @@ func (t *Telemetry) exportOTLP(ctx context.Context, e Event) {
 		// OpenTelemetry convention covers a router yet; an experimental namespace
 		// is what OpenTelemetry asks for while that is true.
 		map[string]any{"key": "switchboard.attempts", "value": map[string]any{"intValue": strconv.Itoa(e.Attempts)}},
+	}
+	if e.PolicyVersion > 0 {
+		// On the span as well as the event, so a trace answers "which policy sent
+		// it here" without a database round trip.
+		attrs = append(attrs, map[string]any{"key": "switchboard.policy_version",
+			"value": map[string]any{"intValue": strconv.FormatInt(e.PolicyVersion, 10)}})
 	}
 	if e.Model != "" {
 		attrs = append(attrs, map[string]any{"key": "gen_ai.request.model", "value": map[string]any{"stringValue": e.Model}})

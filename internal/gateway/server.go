@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -163,7 +164,12 @@ type Server struct {
 	budgets *budgetTable
 	// Idem is nil unless idempotency_ttl_seconds is set. Nil means the feature is
 	// off and a key is refused, which is the behaviour before it existed.
-	Idem     *idemStore
+	Idem *idemStore
+	// Capture is nil unless capture_ttl_seconds is set, and nil is the default.
+	// Nil means no prompt or completion is written anywhere, which is the
+	// behaviour before this existed and the behaviour a deployment gets unless
+	// someone asked for otherwise.
+	Capture  *captureStore
 	Draining atomic.Bool
 	// unhealthy holds providers the startup check rejected, and is cleared per
 	// provider by a real request succeeding through it. A plain latch would have
@@ -315,6 +321,12 @@ func (s *Server) chat(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("X-Request-ID", id)
 	w.Header().Set("traceparent", "00-"+trace+"-"+event.SpanID+"-01")
 	s.Metrics.Requests.Add(1)
+	// Held here rather than written at each success site so that every outcome is
+	// captured from one place: a 401, a policy refusal and a provider failure are
+	// exactly the requests someone asks about later, and three write sites on the
+	// success paths would have recorded none of them.
+	var capturedPrompt, capturedCompletion json.RawMessage
+	var capturedText string
 	defer func() {
 		event.End = time.Now().UnixNano()
 		s.Metrics.ObserveLatency(time.Since(start).Milliseconds())
@@ -323,6 +335,18 @@ func (s *Server) chat(w http.ResponseWriter, r *http.Request) {
 		}
 		if s.Telemetry != nil {
 			s.Telemetry.Emit(event)
+		}
+		if s.Capture != nil {
+			// Best effort, and deliberately after Emit. Capture is an operator
+			// convenience; telemetry and the response are the product, and a full
+			// disk must not be able to cost either of them. A refused write
+			// increments telemetry_disk_errors_total and is otherwise silent here.
+			_ = s.Capture.Write(&captureRecord{
+				RequestID: id, TraceID: trace, PolicyVersion: event.PolicyVersion,
+				Provider: event.Provider, Model: event.Model, Attempts: event.Attempts,
+				Status: event.Status, Fault: event.Fault, Stored: time.Now().Unix(),
+				Prompt: capturedPrompt, Completion: capturedCompletion, Text: capturedText,
+			})
 		}
 		slog.Info("inference", "request_id", id, "trace_id", trace, "status", event.Status, "provider", event.Provider, "attempts", event.Attempts, "duration_ms", time.Since(start).Milliseconds())
 	}()
@@ -369,6 +393,10 @@ func (s *Server) chat(w http.ResponseWriter, r *http.Request) {
 		fail(413, "request body too large or unreadable")
 		return
 	}
+	// Recorded after the size check and before parsing, so a body that fails to
+	// parse is still captured: "what did the caller actually send" is the whole
+	// question when a request is rejected as malformed.
+	capturedPrompt = json.RawMessage(b)
 	c, e := ParseChat(b)
 	if e != nil {
 		fail(400, e.Error())
@@ -407,6 +435,10 @@ func (s *Server) chat(w http.ResponseWriter, r *http.Request) {
 		fail(503, "policy expired")
 		return
 	}
+	// Before any route is chosen. A request the policy refuses is as much a
+	// routing decision as one it serves, and is the case someone is most likely
+	// to ask about afterwards.
+	event.PolicyVersion = p.Version
 	// Decided before the loop, because the answer depends on all the routes: if
 	// every eligible one would be skipped, none is. Refusing to try is worse than
 	// trying and failing over, and a gateway that returns 503 without contacting
@@ -595,6 +627,9 @@ func (s *Server) chat(w http.ResponseWriter, r *http.Request) {
 				if len(empties) > 0 {
 					s.Metrics.EmptyCompletionRecovered.Add(1)
 				}
+				// The assembled answer, not the frames. Replaying frame timing
+				// would be a different feature and a dishonest one to imply.
+				capturedText = streamed.text
 				if idemKey != "" {
 					s.Idem.finish(idemKey, &idemEntry{
 						State: idemDone, BodyHash: hashBody(b), Stored: time.Now().Unix(),
@@ -648,6 +683,7 @@ func (s *Server) chat(w http.ResponseWriter, r *http.Request) {
 		}
 		event.Status = 200
 		body := jsonBytes(completion(id, route, n, start.Unix()))
+		capturedCompletion = body
 		if idemKey != "" {
 			s.Idem.finish(idemKey, &idemEntry{
 				State: idemDone, BodyHash: hashBody(b), Stored: time.Now().Unix(),

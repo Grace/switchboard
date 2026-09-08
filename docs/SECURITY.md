@@ -25,6 +25,35 @@ sharing with untrusted containers in the task.
 It is off by default. A change to what a deployment stores should be chosen, not inherited from an
 upgrade.
 
+### Replay capture (added 2026-09-08)
+
+`capture_ttl_seconds` is a second and larger qualification of the sentence above, added
+deliberately rather than slipped in. Idempotency stores content as a side effect of answering a
+duplicate; **capture stores it as the whole purpose**. When it is on, every request writes a record
+holding the prompt as received and the completion as returned, together with the routing context
+needed to explain where it went: policy version, provider, model, attempts and fault.
+
+What does not change, and is the reason this is a qualification rather than a reversal:
+
+- **Nothing is transmitted.** Records are written to `<data_dir>/capture` and are never attached to
+  an event, never exported over OTLP, and never sent to the control plane. The statement about
+  product telemetry above remains true exactly as written.
+- **Nothing exists unless asked for.** `capture_ttl_seconds` defaults to zero, zero means the store
+  is never constructed, and a default deployment does not create the directory.
+
+What does change while it is on: prompts and completions are on that machine's disk for the TTL.
+Records are mode 0600 in a 0700 directory, bounded by `capture_bytes` in total and 8 MiB each, swept
+every minute and again at startup so a restart is also a compaction. An oversized record is refused
+rather than truncated, because a half-written prompt reads as a complete one. A full store refuses
+new writes rather than evicting old ones.
+
+The gateway logs a **warning**, not an info line, at every startup while capture is on, naming the
+directory and the TTL. An operator should be able to see that they have this on without reading a
+config file.
+
+Turning it on takes on the corresponding obligations: encrypted storage, restricted mounts, a
+retention position, and an answer for deletion requests. The TTL is a bound, not a policy.
+
 ## Runtime profiling
 
 `enable_pprof` exposes Go runtime profiles at `/debug/pprof/`. It is **off by default and

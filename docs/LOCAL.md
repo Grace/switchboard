@@ -195,6 +195,37 @@ is gitignored and must stay local. `devstack.py` prints tokens to stdout by
 design, which is exactly what a deployment must never do — this tooling is for
 local use only.
 
+## Replaying a request
+
+Every event carries the policy version that routed it, and the control plane keeps every signed
+policy envelope forever, so proving where a request went is a join across two tables in the same
+database:
+
+```sh
+DATABASE_URL=... python -m controlplane.replay \
+  --request-id <the X-Request-ID the gateway returned> --tenant dev-tenant
+```
+
+It prints the policy that was live, its route order with the answering route marked, and whether
+that provider was actually in the policy. A provider outside the route list means the policy rotated
+mid-flight or something is wrong, and the report says so rather than staying quiet.
+
+Two things to know when it finds nothing. Telemetry is delivered asynchronously and dropped rather
+than retried forever, so a very recent request may not have arrived yet. And row-level security is
+forced on `telemetry`, so the query sets `app.tenant` exactly as the control plane does; connecting
+without it returns no rows rather than an error.
+
+### Including the prompt and completion
+
+Set `CAPTURE_TTL_SECONDS` in `.dev/env` and bring the stack up again. The gateway then writes each
+request's prompt and completion to `<data_dir>/capture`, and `--capture-dir` includes them in the
+report. It is **off by default here for the same reason it is off in the product**: this is the only
+thing that writes prompts to a disk, and it should be chosen rather than inherited. The gateway logs
+a warning at every startup while it is on.
+
+Capture records never leave the machine — not to telemetry, not to the control plane — so reading
+them needs access to the gateway's data directory. See `docs/SECURITY.md`.
+
 ## Sending telemetry to Honeycomb
 
 OTLP export is off unless you turn it on. `devstack.py` reads `OTLP_URL`,

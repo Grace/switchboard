@@ -48,6 +48,17 @@ class Event(Strict):
     attempts: int = Field(ge=0, le=3)
     start_ns: int = Field(ge=1)
     end_ns: int = Field(ge=1)
+    # Optional, and that is load-bearing in both directions. This model forbids
+    # extras, so a gateway sending a field an older control plane does not know
+    # fails every event: new fields require the control plane to deploy first.
+    # Making it optional handles the other ordering, where an older gateway sends
+    # nothing, so a rollback of the gateway alone does not stop telemetry.
+    #
+    # It is the join key back to the policies table, which keeps every signed
+    # envelope by (tenant, version) forever. With it a request becomes a provable
+    # routing decision; without it the envelope is there and nothing points at
+    # which one was live.
+    policy_version: int | None = Field(default=None, ge=1)
 
 class EventBatch(Strict):
     # Bounded in the model rather than checked by hand: an unbounded array is a
