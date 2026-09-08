@@ -77,12 +77,116 @@ Forcing `MOCK_STATUS=503` makes the gateway exhaust its retry budget and return
 a visible `503 routes unavailable or retry budget exhausted`, which is the
 behavior `docs/ARCHITECTURE.md` describes.
 
-## Using real providers instead
+## Your first real provider request
 
-Point a provider at its real base URL in the generated `config.json`, supply the
-matching key, and publish a policy naming a real model. Note that
-`Config.Validate()` requires every configured provider's key environment
-variable to be non-empty even when the policy never routes to it.
+The development stack above proves the plumbing against a mock. This is the
+shortest path to a real completion from a real provider, and it needs **no
+Postgres, no migrations, no database roles, no tenant, no principals and no
+control plane**. The gateway restores a signed policy from `data_dir/policy.json`
+at startup, and its readiness consults only that local copy.
+
+The control plane is what you graduate to for rotation, multiple tenants and
+policy distribution. It is not needed to see the thing work.
+
+### 1. A signing key
+
+The policy must be signed, and the gateway pins the public half.
+
+```sh
+python -c 'import base64,os; print(base64.b64encode(os.urandom(32)).decode())' > seed.b64
+gateway -public-key < seed.b64
+```
+
+The seed is read on stdin rather than as an argument so it does not reach the
+process table or your shell history. Keep `seed.b64`; you need it in step 3 and
+for every later policy change.
+
+### 2. Configuration
+
+Copy `config.example.json`, which is a working file-only configuration, and
+change two things: put the public key from step 1 in `trusted_keys`, and set
+`tenant` to whatever you like.
+
+```jsonc
+{
+  "listen": "127.0.0.1:8080",
+  "tenant": "acme-prod",
+  "data_dir": "/data",
+  "control_url": "",                  // empty means file-only, no control plane
+  "control_token_env": "",
+  "local_token_env": "LOCAL_TOKEN",
+  "trusted_keys": { "key-2026-09": "<the public key from step 1>" },
+  "providers": {
+    "openai": { "url": "https://api.openai.com", "key_env": "OPENAI_API_KEY" }
+  }
+  // the numeric limits follow; they are all required and each names itself if wrong
+}
+```
+
+Two rules that cost people time:
+
+- **Every configured provider needs its key variable set**, even one the policy
+  never routes to. Configure only the providers you have keys for.
+- `LOCAL_TOKEN` is what your application sends to the gateway, and it must be at
+  least 32 bytes. It is not a provider key.
+
+### 3. A signed policy
+
+```sh
+SWITCHBOARD_POLICY_SEED="$(cat seed.b64)" \
+  python -m controlplane.policytool \
+    --tenant acme-prod --key-id key-2026-09 \
+    --route openai:gpt-4o-mini \
+    --out /data/policy.json
+```
+
+`--key-id` must match the key in `trusted_keys`, and `--tenant` must match
+`tenant`. Repeat `--route` for failover order, first preferred, up to four with
+no provider repeated. The tool sets `issued_at` and `expires_at` itself; a policy
+lasts seven days at most, and an expired one takes readiness to 503.
+
+Changing routes later means signing a **higher** `--version` than the one already
+stored. A lower or equal version is refused as a rollback.
+
+### 4. Run it
+
+```sh
+export OPENAI_API_KEY=sk-...
+export LOCAL_TOKEN=$(python -c 'import base64,os;print(base64.b64encode(os.urandom(32)).decode())')
+gateway -config config.json
+```
+
+Then send a request. Note `"model": "preferred"` — the gateway rejects any other
+value, because the signed policy decides which model runs, not the caller:
+
+```sh
+curl -s http://127.0.0.1:8080/v1/chat/completions \
+  -H "Authorization: Bearer $LOCAL_TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"preferred","messages":[{"role":"user","content":"Reply with the single word: ok"}],"max_tokens":512}'
+```
+
+The response carries `X-Switchboard-Provider`, naming which provider answered,
+and `X-Switchboard-Attempts`. If an earlier route failed over, that is where you
+see it.
+
+### If it does not work
+
+- **`invalid trust key`** — the value in `trusted_keys` is not the base64 public
+  key. Re-derive it with `gateway -public-key`.
+- **`no policy is present`** — file-only operation found nothing at
+  `data_dir/policy.json`. Step 3 writes it; check `--out` matches `data_dir`.
+- **`unsupported or unknown key id`** — `--key-id` and the key in `trusted_keys`
+  disagree.
+- **`503 no valid routing policy`** — usually an expired policy. Sign a new one
+  with a higher `--version`.
+- **Anything about a numeric limit** — the error names the field and its range.
+
+### Graduating to the control plane
+
+Set `control_url` and `control_token_env`, and the gateway polls for policy every
+15 seconds instead of reading the file. That is when Postgres, migrations, roles
+and principals become necessary, and `make dev-up` provisions all of it.
 
 ## Secrets
 

@@ -41,7 +41,13 @@ Keys are pinned out of band in the immutable deployment configuration. The signe
 
 ## Rotation procedure
 
-1. Generate a new signing seed using a cryptographically secure generator inside your approved secret-management workflow. Store it without printing it; export only its public key.
+1. Generate a new signing seed using a cryptographically secure generator inside your approved secret-management workflow. Store it without printing it; export only its public key, which `gateway -public-key` derives by reading the base64 seed on stdin:
+
+   ```sh
+   gateway -public-key < seed.b64
+   ```
+
+   The seed is read from stdin rather than an argument so it does not reach the process table or a shell history file. Deriving a public key is not signing: the gateway binary still cannot produce a policy it would accept.
 2. Deploy gateways with both old and new public keys under distinct key IDs. Confirm rollout and cache persistence.
 3. Update the control-plane signing seed and key ID, roll its tasks, and publish a strictly newer policy for every tenant. During mixed control-plane rollout, either trusted key may sign; tenant version locking serializes publication.
 4. Confirm every gateway has the new policy version. Retire the old public key only after old cached documents can be replaced, including disconnected tasks. Removing a key while a task has only its old cached document intentionally makes startup fail closed.

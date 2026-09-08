@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net"
 	"net/http"
 	"net/url"
@@ -103,47 +104,95 @@ func (c Config) Validate() error {
 	if e != nil || !net.ParseIP(host).IsLoopback() {
 		return errors.New("listen must be a loopback IP:port; use one sidecar per tenant")
 	}
-	if !identifier.MatchString(c.Tenant) || c.DataDir == "" || c.Concurrency < 1 || c.Concurrency > 4096 || c.Rate < 1 || c.Rate > 100000 || c.Burst < 1 || c.Burst > 100000 || c.RetryRate < 1 || c.RetryRate > 10000 || c.MaxAttempts < 1 || c.MaxAttempts > 3 || c.TimeoutSeconds < 1 || c.TimeoutSeconds > 90 || c.QueueSize < 1 || c.QueueSize > 65536 || c.SpoolBytes < 1048576 || c.SpoolBytes > 10737418240 {
-		return errors.New("invalid configuration limits")
+	if !identifier.MatchString(c.Tenant) {
+		return errors.New("tenant must be a short identifier of letters, digits, dashes or underscores")
 	}
-	if !secureURL(c.ControlURL, c.AllowLocalHTTP) || (c.OTLPURL != "" && !secureURL(c.OTLPURL, c.AllowLocalHTTP)) ||
-		(c.OTLPMetricsURL != "" && !secureURL(c.OTLPMetricsURL, c.AllowLocalHTTP)) {
-		return errors.New("invalid control/OTLP URL")
+	if c.DataDir == "" {
+		return errors.New("data_dir is required; it holds the policy cache and the telemetry spool")
 	}
-	if len(os.Getenv(c.ControlTokenEnv)) < 32 || len(os.Getenv(c.LocalTokenEnv)) < 32 {
-		return errors.New("control and local tokens must contain at least 32 bytes")
+	// Each limit reports itself. These were one error naming none of thirteen
+	// conditions, which turned a typo into an afternoon.
+	for _, l := range []struct {
+		name     string
+		v        int64
+		min, max int64
+	}{
+		{"concurrency", int64(c.Concurrency), 1, 4096},
+		{"rate", int64(c.Rate), 1, 100000},
+		{"burst", int64(c.Burst), 1, 100000},
+		{"retry_rate", int64(c.RetryRate), 1, 10000},
+		{"max_attempts", int64(c.MaxAttempts), 1, 3},
+		{"timeout_seconds", int64(c.TimeoutSeconds), 1, 90},
+		{"queue_size", int64(c.QueueSize), 1, 65536},
+		{"spool_bytes", c.SpoolBytes, 1 << 20, 10 << 30},
+	} {
+		if l.v < l.min || l.v > l.max {
+			return fmt.Errorf("%s is %d; it must be between %d and %d", l.name, l.v, l.min, l.max)
+		}
+	}
+	// An empty control_url is file-only operation: the gateway serves a policy
+	// restored from data_dir and never polls. Requiring a control plane that is
+	// never contacted put Postgres, migrations, roles, tenants and an admin
+	// principal in front of a first real request that needs none of them.
+	if c.ControlURL != "" {
+		if !secureURL(c.ControlURL, c.AllowLocalHTTP) {
+			return errors.New("control_url must be https, or http on loopback with allow_local_http")
+		}
+		if len(os.Getenv(c.ControlTokenEnv)) < 32 {
+			return fmt.Errorf("control_url is set, so %s must hold at least 32 bytes", c.ControlTokenEnv)
+		}
+	} else if c.ControlTokenEnv != "" {
+		return errors.New("control_token_env is set but control_url is empty; remove one or the other")
+	}
+	if c.OTLPURL != "" && !secureURL(c.OTLPURL, c.AllowLocalHTTP) {
+		return errors.New("otlp_url must be https, or http on loopback with allow_local_http")
+	}
+	if c.OTLPMetricsURL != "" && !secureURL(c.OTLPMetricsURL, c.AllowLocalHTTP) {
+		return errors.New("otlp_metrics_url must be https, or http on loopback with allow_local_http")
+	}
+	if len(os.Getenv(c.LocalTokenEnv)) < 32 {
+		return fmt.Errorf("%s must hold at least 32 bytes; it is the token your application presents", c.LocalTokenEnv)
 	}
 	if len(c.TrustedKeys) == 0 {
 		return errors.New("empty trust store")
 	}
 	for k, v := range c.TrustedKeys {
+		if !identifier.MatchString(k) {
+			return fmt.Errorf("trust key id %q must be letters, digits, dashes or underscores", k)
+		}
 		b, e := base64.StdEncoding.Strict().DecodeString(v)
-		if !identifier.MatchString(k) || e != nil || len(b) != ed25519.PublicKeySize {
-			return errors.New("invalid trust key")
+		if e != nil {
+			return fmt.Errorf("trust key %q is not valid base64; derive it with 'gateway -public-key'", k)
+		}
+		if len(b) != ed25519.PublicKeySize {
+			return fmt.Errorf("trust key %q decodes to %d bytes; an ed25519 public key is %d", k, len(b), ed25519.PublicKeySize)
 		}
 	}
 	for name, p := range c.Providers {
 		if name != "openai" && name != "anthropic" && name != "gemini" && name != "bedrock" {
-			return errors.New("unknown provider")
+			return fmt.Errorf("unknown provider %q; supported: openai, anthropic, gemini, bedrock", name)
 		}
 		if !secureURL(p.URL, c.AllowLocalHTTP) {
-			return errors.New("invalid provider configuration")
+			return fmt.Errorf("provider %q: url must be https, or http on loopback with allow_local_http", name)
 		}
 		if name == "bedrock" {
 			// Authenticated by the task's IAM role, so there is no key to
 			// require. A region is mandatory instead: SigV4 binds a signature
 			// to one, and guessing it produces a signature the service rejects.
 			if !identifier.MatchString(p.Region) {
-				return errors.New("bedrock requires a region")
+				return errors.New("provider \"bedrock\": region is required; SigV4 binds a signature to one")
 			}
 			continue
 		}
-		if p.KeyEnv == "" || os.Getenv(p.KeyEnv) == "" {
-			return errors.New("invalid provider configuration")
+		if p.KeyEnv == "" {
+			return fmt.Errorf("provider %q: key_env is required", name)
+		}
+		if os.Getenv(p.KeyEnv) == "" {
+			return fmt.Errorf("provider %q: %s is empty; every configured provider needs its key, even one the policy never routes to", name, p.KeyEnv)
 		}
 	}
 	if len(c.Providers) == 0 {
-		return errors.New("no providers")
+		return errors.New("no providers configured")
 	}
 	return c.Marketplace.Validate()
 }

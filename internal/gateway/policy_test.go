@@ -115,3 +115,36 @@ func TestCrossLanguageFixture(t *testing.T) {
 		t.Fatal(e)
 	}
 }
+
+// The signing tool is Python and the verifier is Go, so the canonical byte
+// encoding is a contract between two languages with nothing but this test
+// holding them together. It is checked in as a fixture rather than generated,
+// because a drift in either canonicaliser should fail here rather than be
+// silently reproduced on both sides.
+//
+// Regenerate with, using the test seed below:
+//
+//	SWITCHBOARD_POLICY_SEED=AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8= \
+//	  python -m controlplane.policytool --tenant acme-prod --key-id key-2026-09 \
+//	  --route openai:gpt-4o-mini --route anthropic:claude-haiku-4-5-20251001 \
+//	  --out testdata/policytool-envelope.json
+func TestGoVerifierAcceptsPythonSignedPolicy(t *testing.T) {
+	pub, err := base64.StdEncoding.DecodeString("A6EHv/POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg=")
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, err := os.ReadFile("../../testdata/policytool-envelope.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := &PolicyStore{Tenant: "acme-prod", Keys: map[string]ed25519.PublicKey{"key-2026-09": pub}}
+	// Pinned inside the fixture's lifetime; a wall-clock check would start
+	// failing a week after the fixture was written and say nothing useful.
+	p, err := s.Verify(raw, time.Unix(1788845812+60, 0))
+	if err != nil {
+		t.Fatalf("Go rejected a policy signed by controlplane.policytool: %v", err)
+	}
+	if len(p.Routes) != 2 || p.Routes[0].Provider != "openai" || p.Routes[1].Provider != "anthropic" {
+		t.Fatalf("routes did not survive the round trip: %+v", p.Routes)
+	}
+}

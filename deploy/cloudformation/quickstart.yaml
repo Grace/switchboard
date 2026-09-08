@@ -879,7 +879,11 @@ Outputs:
       Guessing one is what hid a name-length defect until a real deployment.
     Value: !Ref TargetGroup
   PolicySigningSeedSecretArn:
-    Description: Secret holding the signing seed. Read the public key from the control plane, never this.
+    Description: >-
+      Secret holding the signing seed. Derive the pinnable public key with
+      'gateway -public-key', which reads the base64 seed on stdin. The control
+      plane serves no endpoint for it; an earlier version of this description
+      said otherwise and could not be followed.
     Value: !Ref PolicySigningSeedSecret
   DatabaseEndpoint:
     Value: !GetAtt Database.Endpoint.Address
