@@ -66,8 +66,10 @@ Parameters:
       evaluation, the default, leaves database deletion protection off so a trial
       stack can be deleted without a manual step. production turns it on, which
       means deleting this stack fails until you clear the flag by hand. The
-      database is snapshotted on delete either way; run scripts/teardown.sh
-      afterwards to remove the retained key, secrets and log group.
+      database is snapshotted on delete either way. Deleting the stack leaves a
+      KMS key and alias, three secrets and a log group behind, all still
+      billing; the Cleanup output holds the commands to remove them, with this
+      stack's names already filled in.
 
   ControlPlaneImage:
     Type: String
@@ -294,11 +296,18 @@ Resources:
   KeyAlias:
     Type: AWS::KMS::Alias
     # Retained with the key it names. Without this the key survives the stack
-    # with no alias, and the teardown script cannot find it to offer deletion.
+    # with no alias, and nothing can find it to offer deletion.
+    #
+    # Retained means it outlives the stack, and scheduling the key's deletion
+    # does not remove it either -- it stays for the whole pending window. So
+    # deleting the alias is part of cleanup, not a consequence of it, and
+    # skipping that step makes a redeploy under the same stack name fail here
+    # after the VPC, NAT gateway and database are already built. The Cleanup
+    # output and scripts/teardown.sh both delete it explicitly.
     DeletionPolicy: Retain
     UpdateReplacePolicy: Retain
     Properties:
-      AliasName: !Sub 'alias/${AWS::StackName}-switchboard'
+      AliasName: !Sub 'alias/${AWS::StackName}-key'
       TargetKeyId: !Ref EncryptionKey
 
   LogGroup:
@@ -880,6 +889,37 @@ Resources:
       DatabaseUrlArn: !Ref DatabaseUrlSecret
 
 Outputs:
+  # Deleting this stack deliberately leaves several resources behind, so that a
+  # delete cannot destroy data by accident. The cost of that is they keep
+  # billing until someone removes them, and the person most likely to be caught
+  # by it is whoever deployed this to evaluate it.
+  #
+  # The commands are here, with this stack's real names already substituted,
+  # rather than in a script. A subscriber receives a template and images, not
+  # this repository, so an instruction to run scripts/teardown.sh was an
+  # instruction to run something they do not have.
+  #
+  # Run these only after the stack itself is gone. The alias matters more than
+  # it looks: it is retained, and scheduling the key does not remove it, so
+  # leaving it in place makes a redeploy under this stack name fail on
+  # AWS::KMS::Alias after the VPC, NAT gateway and database are already built.
+  Cleanup:
+    Description: >-
+      Commands to remove what deleting this stack leaves behind. Run them after
+      the stack is deleted. The snapshot is the only remaining copy of the
+      database, so delete it last and only if you are sure.
+    Value: !Sub |
+      aws cloudformation delete-stack --region ${AWS::Region} --stack-name ${AWS::StackName}
+      aws cloudformation wait stack-delete-complete --region ${AWS::Region} --stack-name ${AWS::StackName}
+      aws logs delete-log-group --region ${AWS::Region} --log-group-name /ecs/${AWS::StackName}/control
+      aws secretsmanager delete-secret --region ${AWS::Region} --force-delete-without-recovery --secret-id ${AWS::StackName}/policy-signing-seed
+      aws secretsmanager delete-secret --region ${AWS::Region} --force-delete-without-recovery --secret-id ${AWS::StackName}/runtime-db-password
+      aws secretsmanager delete-secret --region ${AWS::Region} --force-delete-without-recovery --secret-id ${AWS::StackName}/database-url
+      aws kms schedule-key-deletion --region ${AWS::Region} --key-id alias/${AWS::StackName}-key --pending-window-in-days 7
+      aws kms delete-alias --region ${AWS::Region} --alias-name alias/${AWS::StackName}-key
+      # Last, and irreversible. Lists the snapshots this stack left, then deletes one.
+      aws rds describe-db-snapshots --region ${AWS::Region} --snapshot-type manual --query "DBSnapshots[?starts_with(DBSnapshotIdentifier,'${AWS::StackName}')].DBSnapshotIdentifier" --output text
+      # aws rds delete-db-snapshot --region ${AWS::Region} --db-snapshot-identifier <one of the above>
   ControlPlaneURL:
     Description: >-
       Set the sidecar's control_url to this. It resolves inside the VPC only.

@@ -102,8 +102,29 @@ LOGS=$(aws logs describe-log-groups --log-group-name-prefix "/ecs/${STACK}/" \
 # --- KMS key ----------------------------------------------------------------
 # By alias first. Older stacks deleted the alias while retaining the key, so
 # fall back to the stack tag, which survives either way.
-KEY=$(aws kms describe-key --key-id "alias/${STACK}-switchboard" \
+# Two names, because the alias was renamed. Stacks built before that carry
+# alias/<stack>-switchboard, which read as alias/switchboard-switchboard for a
+# stack named switchboard. Checking only the current name would walk past the
+# alias on every stack deployed before the rename and leave behind the one
+# resource that blocks redeploying the same stack name -- which is the failure
+# this deletion exists to prevent.
+ALIAS=""
+for candidate in "alias/${STACK}-key" "alias/${STACK}-switchboard"; do
+  if aws kms list-aliases --query "Aliases[?AliasName=='${candidate}'].AliasName" \
+      --output text 2>/dev/null | grep -q .; then
+    ALIAS="$candidate"
+    break
+  fi
+done
+# Fall back to the current name for the key lookup below, so a stack whose alias
+# was already deleted still resolves its key by the tag scan that follows.
+KEY=$(aws kms describe-key --key-id "${ALIAS:-alias/${STACK}-key}" \
   --query 'KeyMetadata.KeyId' --output text 2>/dev/null || true)
+# Whether an alias exists at all is a separate question from whether the key
+# does: the template retains the alias, and scheduling a key deletion leaves it
+# in place for the whole pending window, so a redeploy of the same stack name
+# inside that window hits an alias that is already taken.
+ALIAS_EXISTS="$ALIAS"
 if [ -z "${KEY:-}" ] || [ "$KEY" = "None" ]; then
   for k in $(aws kms list-keys --query 'Keys[].KeyId' --output text 2>/dev/null); do
     state=$(aws kms describe-key --key-id "$k" \
@@ -137,6 +158,14 @@ fi
 if [ -n "${KEY:-}" ] && [ "$KEY" != "None" ]; then
   echo "KMS key (about \$1 per month):"
   printf '    %s\n' "$KEY"
+  found=1
+fi
+# Listed separately from the key because it can outlive one: scheduling a key
+# deletion leaves its alias in place for the whole pending window, and the alias
+# is what a redeploy of the same stack name collides with.
+if [ -n "${ALIAS_EXISTS:-}" ] && [ "$ALIAS_EXISTS" != "None" ]; then
+  echo "KMS alias (free, but blocks redeploying this stack name):"
+  printf '    %s\n' "$ALIAS"
   found=1
 fi
 
@@ -197,6 +226,18 @@ if [ -n "${KEY:-}" ] && [ "$KEY" != "None" ]; then
   aws kms schedule-key-deletion --key-id "$KEY" --pending-window-in-days 7 \
     --query 'DeletionDate' --output text \
     && echo "scheduled KMS key $KEY for deletion in 7 days"
+fi
+
+# The alias, which scheduling the key does not remove. It is retained by the
+# template and outlives the stack, so leaving it here means a redeploy under the
+# same stack name fails on AWS::KMS::Alias -- after the VPC, NAT gateway and
+# database have already been built, which is an expensive way to find out.
+#
+# Deleted after the key is scheduled rather than before, so that a failure to
+# schedule leaves the alias in place and the key still discoverable by it.
+if [ -n "${ALIAS_EXISTS:-}" ] && [ "$ALIAS_EXISTS" != "None" ]; then
+  aws kms delete-alias --alias-name "$ALIAS" \
+    && echo "deleted KMS alias $ALIAS"
 fi
 
 echo
