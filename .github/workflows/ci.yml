@@ -10,15 +10,27 @@ jobs:
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
         with:
           go-version: '1.27.x'
+      # Every step below carries `if: !cancelled()` so that one failure reports
+      # the others rather than hiding them. gofmt is first and fails the job
+      # instantly, and for eight commits that meant vet, the tests, both builds
+      # and govulncheck never ran on main at all: a whitespace nit bought total
+      # blindness to every check that could have found something real. Not
+      # `always()`, which would keep going after a cancellation too.
       - run: test -z "$(gofmt -l cmd internal)"
       - run: go vet ./...
+        if: ${{ !cancelled() }}
       - run: go test -race -coverprofile=coverage.out ./...
+        if: ${{ !cancelled() }}
       - run: CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath ./cmd/gateway
+        if: ${{ !cancelled() }}
       - run: CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -trimpath ./cmd/gateway
+        if: ${{ !cancelled() }}
       # Scans the module graph against the Go vulnerability database. Marketplace
       # requires sellers to keep software free of known vulnerabilities.
       - run: go install golang.org/x/vuln/cmd/govulncheck@latest
+        if: ${{ !cancelled() }}
       - run: govulncheck ./...
+        if: ${{ !cancelled() }}
   control:
     runs-on: ubuntu-latest
     services:
@@ -61,7 +73,9 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4
-      - run: terraform -chdir=deploy/terraform fmt -recursive
+      # -check, because plain `terraform fmt` rewrites the runner's checkout and
+      # exits 0 whatever it finds. Without it this step could never fail.
+      - run: terraform -chdir=deploy/terraform fmt -check -recursive
       - run: terraform -chdir=deploy/terraform init -backend=false
       - run: terraform -chdir=deploy/terraform validate
       - run: terraform -chdir=deploy/terraform/controlplane init -backend=false

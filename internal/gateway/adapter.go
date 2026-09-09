@@ -232,8 +232,8 @@ type wire struct {
 		// cached prompt, not with a deployment.
 		CacheCreation int `json:"cache_creation_input_tokens"`
 		CacheRead     int `json:"cache_read_input_tokens"`
-		Prompt     int `json:"prompt_tokens"`
-		Completion int `json:"completion_tokens"`
+		Prompt        int `json:"prompt_tokens"`
+		Completion    int `json:"completion_tokens"`
 		// Reasoning models bill hidden reasoning inside completion_tokens and
 		// break it out here. Without it there is no way to tell a short answer
 		// from a budget entirely consumed before any answer was written.

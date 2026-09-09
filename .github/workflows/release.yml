@@ -11,7 +11,37 @@ permissions:
   contents: read
 
 jobs:
+  # v0.4.0 was tagged and published from a tree whose `verify` run was failing.
+  # verify does run on tags, but workflows cannot depend on one another, so
+  # nothing stopped the images being built and pushed anyway. These are the same
+  # checks as ci.yml's `go` job, duplicated deliberately: moving publish into
+  # ci.yml would put a job holding id-token: write into a workflow that runs on
+  # every branch push, and this file's header promises the opposite. A repeated
+  # job is the cheaper thing to give up.
+  #
+  # Two honest limits. This gates on the Go checks only, not controlplane's
+  # pytest suite, which needs a Postgres service. And it re-runs work verify is
+  # doing concurrently on the same tag. It is a gate on the artifact, not a
+  # replacement for verify.
+  gate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
+        with:
+          go-version: '1.27.x'
+      - run: test -z "$(gofmt -l cmd internal)"
+      - run: go vet ./...
+        if: ${{ !cancelled() }}
+      - run: go test -race ./...
+        if: ${{ !cancelled() }}
+      - run: CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath ./cmd/gateway
+        if: ${{ !cancelled() }}
+      - run: CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -trimpath ./cmd/gateway
+        if: ${{ !cancelled() }}
+
   publish:
+    needs: gate
     runs-on: ubuntu-latest
     permissions:
       contents: read
