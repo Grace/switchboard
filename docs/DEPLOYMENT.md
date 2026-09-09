@@ -318,11 +318,20 @@ its scope. A clean scan is a much smaller attack surface, not a guarantee.
 |---|---|---|
 | `quickstart.yaml` | `CertificateArn`, `ControlPlaneHostname`, `ControlPlaneImage` | `CAPABILITY_IAM` |
 | `controlplane.yaml` | 14, all pre-existing infrastructure | `CAPABILITY_IAM` |
+| `github-oidc.yaml` | `OidcProviderArn` | **`CAPABILITY_NAMED_IAM`** |
 
-Both templates create IAM resources, so a deploying buyer must acknowledge
-`CAPABILITY_IAM`. `controlplane.yaml` creates only the sidecar metering policy;
-`quickstart.yaml` additionally creates the execution and task roles. Every
-quickstart parameter except the certificate, hostname and image has a default.
+All three create IAM resources, so a deploying buyer must acknowledge
+`CAPABILITY_IAM` — except `github-oidc.yaml`, which needs `CAPABILITY_NAMED_IAM`
+because it sets `RoleName` explicitly. A custom name is what escalates the
+requirement: CloudFormation makes you acknowledge it because a named IAM
+resource can collide with another stack's and cannot be replaced without
+disruption. The other two let CloudFormation generate names, which is why
+`CAPABILITY_IAM` is enough for them.
+
+`controlplane.yaml` creates only the sidecar metering policy; `quickstart.yaml`
+additionally creates the execution and task roles; `github-oidc.yaml` creates
+only the role GitHub Actions assumes to publish images. Every quickstart
+parameter except the certificate, hostname and image has a default.
 
 The certificate cannot be created by either template: the sidecar refuses plain
 HTTP to anything but loopback and trusts only the system roots, so reaching the
