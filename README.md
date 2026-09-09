@@ -61,17 +61,11 @@ Directories: `cmd/gateway`, `internal/gateway`, `controlplane`, `deploy`, `scrip
 
 ## License
 
-Source available under the [Elastic License 2.0](LICENSE). Not an OSI-approved
-open source license, and the project should not be described as open source.
+Open source under the [Apache License 2.0](LICENSE).
 
-You may read, audit, modify, self-host and run Switchboard in production,
-including commercially. You may not offer it to third parties as a hosted or
-managed service, and you may not circumvent or remove the licensing
-functionality — in this codebase, the AWS Marketplace entitlement check in
-`internal/gateway/marketplace.go`.
-
-The auditability argument is unaffected: every line is readable, and the
-dependency graph is 4 direct and 12 indirect modules, all AWS-published.
+The auditability argument rests on the same ground it always did: every line is
+readable, and the dependency graph is 4 direct and 12 indirect modules, all
+AWS-published.
 
 Contributions are not currently accepted. When that changes,
 [CONTRIBUTING.md](CONTRIBUTING.md) sets the terms: sign-off under the

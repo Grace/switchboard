@@ -20,13 +20,15 @@ CI rejects any commit in a pull request without the trailer.
 Signing off certifies the [Developer Certificate of Origin 1.1](DCO), reproduced
 verbatim in this repository.
 
-**One wording note, because it would otherwise be confusing.** The DCO says
-"the open source license indicated in the file." Switchboard is licensed under
-the [Elastic License 2.0](LICENSE), which is source available and **not** an
-OSI-approved open source license. For this project, signing off certifies the
-same four things — (a) through (d) — with respect to the Elastic License 2.0.
-Source-available projects use the DCO routinely; the text is left unmodified
-because an edited DCO is worth less than the recognised one.
+The DCO refers to "the open source license indicated in the file," which for
+Switchboard is the [Apache License 2.0](LICENSE). The text is reproduced
+unmodified: an edited DCO is worth less than the recognised one, and there is
+nothing here to reconcile.
+
+That was not always true. Between 2026-09-07 and 2026-09-09 the project was
+under the Elastic License 2.0, which is source available rather than
+OSI-approved, and this section explained the mismatch. Recorded because a
+contributor reading old commits will find sign-offs made under those terms.
 
 ## Grant
 
@@ -40,8 +42,9 @@ part, **under any license terms and as part of any product**.
 
 That last clause is doing real work and is stated plainly rather than buried:
 
-- Switchboard Sidecar is source available under ELv2 today. This grant permits
-  relicensing it later, including under different terms.
+- Switchboard Sidecar is Apache 2.0 today. This grant permits relicensing it
+  later, including under different terms — it has already carried the project
+  through MIT, the Elastic License 2.0 and back to Apache.
 - **Switchboard Recordkeeper is proprietary and closed.** Your contribution may
   be used there, in a product whose source is not published.
 
@@ -69,5 +72,5 @@ position and no argument will be made against it.
 ## Not legal advice
 
 This document was drafted without a lawyer. Before the first external
-contribution is accepted, it — and the ELv2 relicense it sits on top of —
+contribution is accepted, it — and the Apache 2.0 relicense it sits on top of —
 should be reviewed by one.
