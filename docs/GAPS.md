@@ -795,6 +795,28 @@ Each of these is backed by a run recorded in `docs/VALIDATION.md`.
     highlight.io as `License-1` instead of an `Apache-2.0` badge. The ELv2 text
     is recoverable at `git show f3d7236:LICENSE`.
 
+22. **The relicense commit credits the DCO with something the DCO does not do.**
+    `3b3fc4b` says "The DCO's inbound grant is what made this clean, as it did
+    the previous one." The DCO has no inbound grant. It is a certification:
+    clauses (a) to (d) attest that the contributor wrote the work and had the
+    right to submit it under *the open source license*, and nothing in it
+    licenses anything to anyone.
+
+    What supplies the inbound license is Apache 2.0 section 5. What permits
+    relicensing a contribution under different or proprietary terms -- the thing
+    a future `enterprise/` carve-out and Switchboard Recordkeeper actually depend
+    on -- is the separate **Grant** section of `CONTRIBUTING.md`, which is
+    sublicensable and transferable and says so plainly. That architecture is
+    correct; only the commit message's account of it is not.
+
+    What in fact made both relicenses clean is simpler: contributions are not
+    accepted, so one person holds the entire copyright. The DCO and the Grant
+    matter from the first external contribution onward, not before it.
+
+    Recorded rather than corrected, because the commit is already on three
+    remotes and rewriting published history to fix a sentence is a worse trade
+    than a note. `CONTRIBUTING.md` itself is accurate and needs no change.
+
 ## Blocked externally
 
 These need an action from the owner or from AWS. **They are not implementation

@@ -82,12 +82,15 @@ jobs:
       - run: terraform -chdir=deploy/terraform/controlplane validate
       - run: terraform -chdir=deploy/terraform/postgres init -backend=false
       - run: terraform -chdir=deploy/terraform/postgres validate
-  # Every commit in a pull request must carry a Signed-off-by trailer certifying
-  # the DCO. Hand-rolled rather than a marketplace action: it is a dozen lines,
-  # and a repository whose argument is a minimal trusted dependency graph should
-  # not pull a third party into CI to read a git trailer.
+  # Every commit must carry a Signed-off-by trailer certifying the DCO.
+  # Hand-rolled rather than a marketplace action: it is a dozen lines, and a
+  # repository whose argument is a minimal trusted dependency graph should not
+  # pull a third party into CI to read a git trailer.
+  #
+  # This ran only on pull requests, and CONTRIBUTING.md states the rule for every
+  # commit. Since this project is pushed directly to main, the rule had never
+  # once been checked -- and, when looked at, had never once been met either.
   dco:
-    if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -95,15 +98,27 @@ jobs:
           fetch-depth: 0
       - name: Check sign-off
         env:
-          BASE: ${{ github.event.pull_request.base.sha }}
-          HEAD: ${{ github.event.pull_request.head.sha }}
+          # A push reports the range it advanced; a pull request reports its own
+          # base and head. Both are ranges, so the walk below is the same.
+          BASE: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}
+          HEAD: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
         run: |
           set -euo pipefail
+          # A new branch, a tag, or the first push to a repository reports an
+          # all-zero base that names no commit, so there is no range to walk.
+          # Check the tip alone rather than failing on a git error, which would
+          # read as a sign-off problem when it is not one.
+          if git cat-file -e "$BASE^{commit}" 2>/dev/null; then
+            range=$(git rev-list --no-merges "$BASE".."$HEAD")
+          else
+            echo "::notice::no usable base for this event; checking the tip commit only"
+            range=$(git rev-list --no-merges -1 "$HEAD")
+          fi
           missing=0
           # --no-merges: a merge commit carries no sign-off trailer and cannot be
           # given one without rewriting the merge, so flagging it would produce a
           # failure with no remedy the printed advice can fix.
-          for sha in $(git rev-list --no-merges "$BASE".."$HEAD"); do
+          for sha in $range; do
             if ! git log -1 --format=%B "$sha" | git interpret-trailers --parse | grep -qi '^Signed-off-by:'; then
               echo "::error::missing Signed-off-by: $sha $(git log -1 --format=%s "$sha")"
               missing=1
