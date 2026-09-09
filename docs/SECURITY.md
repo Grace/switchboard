@@ -121,16 +121,13 @@ Never reuse a policy version with changed content. To roll configuration back, p
 
 ## Secrets handling
 
-For agent/operator commands, use `asm-exec` with dynamic references. For example:
+Secret values are never assembled by hand. **ECS uses its native `secrets` injection at task startup: specify secret ARNs, never values.** The execution role retrieves them; the gateway task role needs no Secrets Manager access at all. Restrict execution-role resources and KMS decrypt permissions, and note that rotated injected credentials require replacement tasks. `deploy/cloudformation/quickstart.yaml` is the worked example.
 
-```sh
-DATABASE_URL='{{resolve:secretsmanager:switchboard/control:SecretString:database_url}}' \
-POLICY_SIGNING_SEED='{{resolve:secretsmanager:switchboard/control:SecretString:signing_seed}}' \
-POLICY_KEY_ID=key-2026-09 \
-asm-exec -- python -m uvicorn controlplane.app:app --host 127.0.0.1 --port 8000 --no-access-log
-```
+Off ECS, inject the same variables from whatever secret store you run, by whatever means keeps the value out of the command line, the process table and shell history. `.env.example` names every variable and where each one comes from; its values are deliberately empty.
 
-Do not run commands that print resolved environment variables or secret-bearing connection strings. `asm-exec` is an external AWS skill/runtime tool, not vendored here. ECS uses its native `secrets` injection at task startup: specify secret ARNs, never values. The ECS execution role retrieves them; the gateway task role does not need Secrets Manager access. Restrict execution-role resources and KMS decrypt permissions. Rotated injected credentials require replacement tasks.
+Do not run commands that print resolved environment variables or secret-bearing connection strings, and do not build a DSN by string-substituting a password in a shell — `scripts/devstack.py` composes it in Python from a separately injected `PGPASSWORD` precisely so that no password becomes part of a URL anywhere a shell or an audit log can see it.
+
+This section previously gave a worked example using `asm-exec`, an agent-side wrapper that resolves `{{resolve:secretsmanager:...}}` references. It is not vendored here, is not on any reader's `PATH`, and resolves through a local daemon and an authenticated endpoint that a deployment does not have — so the instruction could not be followed. Nothing replaces it, because every value it was meant to resolve is already injected natively by the mechanisms above.
 
 Keep migration credentials separate from runtime database credentials. Supply the RDS CA certificate and use `sslmode=verify-full` and `sslrootcert` for remote Postgres connections. Do not use the RDS master login as the application login.
 

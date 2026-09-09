@@ -54,8 +54,12 @@ position and no argument will be made against it.
 ## Practical rules
 
 - **No real credentials, private signing keys, or Terraform state** ever enter
-  this repository. The `.env.example` holds runtime references only, and the
-  fixture public key in `testdata` is test-only.
+  this repository. The `.env.example` names variables and their sources with
+  every value empty, and the fixture public key in `testdata` is test-only.
+- **Your own secret tooling is not a product dependency.** A wrapper that keeps
+  values out of your shell or your agent's context is yours; naming it in
+  `docs/` tells a reader to run something they do not have. `asm-exec` reached
+  `DEPLOYMENT.md` and `SECURITY.md` that way and had to be removed.
 - `go test -race ./...` must pass. Postgres tests need a disposable dedicated
   cluster and `TEST_DATABASE_URL`; they create schema and roles.
 - CI runs `govulncheck` and `pip-audit`, and pins every GitHub Action by full

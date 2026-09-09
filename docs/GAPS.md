@@ -672,10 +672,20 @@ Each of these is backed by a run recorded in `docs/VALIDATION.md`.
     thirteen.
 
     Still open, recorded so it is not rediscovered: four correlated secrets
-    related only by `.dev/env`; the 15 second policy poll that makes a first
-    control-plane attempt look like a hang; and `asm-exec`, referenced by
-    `.env.example` and `docs/DEPLOYMENT.md`, which is not in this repository and
-    is nowhere explained.
+    related only by `.dev/env`.
+
+    Two items that were listed here are since resolved. The 15 second policy
+    poll was never the reason a first control-plane attempt looked like a hang —
+    `Sync` calls `syncOnce` before waiting on the ticker, so the first poll is
+    immediate; the reason was that `syncOnce` discarded eight distinct errors in
+    silence, which item 20 covers. And `asm-exec` is gone from the product
+    surface: it was an agent-side wrapper for resolving
+    `{{resolve:secretsmanager:...}}` references, not a tool any reader has, and
+    it had leaked into the customer runbook where `docs/DEPLOYMENT.md` steps 2
+    and 4 told a subscriber to run a command that could not exist on their
+    machine. Nothing replaces it — every value it was meant to resolve already
+    arrives by ECS `secrets:` injection, or is composed in Python by
+    `_migration_dsn()` so no shell interpolates a password into a URL.
 
     Not a defect and deliberately unchanged: `adapter.go` rejects any model but
     `preferred`, so the first thing an OpenAI SDK user types fails. That is the

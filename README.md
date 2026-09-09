@@ -81,7 +81,7 @@ The Postgres tests need a **disposable dedicated cluster** and `TEST_DATABASE_UR
 
 ## Deploy
 
-Follow [deployment](docs/DEPLOYMENT.md), then [security and rotation](docs/SECURITY.md). No real credentials, private signing keys or Terraform state belong in this repository. The `.env.example` contains runtime references only.
+Follow [deployment](docs/DEPLOYMENT.md), then [security and rotation](docs/SECURITY.md). No real credentials, private signing keys or Terraform state belong in this repository. The `.env.example` names the variables and where each value comes from; every value in it is empty.
 
 Directories: `cmd/gateway`, `internal/gateway`, `controlplane`, `deploy`, `scripts`, `testdata`, and `docs`. The fixture public key in `testdata` is intentionally test-only and is not a deployment trust key.
 
