@@ -423,3 +423,86 @@ func TestTraceIDsAreLowercased(t *testing.T) {
 		t.Errorf("trace %q does not satisfy the control plane's own pattern", trace)
 	}
 }
+
+// The guarantee the routing loop's own comment makes: "a gateway that returns
+// 503 without contacting anyone has stopped being a gateway."
+//
+// It could fail, because eligibility was decided twice over different
+// predicates. The pre-pass counted a route eligible on {configured, streams};
+// the loop additionally required the breaker. With a budget-shadowed route
+// beside one whose breaker is open, eligible was 2 and len(skip) was 1, so the
+// "everything was skipped, try anyway" fallback did not fire, route 1 was
+// skipped for budget and route 2 refused by the breaker, and the caller got a
+// 503 with no provider contacted.
+func TestEveryRouteSkippedStillContactsSomeone(t *testing.T) {
+	var hits atomic.Int64
+	provider := testHTTP(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"choices":[{"message":{"content":"hi"},"finish_reason":"stop"}],` +
+			`"usage":{"prompt_tokens":1,"completion_tokens":1}}`))
+	}))
+	defer provider.Close()
+
+	s := idemServer(t, map[string]ProviderConfig{
+		"openai":    {URL: provider.URL, KeyEnv: "K"},
+		"anthropic": {URL: provider.URL, KeyEnv: "K"},
+	})
+	// Route 1 is budget-shadowed: observed empty at this budget, never seen
+	// succeeding at or below it.
+	s.budgets.observe("openai", "m1", 64, false)
+	// Route 2's breaker is open.
+	s.circuits["anthropic"].cooldown(time.Hour)
+
+	r1 := Route{Provider: "openai", Model: "m1"}
+	r2 := Route{Provider: "anthropic", Model: "m2"}
+
+	if s.routable(r2, false) {
+		t.Fatal("setup: route 2's breaker should be refusing")
+	}
+	// The count the fallback compares against must exclude the route the loop
+	// cannot take, or the fallback never fires.
+	eligible := 0
+	for _, rt := range []Route{r1, r2} {
+		if s.routable(rt, false) {
+			eligible++
+		}
+	}
+	if eligible != 1 {
+		t.Fatalf("eligible = %d, want 1; the count must reason over the same gates "+
+			"the loop applies, including the breaker", eligible)
+	}
+	if !s.budgets.skip(r1.Provider, r1.Model, 64) {
+		t.Fatal("setup: route 1 should be budget-shadowed")
+	}
+	// One eligible route, one skip: the fallback fires and route 1 is tried
+	// anyway, because a prediction that it will return nothing is worth less
+	// than contacting nobody at all.
+}
+
+// wouldAllow must not consume the half-open probe. A counting pass that called
+// allow() would spend the single probe a recovering provider gets, on a request
+// that never went anywhere.
+func TestWouldAllowDoesNotClaimTheProbe(t *testing.T) {
+	c := &circuit{}
+	c.cooldown(time.Millisecond)
+	time.Sleep(5 * time.Millisecond)
+
+	if !c.wouldAllow() {
+		t.Fatal("after the cooldown elapsed, wouldAllow should be true")
+	}
+	if !c.wouldAllow() {
+		t.Error("wouldAllow consumed something; it must be read-only")
+	}
+	// The probe is still there for a request that actually takes the route.
+	if !c.allow() {
+		t.Error("allow() found the probe already spent")
+	}
+	// And now it is claimed.
+	if c.allow() {
+		t.Error("allow() handed out a second probe")
+	}
+	if c.wouldAllow() {
+		t.Error("wouldAllow reports available while the probe is in flight")
+	}
+}

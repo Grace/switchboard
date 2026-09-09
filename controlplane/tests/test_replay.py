@@ -118,3 +118,51 @@ def test_an_undecodable_envelope_makes_no_claim_about_routes():
     assert "could not" in out
     assert "WARNING" not in out
     assert "consistent" not in out
+
+
+def test_the_endpoint_and_the_cli_read_the_same_reconstruction():
+    """The property that makes one implementation worth having.
+
+    The endpoint used to re-derive the consistency verdict, the model inference
+    and the undecodable-envelope case, with a test suite each and nothing
+    comparing them. Both now call reconstruct(), so a disagreement is a
+    compile-time impossibility rather than something a reviewer has to notice.
+    """
+    from controlplane import app as cp_app
+    from controlplane.replay import reconstruct
+
+    assert cp_app.reconstruct is reconstruct
+
+
+def test_reconstruct_is_what_report_renders():
+    """report() formats the reconstruction rather than recomputing it, so the
+    prose and the JSON cannot drift apart."""
+    from controlplane.replay import reconstruct
+
+    ev = event(provider="anthropic")
+    pol = policy([{"provider": "openai", "model": "gpt-5-nano"},
+                  {"provider": "anthropic", "model": "claude-haiku-4-5-20251001"}])
+    d = reconstruct(ev, pol)
+    assert d["consistent"] is True
+    assert d["model"] == "claude-haiku-4-5-20251001"
+    assert [r["provider"] for r in d["routes"]] == ["openai", "anthropic"]
+
+    text = report(ev, pol)
+    assert d["model"] in text
+    assert "consistent" in text
+
+
+def test_reconstruct_makes_no_claim_on_an_undecodable_envelope():
+    from controlplane.replay import reconstruct
+
+    d = reconstruct(event(), {"version": 3, "created_at": WHEN, "envelope": {"payload": "!!"}})
+    assert d["consistent"] is None
+    assert d["routes"] == []
+    assert "could not be decoded" in d["policy_error"]
+
+
+def test_reconstruct_handles_a_request_that_reached_no_provider():
+    from controlplane.replay import reconstruct
+
+    d = reconstruct(event(provider=None, status=401, attempts=0), None)
+    assert d["provider"] is None and d["consistent"] is None

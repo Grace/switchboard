@@ -20,7 +20,7 @@ from psycopg.conninfo import conninfo_to_dict
 from psycopg.types.json import Jsonb
 from psycopg_pool import ConnectionPool
 from controlplane.policy import sign, validate_policy, ID
-from controlplane.replay import routes_of
+from controlplane.replay import reconstruct
 
 log = logging.getLogger("switchboard")
 log.setLevel(logging.INFO)
@@ -277,29 +277,12 @@ def create_app(pool=None, seed=None, key_id=None):
                 "SELECT version,envelope,created_at FROM policies WHERE tenant_id=%s AND version=%s",
                 (p["tenant_id"], version),
             ).fetchone()
-
-        served = (row["event"] or {}).get("provider")
-        routes = routes_of(policy["envelope"]) if policy else []
-        out = {
-            "request_id": request_id,
-            "received_at": row["received_at"],
-            "status": (row["event"] or {}).get("status"),
-            "attempts": (row["event"] or {}).get("attempts"),
-            "provider": served,
-            "policy_version": version,
-            "routes": routes,
-            "consistent": None,
-        }
-        if policy and not routes:
-            # An envelope that cannot be decoded must not be reported as a
-            # policy with no routes: that would make every request look
-            # inconsistent with its own policy.
-            out["policy_error"] = "envelope payload could not be decoded"
-        elif routes and served:
-            out["consistent"] = served in {r.get("provider") for r in routes}
-            if out["consistent"]:
-                out["model"] = next(r.get("model") for r in routes if r.get("provider") == served)
-        return out
+        # One implementation, shared with the CLI. The endpoint previously
+        # re-derived the consistency verdict, the model inference and the
+        # undecodable-envelope case, with a separate test suite and nothing
+        # comparing the two -- so they could have disagreed about what happened
+        # to a request and no test would have caught it.
+        return reconstruct(row, policy)
 
     @app.get("/v1/audit")
     def audit_list(s=Depends(session, scope="function")):

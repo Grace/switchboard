@@ -63,6 +63,25 @@ func (c *circuit) allow() bool {
 	c.probe = true
 	return true
 }
+
+// wouldAllow is allow() without the claim. allow() sets probe as a side effect,
+// which is correct when a route is being taken and wrong when a route is merely
+// being counted -- a counting pass that called allow() would consume the
+// half-open probe for a request that never went anywhere.
+//
+// It exists because eligibility used to be decided by two passes over different
+// predicates. The pre-pass counted a route eligible on {configured, streams};
+// the loop additionally required the breaker to allow it. So with a
+// budget-shadowed route beside one whose breaker is open, eligible was 2 and
+// len(skip) was 1, the "everything was skipped, try anyway" fallback did not
+// fire, and the request 503'd having contacted nobody -- the exact outcome the
+// comment below says must never happen.
+func (c *circuit) wouldAllow() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.until.IsZero() || (!time.Now().Before(c.until) && !c.probe)
+}
+
 func (c *circuit) result(failed bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -325,6 +344,24 @@ func traceIDs(h string) (string, string) {
 	}
 	return randomID(16), ""
 }
+
+// routable reports whether this route could be attempted right now, applying
+// every gate that does not depend on how far the loop has already got. One
+// predicate, so the pre-pass that decides "was everything skipped" and the loop
+// that does the skipping cannot disagree about what counts.
+//
+// Deliberately excludes the attempt budget, which is a property of the loop's
+// progress rather than of the route.
+func (s *Server) routable(route Route, stream bool) bool {
+	if _, ok := s.C.Providers[route.Provider]; !ok {
+		return false
+	}
+	if stream && !streams(route.Provider) {
+		return false
+	}
+	return s.circuits[route.Provider].wouldAllow()
+}
+
 func (s *Server) chat(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
 	id := randomID(16)
@@ -457,13 +494,15 @@ func (s *Server) chat(w http.ResponseWriter, r *http.Request) {
 	// anyone has stopped being a gateway. A policy whose routes are all reasoning
 	// models is exactly the case this exists for, and exactly the case that would
 	// otherwise be refused outright.
+	//
+	// The count has to reason over the same gates the loop applies, or the
+	// fallback compares against the wrong denominator and declines to fire. The
+	// breaker is read without claiming the half-open probe, since nothing is
+	// being attempted yet.
 	skip := map[int]bool{}
 	eligible := 0
 	for i, route := range p.Routes {
-		if _, ok := s.C.Providers[route.Provider]; !ok {
-			continue
-		}
-		if c.Stream && !streams(route.Provider) {
+		if !s.routable(route, c.Stream) {
 			continue
 		}
 		eligible++

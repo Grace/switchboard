@@ -96,7 +96,54 @@ def routes_of(envelope) -> list[dict]:
     return policy_document(envelope).get("routes", [])
 
 
+def reconstruct(ev, pol) -> dict:
+    """The routing decision, as data, from an event row and a policy row.
+
+    One implementation, because there are two callers: this module's CLI and the
+    control plane's GET /v1/replay/{id}. They were briefly separate -- the
+    endpoint re-derived the consistency verdict, the model inference and the
+    undecodable-envelope case -- with a test suite each and nothing comparing
+    them, so the two could have disagreed about what happened to a request and
+    no test would have noticed.
+    """
+    e = ev["event"] or {}
+    served = e.get("provider")
+    out = {
+        "request_id": e.get("request_id"),
+        "received_at": ev["received_at"],
+        "status": e.get("status"),
+        "attempts": e.get("attempts"),
+        "provider": served,
+        "policy_version": e.get("policy_version"),
+        "trace_id": e.get("trace_id"),
+        "routes": [],
+        "consistent": None,
+        "model": None,
+        "policy_error": None,
+    }
+    if pol is None:
+        return out
+
+    out["policy_version_signed_at"] = pol["created_at"]
+    routes = routes_of(pol["envelope"])
+    out["routes"] = routes
+    if not routes:
+        # An envelope that cannot be decoded must not be reported as a policy
+        # with no routes: that would make every request look inconsistent with
+        # its own policy, which is a confident falsehood rather than a gap.
+        out["policy_error"] = "envelope payload could not be decoded"
+        return out
+    if served:
+        out["consistent"] = served in {r.get("provider") for r in routes}
+        if out["consistent"]:
+            # A policy forbids a repeated provider, so the provider determines
+            # the model and nothing had to store it.
+            out["model"] = next(r.get("model") for r in routes if r.get("provider") == served)
+    return out
+
+
 def report(ev, pol, capture=None) -> str:
+    d = reconstruct(ev, pol)
     e = ev["event"]
     out = [
         f"request        {e.get('request_id')}",
@@ -117,7 +164,7 @@ def report(ev, pol, capture=None) -> str:
             "               policy_version being recorded."
         )
     else:
-        routes = routes_of(pol["envelope"])
+        routes = d["routes"]
         if not routes:
             # Refusing to guess. An unreadable envelope reported as an empty
             # route list would make every request look inconsistent with its own
@@ -136,7 +183,7 @@ def report(ev, pol, capture=None) -> str:
         # The check worth doing. A provider outside the policy's route list means
         # either a bug or a policy that rotated mid-flight, and both are things
         # someone would rather find out here than not at all.
-        if served and served not in {r.get("provider") for r in routes}:
+        if served and d["consistent"] is False:
             out.append("")
             out.append(
                 f"  WARNING: {served} answered but is not in policy v{pol['version']}.\n"
@@ -146,9 +193,8 @@ def report(ev, pol, capture=None) -> str:
         elif served:
             # Providers are unique within a policy, so the model follows from the
             # provider without having been stored.
-            model = next(r.get("model") for r in routes if r.get("provider") == served)
             out.append("")
-            out.append(f"  consistent: {served} is in this policy, serving {model}")
+            out.append(f"  consistent: {served} is in this policy, serving {d['model']}")
 
     if capture is not None:
         out += ["", "captured content:"]
