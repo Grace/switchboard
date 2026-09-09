@@ -31,9 +31,36 @@ def _b64(raw):
     return base64.b64encode(raw).decode()
 
 
+# The marker dev-up.sh sets when it calls `keys`. Anything else has to opt in
+# deliberately, in an environment variable, which is not something a person
+# reaches for by accident and not something a stray `run-task` override carries.
+DEV_MARKER = "SWITCHBOARD_DEV"
+
+
 def cmd_keys(args):
     from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
     from cryptography.hazmat.primitives import serialization
+
+    # This subcommand prints an Ed25519 signing seed and four bearer tokens to
+    # stdout, which is correct for its purpose -- dev-up.sh redirects it into
+    # .dev/env -- and indefensible anywhere else.
+    #
+    # It needs a guard because this file ships in the production image.
+    # Dockerfile.controlplane copies scripts/, and quickstart.yaml's bootstrap
+    # task runs `scripts/devstack.py dbinit`, so `devstack.py` cannot simply be
+    # excluded: dbinit is the production entrypoint for migrations and the
+    # runtime login. That leaves `keys` present and one run-task override away
+    # from printing a signing seed into a CloudWatch log group.
+    #
+    # Nothing does that today. The point is that nothing should be able to.
+    if not os.environ.get(DEV_MARKER):
+        raise SystemExit(
+            "refusing to run `keys` without %s=1 set.\n"
+            "  It prints a signing seed and four bearer tokens to stdout, and this\n"
+            "  file ships inside the production control-plane image, where stdout is\n"
+            "  a CloudWatch log group. `make dev-up` sets the marker for you.\n"
+            "  In a deployment, secrets come from Secrets Manager by ECS injection;\n"
+            "  nothing should be generating them here." % DEV_MARKER)
 
     private = Ed25519PrivateKey.generate()
     seed = private.private_bytes(

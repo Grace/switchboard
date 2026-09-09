@@ -26,7 +26,10 @@ if [ ! -s .dev/env ]; then
   echo "building images"
   $COMPOSE build devtools gateway controlplane >/dev/null
   echo "generating signing key and tokens"
-  $COMPOSE run --rm --no-deps -T dbinit scripts/devstack.py keys > .dev/env.tmp
+  # SWITCHBOARD_DEV is the marker `keys` requires. devstack.py ships inside the
+  # production image, so the subcommand that prints a signing seed refuses to run
+  # unless something says plainly that this is local development.
+  $COMPOSE run --rm --no-deps -T -e SWITCHBOARD_DEV=1 dbinit scripts/devstack.py keys > .dev/env.tmp
   mv .dev/env.tmp .dev/env
   chmod 0600 .dev/env
   echo "  wrote .dev/env (Ed25519 seed and bearer tokens; gitignored, local only)"

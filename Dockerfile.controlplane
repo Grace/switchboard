@@ -31,7 +31,13 @@ COPY --from=build /usr/local /usr/local
 COPY --from=build /staged/ /usr/lib/
 COPY --from=build /etc/ssl/rds/global-bundle.pem /etc/ssl/rds/global-bundle.pem
 COPY controlplane /app/controlplane
-COPY scripts /app/scripts
+# Only the two scripts a deployment runs, named rather than copied wholesale.
+# devstack.py is quickstart.yaml's bootstrap entrypoint (`devstack.py dbinit`)
+# and bootstrap.py provisions the first tenant; mockprovider.py and the
+# dev-smoke/dev-up helpers have no business in a production image. devstack.py
+# still carries the `keys` subcommand, which is why that subcommand refuses to
+# run without SWITCHBOARD_DEV rather than relying on being absent.
+COPY scripts/devstack.py scripts/bootstrap.py /app/scripts/
 WORKDIR /app
 ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 PATH=/usr/local/bin:/usr/bin:/bin
 USER 65532:65532
