@@ -1,6 +1,10 @@
 package gateway
 
-import "testing"
+import (
+	"strings"
+	"testing"
+	"unicode/utf8"
+)
 
 // Every body here is a verbatim response from a real provider, captured during
 // live verification. Inventing them would defeat the purpose: this classifier
@@ -98,4 +102,23 @@ func repeat(s string, n int) string {
 		out = append(out, s[0])
 	}
 	return string(out)
+}
+
+// The message reaches the caller's error body, so a cut landing mid-sequence
+// ships a replacement character to whoever is trying to read the error.
+func TestProviderReasonTruncatesOnARuneBoundary(t *testing.T) {
+	// The cut must land *inside* a rune or this proves nothing. One ASCII byte
+	// then three-byte runes: byte 300 is 1+299, and 299 is not a multiple of 3,
+	// so a plain msg[:300] slices the hundredth rune after two of its three
+	// bytes. (An earlier version of this test used two-byte runes with no ASCII
+	// prefix, where 300 is a clean boundary and the bug survived the test.)
+	long := "a" + strings.Repeat("€", 200)
+	body := []byte(`{"error":{"message":"` + long + `"}}`)
+	got := providerReason(body)
+	if len(got) > 300 {
+		t.Fatalf("length %d, want at most 300", len(got))
+	}
+	if !utf8.ValidString(got) {
+		t.Fatalf("truncation produced invalid UTF-8: %q", got)
+	}
 }

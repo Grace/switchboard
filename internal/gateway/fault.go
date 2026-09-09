@@ -27,6 +27,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"strings"
+	"unicode/utf8"
 )
 
 type fault int
@@ -44,6 +45,20 @@ const (
 	faultAccount
 	// faultDegraded is the provider itself failing. This is what the breaker is for.
 	faultDegraded
+	// faultRefused is this provider declining the request before generating
+	// anything: credentials it will not accept (401), access it will not grant
+	// (403), or a model it does not have (404).
+	//
+	// Two things follow, and both were previously wrong. Nothing was accepted and
+	// nothing was billed -- the same reasoning temperature.go applies to a 400 --
+	// so failing over cannot charge twice. And the refusal is specific to this
+	// provider: a key rotated at OpenAI says nothing about Anthropic, and a model
+	// one provider retired is not a model every provider retired. So
+	// faultTerminal's premise, that "this request would fail the same way at
+	// every provider", is simply false here.
+	//
+	// Added last so the existing values stay stable; String() is a query surface.
+	faultRefused
 )
 
 // String is what reaches telemetry as switchboard.fault. These four names are
@@ -63,6 +78,8 @@ func (f fault) String() string {
 		return "account"
 	case faultDegraded:
 		return "degraded"
+	case faultRefused:
+		return "refused"
 	}
 	return "unknown"
 }
@@ -100,6 +117,12 @@ func classify(status int, body []byte) fault {
 			return faultAccount
 		}
 		return faultTerminal
+	case 401, 403, 404:
+		// Refused before generation, and specific to this provider. See
+		// faultRefused. Deliberately not folded into the default below, which is
+		// where 500/502/504 still land: those may mean the provider accepted the
+		// request and failed while generating it, which is not replayable.
+		return faultRefused
 	}
 	return faultTerminal
 }
@@ -142,9 +165,15 @@ func providerReason(body []byte) string {
 	}
 	msg = strings.TrimSpace(msg)
 	// Bounded: this reaches a client response, and a provider could return an
-	// arbitrarily long message.
+	// arbitrarily long message. Cut on a rune boundary -- a byte slice can land
+	// mid-sequence, and the result is a message ending in a replacement
+	// character in the caller's error body.
 	if len(msg) > 300 {
-		msg = msg[:300]
+		cut := 300
+		for cut > 0 && !utf8.RuneStart(msg[cut]) {
+			cut--
+		}
+		msg = msg[:cut]
 	}
 	return msg
 }

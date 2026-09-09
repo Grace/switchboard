@@ -49,6 +49,12 @@ type Metrics struct {
 	// account could not serve at all: no credits, balance too low, quota gone.
 	// Distinct from RateLimited, which is transient and self-clearing.
 	AccountFailover atomic.Int64
+	// RefusedFailover counts requests moved to another provider because this one
+	// refused before generating: 401, 403 or 404. Counted apart from
+	// AccountFailover because the operator action differs -- an account failover
+	// means pay the provider, a refusal means fix a credential or a model name --
+	// and apart from Errors because the caller was served.
+	RefusedFailover atomic.Int64
 	// ProviderProbeFailed counts providers rejected by the startup check.
 	ProviderProbeFailed atomic.Int64
 	// IdempotentReplay counts responses served from the idempotency store rather
@@ -157,6 +163,7 @@ func (m *Metrics) series() []series {
 		{"empty_completion_recovered_total", "counter", &m.EmptyCompletionRecovered},
 		{"empty_completion_failed_total", "counter", &m.EmptyCompletionFailed},
 		{"account_failover_total", "counter", &m.AccountFailover},
+		{"refused_failover_total", "counter", &m.RefusedFailover},
 		{"provider_probe_failed_total", "counter", &m.ProviderProbeFailed},
 		{"budget_skip_total", "counter", &m.BudgetSkip},
 		{"temperature_dropped_total", "counter", &m.TemperatureDropped},

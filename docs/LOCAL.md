@@ -94,7 +94,7 @@ The policy must be signed, and the gateway pins the public half.
 
 ```sh
 python -c 'import base64,os; print(base64.b64encode(os.urandom(32)).decode())' > seed.b64
-gateway -public-key < seed.b64
+./bin/gateway -public-key < seed.b64
 ```
 
 The seed is read on stdin rather than as an argument so it does not reach the
@@ -103,15 +103,26 @@ for every later policy change.
 
 ### 2. Configuration
 
-Copy `config.example.json`, which is a working file-only configuration, and
-change two things: put the public key from step 1 in `trusted_keys`, and set
-`tenant` to whatever you like.
+**Copy `config.example.json`; do not retype the block below.** It is elided —
+the numeric limits are all required, and typing only what is shown produces a
+run of validation failures, one per re-run.
+
+Change three things: put the public key from step 1 in `trusted_keys`, set
+`tenant` to whatever you like, and point `data_dir` somewhere that exists. The
+example ships `/data`, which is right inside a container and not writable on a
+laptop; use something like `./data` locally, and create it first.
+
+The example's `trusted_keys` value is a real, well-formed key so that the file
+starts as shipped — but it is **not yours**, and no seed in this repository
+produces it. Leave it in place and the gateway will start, then refuse your
+policy with `invalid signature`, which is now logged with the reason rather than
+counted in silence. Replace it with your own public key from step 1.
 
 ```jsonc
 {
   "listen": "127.0.0.1:8080",
   "tenant": "acme-prod",
-  "data_dir": "/data",
+  "data_dir": "./data",               // the example ships /data, for containers
   "control_url": "",                  // empty means file-only, no control plane
   "control_token_env": "",
   "local_token_env": "LOCAL_TOKEN",
@@ -133,12 +144,16 @@ Two rules that cost people time:
 ### 3. A signed policy
 
 ```sh
+mkdir -p ./data
 SWITCHBOARD_POLICY_SEED="$(cat seed.b64)" \
   python -m controlplane.policytool \
     --tenant acme-prod --key-id key-2026-09 \
     --route openai:gpt-4o-mini \
-    --out /data/policy.json
+    --out ./data/policy.json
 ```
+
+`--out` must land inside `data_dir` and be named `policy.json`; that is the only
+file the gateway reads at startup in file-only mode.
 
 `--key-id` must match the key in `trusted_keys`, and `--tenant` must match
 `tenant`. Repeat `--route` for failover order, first preferred, up to four with
@@ -153,7 +168,7 @@ stored. A lower or equal version is refused as a rollback.
 ```sh
 export OPENAI_API_KEY=sk-...
 export LOCAL_TOKEN=$(python -c 'import base64,os;print(base64.b64encode(os.urandom(32)).decode())')
-gateway -config config.json
+./bin/gateway -config config.json
 ```
 
 Then send a request. Note `"model": "preferred"` — the gateway rejects any other
@@ -172,15 +187,33 @@ see it.
 
 ### If it does not work
 
-- **`invalid trust key`** — the value in `trusted_keys` is not the base64 public
-  key. Re-derive it with `gateway -public-key`.
-- **`no policy is present`** — file-only operation found nothing at
+Each heading below is the message the software actually prints, so it can be
+searched for. (Three of them used to be paraphrases that appeared nowhere in the
+code, which is the worst possible thing for a troubleshooting list to be.)
+
+- **`trust key "..." is not valid base64; derive it with 'gateway -public-key'`**
+  — the value in `trusted_keys` is not a base64 public key. Replace it with the
+  output of `./bin/gateway -public-key < seed.b64`.
+- **`trust key "..." decodes to N bytes; an ed25519 public key is 32`** — right
+  encoding, wrong value. You have probably pasted the seed rather than the
+  public key.
+- **`untrusted signing key`** — `--key-id` and the key name in `trusted_keys`
+  disagree. The key itself may be fine.
+- **`invalid signature`** — the key id matched but the key does not correspond to
+  the seed that signed the policy. This is the one to expect if you copied
+  `config.example.json` and did not replace the trust key.
+- **`file-only operation, but no policy is present`** — nothing at
   `data_dir/policy.json`. Step 3 writes it; check `--out` matches `data_dir`.
-- **`unsupported or unknown key id`** — `--key-id` and the key in `trusted_keys`
-  disagree.
-- **`503 no valid routing policy`** — usually an expired policy. Sign a new one
-  with a higher `--version`.
+- **`no valid routing policy or draining`** (503 from a request) — usually an
+  expired policy. Sign a new one with a higher `--version`.
+- **`/readyz` returns 503** — the body names the cause: no policy yet, the cached
+  policy expired, a policy naming no configured provider, or draining. In
+  control-plane mode `policy sync failed` is also logged once, with the reason
+  and a hint, when the failure starts and again when it clears.
 - **Anything about a numeric limit** — the error names the field and its range.
+  If you typed the abbreviated config block rather than copying
+  `config.example.json`, expect several of these in sequence: the numeric limits
+  are all required.
 
 ### Graduating to the control plane
 

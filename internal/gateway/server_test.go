@@ -60,8 +60,15 @@ func TestFailoverAndControlDown(t *testing.T) {
 		t.Fatal("control down not observed")
 	}
 }
+
+// 401 was removed from this list deliberately. A 401, 403 or 404 is refused
+// before the provider generates anything, so nothing was accepted and nothing
+// was billed, and the refusal is specific to one provider -- see faultRefused
+// and TestRefusedStatusesFailOver below. What remains here is the genuinely
+// ambiguous set: 200 and 400 because the request was answered, 500 because the
+// provider may have accepted it and failed partway through generating.
 func TestNoReplayAfterAcceptanceOrAmbiguity(t *testing.T) {
-	for _, status := range []int{200, 400, 401, 500} {
+	for _, status := range []int{200, 400, 500} {
 		t.Run(http.StatusText(status), func(t *testing.T) {
 			var fallback atomic.Int64
 			a := testHTTP(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -79,6 +86,245 @@ func TestNoReplayAfterAcceptanceOrAmbiguity(t *testing.T) {
 		})
 	}
 }
+
+// A rotated key, a revoked one, or a model the provider retired. Each is a
+// refusal issued before generation and specific to the provider that issued it,
+// so the policy's remaining routes are exactly what they are for. Before this
+// worked, every request returned 502 while a healthy provider sat idle in the
+// same signed policy -- and docs/GAPS.md item 2 records two of three model names
+// in this repository's own tests being retired by their providers mid-project,
+// so the 404 is not hypothetical.
+func TestRefusedStatusesFailOver(t *testing.T) {
+	for _, status := range []int{401, 403, 404} {
+		t.Run(http.StatusText(status), func(t *testing.T) {
+			var first, second atomic.Int64
+			a := testHTTP(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				first.Add(1)
+				w.WriteHeader(status)
+				io.WriteString(w, `{"error":{"message":"nope"}}`)
+			}))
+			defer a.Close()
+			b := testHTTP(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				second.Add(1)
+				io.WriteString(w, `{"content":[{"type":"text","text":"rescued"}],"stop_reason":"end_turn"}`)
+			}))
+			defer b.Close()
+			s := testServer(t, map[string]ProviderConfig{
+				"openai":    {URL: a.URL, KeyEnv: "PROVIDER_KEY"},
+				"anthropic": {URL: b.URL, KeyEnv: "PROVIDER_KEY"},
+			})
+			w := call(s, chat)
+			if w.Code != 200 || !strings.Contains(w.Body.String(), "rescued") {
+				t.Fatalf("status %d did not fail over: %d %s", status, w.Code, w.Body)
+			}
+			if first.Load() != 1 || second.Load() != 1 {
+				t.Fatalf("route counts wrong: first=%d second=%d", first.Load(), second.Load())
+			}
+			if s.Metrics.RefusedFailover.Load() != 1 {
+				t.Errorf("refused_failover_total = %d, want 1", s.Metrics.RefusedFailover.Load())
+			}
+			// Withheld as well as failed over. Without the cooldown every later
+			// request pays a doomed round trip to the same provider first.
+			if s.circuits["openai"].wouldAllow() {
+				t.Error("a provider that refused our credentials was not withheld")
+			}
+		})
+	}
+}
+
+// result(false) is the success path: it zeroes failures and clears the
+// open-until deadline. The terminal branch called it, so a provider returning
+// 500 forever reset its own breaker on every request and the breaker could
+// never open however many failures arrived.
+func TestTerminalFailuresStillOpenTheBreaker(t *testing.T) {
+	a := testHTTP(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(500)
+		io.WriteString(w, `{"error":{"message":"boom"}}`)
+	}))
+	defer a.Close()
+	s := testServer(t, map[string]ProviderConfig{"openai": {URL: a.URL, KeyEnv: "PROVIDER_KEY"}})
+	for i := 0; i < 3; i++ {
+		if w := call(s, chat); w.Code != 502 {
+			t.Fatalf("attempt %d: status %d, want 502", i+1, w.Code)
+		}
+	}
+	if s.circuits["openai"].wouldAllow() {
+		t.Fatal("three consecutive 500s left the breaker closed; it reset itself each time")
+	}
+}
+
+// The other half of the same bug, in the opposite direction: a 400 is the
+// caller's fault, so it must not wipe out failures a sick provider has already
+// accumulated. Two real failures then a client error should leave the provider
+// one failure away from open, not back at zero.
+func TestClientErrorDoesNotResetTheBreaker(t *testing.T) {
+	var status atomic.Int64
+	status.Store(500)
+	a := testHTTP(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(int(status.Load()))
+		io.WriteString(w, `{"error":{"message":"x"}}`)
+	}))
+	defer a.Close()
+	s := testServer(t, map[string]ProviderConfig{"openai": {URL: a.URL, KeyEnv: "PROVIDER_KEY"}})
+	for i := 0; i < 2; i++ {
+		call(s, chat)
+	}
+	status.Store(400)
+	call(s, chat)
+
+	s.circuits["openai"].mu.Lock()
+	failures := s.circuits["openai"].failures
+	s.circuits["openai"].mu.Unlock()
+	if failures != 2 {
+		t.Fatalf("failures = %d after two 500s and a 400, want 2; the client error reset the breaker", failures)
+	}
+}
+
+// One histogram over two populations made the median meaningless: local
+// rejections complete in microseconds without contacting anyone, and
+// latencyBounds starts at 5 with no lower edge on the first bucket, so enough of
+// them interpolate the median below zero. docs/GAPS.md item 5 recorded P50 as
+// -5 ms.
+func TestLatencyMeasuresOnlyRequestsThatReachedAProvider(t *testing.T) {
+	a := testHTTP(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		io.WriteString(w, `{"choices":[{"index":0,"message":{"content":"ok"},"finish_reason":"stop"}],`+
+			`"usage":{"prompt_tokens":1,"completion_tokens":1}}`)
+	}))
+	defer a.Close()
+	s := testServer(t, map[string]ProviderConfig{"openai": {URL: a.URL, KeyEnv: "PROVIDER_KEY"}})
+
+	// Unauthorized: never reaches a provider.
+	w := httptest.NewRecorder()
+	s.Handler().ServeHTTP(w, httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(chat)))
+	if w.Code != 401 {
+		t.Fatalf("setup: status %d, want 401", w.Code)
+	}
+	// Malformed body: parsed and refused, still never reaches a provider.
+	if got := call(s, `{"model":"gpt-4o","messages":[{"role":"user","content":"hi"}]}`); got.Code != 400 {
+		t.Fatalf("setup: status %d, want 400", got.Code)
+	}
+	if n := s.Metrics.Completed.Load(); n != 0 {
+		t.Fatalf("requests that contacted no provider were measured: completed=%d, want 0", n)
+	}
+
+	if got := call(s, chat); got.Code != 200 {
+		t.Fatalf("inference: %d %s", got.Code, got.Body)
+	}
+	if n := s.Metrics.Completed.Load(); n != 1 {
+		t.Fatalf("completed=%d after one real inference, want 1", n)
+	}
+}
+
+// Every distinct first-run misconfiguration used to present as one empty-bodied
+// 503, retried in silence every fifteen seconds forever. A wrong trust key, an
+// unregistered control token, a tenant with no published policy and a policy
+// that quietly expired were indistinguishable to the person trying to start it.
+func TestReadyzSaysWhyItIsNotReady(t *testing.T) {
+	s := testServer(t, map[string]ProviderConfig{"openai": {URL: "http://127.0.0.1:1", KeyEnv: "PROVIDER_KEY"}})
+
+	// Healthy: the test policy is already applied.
+	if r := s.readyzReason(); r != "" {
+		t.Fatalf("setup: not ready, %q", r)
+	}
+
+	// No policy at all, with a control plane configured.
+	empty := &PolicyStore{Tenant: "tenant-a", Keys: s.Policies.Keys}
+	s.Policies = empty
+	if r := s.notReady(); !strings.Contains(r, "no policy") {
+		t.Errorf("reason = %q, want it to mention the missing policy", r)
+	}
+
+	// The sync failure is the actual cause and must supersede the generic wait.
+	s.noteSync("control plane refused the policy request", "status", 401)
+	if r := s.notReady(); !strings.Contains(r, "refused") {
+		t.Errorf("reason = %q, want the sync failure to be named", r)
+	}
+
+	// And the endpoint carries it, rather than an empty body.
+	w := httptest.NewRecorder()
+	s.Handler().ServeHTTP(w, httptest.NewRequest("GET", "/readyz", nil))
+	if w.Code != 503 {
+		t.Fatalf("status %d, want 503", w.Code)
+	}
+	if strings.TrimSpace(w.Body.String()) == "" {
+		t.Fatal("/readyz returned 503 with an empty body; that is the defect")
+	}
+
+	s.Draining.Store(true)
+	if r := s.notReady(); r != "draining" {
+		t.Errorf("draining reason = %q", r)
+	}
+}
+
+// A control plane that is down stays down. Logging every fifteen seconds is not
+// diagnostics, it is 5,760 identical lines a day burying the one that mattered.
+func TestSyncFailureIsReportedOnceAndOnRecovery(t *testing.T) {
+	var status atomic.Int64
+	status.Store(401)
+	cp := testHTTP(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if code := int(status.Load()); code != 200 {
+			w.WriteHeader(code)
+			return
+		}
+		w.WriteHeader(200)
+		io.WriteString(w, "not a policy")
+	}))
+	defer cp.Close()
+	s := testServer(t, map[string]ProviderConfig{"openai": {URL: "http://127.0.0.1:1", KeyEnv: "PROVIDER_KEY"}})
+	s.C.ControlURL = cp.URL
+
+	s.syncOnce(context.Background())
+	first, _ := s.syncState.Load().(string)
+	if !strings.Contains(first, "refused") {
+		t.Fatalf("sync state after a 401 = %q, want it to name the refusal", first)
+	}
+	s.syncOnce(context.Background())
+	if again, _ := s.syncState.Load().(string); again != first {
+		t.Errorf("state changed on an identical repeat failure: %q -> %q", first, again)
+	}
+
+	// A 200 carrying something that is not a verifiable policy is a different
+	// failure and must be reported as one, not silently counted.
+	status.Store(200)
+	s.syncOnce(context.Background())
+	if r, _ := s.syncState.Load().(string); !strings.Contains(r, "rejected") {
+		t.Errorf("sync state after an unverifiable body = %q, want it to name the rejection", r)
+	}
+	if s.Metrics.PolicyErrors.Load() != 3 {
+		t.Errorf("policy_errors_total = %d, want 3", s.Metrics.PolicyErrors.Load())
+	}
+}
+
+// stream() sets these before reading a frame. A stream that produced nothing
+// fails over and can end at a JSON error instead, which was shipping an error
+// body labelled as an unbuffered event stream because only Content-Type was
+// being overwritten.
+func TestProblemClearsStreamingHeaders(t *testing.T) {
+	w := httptest.NewRecorder()
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("X-Accel-Buffering", "no")
+
+	problem(w, 503, "routes unavailable")
+
+	if got := w.Header().Get("Content-Type"); got != "application/json" {
+		t.Errorf("Content-Type = %q, want application/json", got)
+	}
+	for _, h := range []string{"Cache-Control", "X-Accel-Buffering"} {
+		if got := w.Header().Get(h); got != "" {
+			t.Errorf("%s = %q on a JSON error body, want it cleared", h, got)
+		}
+	}
+}
+
+func TestSyncHintNamesTheThingToCheck(t *testing.T) {
+	for _, status := range []int{401, 403, 404, 503} {
+		if syncHint(status) == "" {
+			t.Errorf("status %d has no hint; it is a first-run misconfiguration", status)
+		}
+	}
+}
+
 func TestLimitsAndAuth(t *testing.T) {
 	s := testServer(t, nil)
 	w := httptest.NewRecorder()
@@ -104,6 +350,39 @@ func TestLimitsAndAuth(t *testing.T) {
 		t.Fatal("drain")
 	}
 }
+
+// The first two requests an OpenAI SDK user sends, and what they used to be
+// told. `model="gpt-4o"` was answered with a sentence about message counts, and
+// anything carrying `response_format` or `top_p` was answered with a sentence
+// about tools -- in both cases naming something the caller had not done.
+func TestParseErrorsNameTheActualProblem(t *testing.T) {
+	const msgs = `"messages":[{"role":"user","content":"hi"}]`
+	for _, tc := range []struct{ name, body, want string }{
+		{"the offending field is named", `{"model":"preferred","response_format":{},` + msgs + `}`, "response_format"},
+		{"every offending field is listed", `{"model":"preferred","top_p":1,"n":2,` + msgs + `}`, "n, top_p"},
+		{"the rejected model is quoted back", `{"model":"gpt-4o",` + msgs + `}`, `"gpt-4o"`},
+		{"the model error explains why", `{"model":"gpt-4o",` + msgs + `}`, "signed routing policy"},
+		{"array content is explained", `{"model":"preferred","messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}]}`, "plain string"},
+		{"message count is its own error", `{"model":"preferred","messages":[]}`, "1-128 messages"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, e := ParseChat([]byte(tc.body))
+			if e == nil {
+				t.Fatal("accepted an unsupported request")
+			}
+			if !strings.Contains(e.Error(), tc.want) {
+				t.Errorf("error %q does not mention %q", e.Error(), tc.want)
+			}
+		})
+	}
+	// The old message named tools for every unknown field. It must not appear
+	// when the caller never mentioned tools.
+	_, e := ParseChat([]byte(`{"model":"preferred","top_p":1,` + msgs + `}`))
+	if strings.Contains(e.Error(), "tool") {
+		t.Errorf("a top_p rejection still talks about tools: %q", e.Error())
+	}
+}
+
 func TestUnsupportedInputs(t *testing.T) {
 	for _, b := range []string{`{"model":"preferred","tools":[],"messages":[{"role":"user","content":"hi"}]}`, `{"model":"preferred","messages":[{"role":"tool","content":"hi"}]}`, `{"model":"preferred","messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}]}`, `{"model":"preferred","messages":[{"role":"assistant","content":"hi"}]}`, chat + `{}`} {
 		if _, e := ParseChat([]byte(b)); e == nil {

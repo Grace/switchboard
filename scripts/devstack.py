@@ -60,6 +60,34 @@ def cmd_keys(args):
         print("%s=%s" % (k, v))
 
 
+# Every one of these comes from .dev/env, which `make dev-up` writes. A bare
+# KeyError traceback names the variable and nothing else -- not where it should
+# have come from, and not that running `docker compose up` directly instead of
+# `make dev-up` is the usual reason it is missing, because compose interpolates
+# from the shell rather than from env_file.
+_ENV_SOURCE = {
+    "DBHOST": "set by docker-compose.dev.yml",
+    "PGPASSWORD": "set by docker-compose.dev.yml",
+    "APP_DB_PASSWORD": "generated into .dev/env by `make dev-up`",
+    "TENANT": "generated into .dev/env by `make dev-up`",
+    "BOOTSTRAP_ADMIN_TOKEN": "generated into .dev/env by `make dev-up`",
+    "CONTROL_TOKEN": "generated into .dev/env by `make dev-up`",
+}
+
+
+def _env(name):
+    """Required environment, with the remedy attached to the failure."""
+    value = os.environ.get(name)
+    if value:
+        return value
+    raise SystemExit(
+        "%s is not set (%s).\n"
+        "  If you ran `docker compose ... up` directly, use `make dev-up` instead:\n"
+        "  compose interpolates ${%s} from the shell, not from env_file, so it\n"
+        "  silently becomes an empty string and the failure surfaces minutes later\n"
+        "  somewhere else." % (name, _ENV_SOURCE.get(name, "see docs/LOCAL.md"), name))
+
+
 def _migration_dsn():
     """Prefer a complete DSN, otherwise compose one from parts.
 
@@ -69,8 +97,8 @@ def _migration_dsn():
     dsn = os.environ.get("MIGRATION_DATABASE_URL")
     if dsn:
         return dsn
-    host = os.environ["DBHOST"]
-    password = urllib.parse.quote(os.environ["PGPASSWORD"], safe="")
+    host = _env("DBHOST")
+    password = urllib.parse.quote(_env("PGPASSWORD"), safe="")
     user = os.environ.get("DBUSER", "switchboard_owner")
     name = os.environ.get("DBNAME", "switchboard")
     ssl = os.environ.get("DBSSLMODE", "verify-full")
@@ -89,7 +117,7 @@ def cmd_dbinit(args):
     subprocess.run([sys.executable, "-m", "controlplane.migrate"], check=True,
                    env={**os.environ, "MIGRATION_DATABASE_URL": admin})
 
-    password = os.environ["APP_DB_PASSWORD"]
+    password = _env("APP_DB_PASSWORD")
     with psycopg.connect(admin, autocommit=True) as db:
         exists = db.execute("SELECT 1 FROM pg_roles WHERE rolname='switchboard_rt'").fetchone()
         # Role DDL takes no bind parameters, so the password is quoted as a
@@ -118,22 +146,41 @@ def _request(method, url, token, body=None):
 
 
 def _wait_for(url, attempts=60):
-    for _ in range(attempts):
+    """Wait for a service, saying so while it waits.
+
+    This could take three minutes (60 attempts x 1s sleep + up to 2s timeout) and
+    printed nothing at all until it gave up, so the common case -- the control
+    plane crash-looping on an empty APP_DB_PASSWORD -- looked like a hang and
+    then reported a timeout that named the symptom rather than the cause.
+    """
+    last = None
+    for attempt in range(1, attempts + 1):
         try:
             with urllib.request.urlopen(url, timeout=2) as r:
                 if r.status == 200:
+                    if attempt > 1:
+                        print("  ready after %ds" % attempt)
                     return
-        except Exception:
-            pass
+                last = "status %d" % r.status
+        except Exception as exc:
+            last = type(exc).__name__ + ": " + str(exc)
+        if attempt == 1 or attempt % 10 == 0:
+            print("  waiting for %s (%ds, last: %s)" % (url, attempt, last), flush=True)
         time.sleep(1)
-    raise SystemExit("timed out waiting for " + url)
+    raise SystemExit(
+        "timed out after %ds waiting for %s\n"
+        "  last attempt: %s\n"
+        "  Check `docker compose -f docker-compose.dev.yml logs controlplane`.\n"
+        "  The usual cause is an empty APP_DB_PASSWORD, which happens when compose\n"
+        "  is run directly instead of through `make dev-up`." % (attempts, url, last))
 
 
 def _principal_exists(digest):
     import psycopg
     try:
         dsn = _migration_dsn()
-    except KeyError:
+    except (KeyError, SystemExit):
+        # No database reachable from here; fall back to asking the API.
         return False
     with psycopg.connect(dsn) as db:
         row = db.execute(
@@ -144,9 +191,9 @@ def _principal_exists(digest):
 
 def cmd_init(args):
     control = os.environ.get("CONTROL_URL", "http://127.0.0.1:8000")
-    tenant = os.environ["TENANT"]
-    admin_token = os.environ["BOOTSTRAP_ADMIN_TOKEN"]
-    control_token = os.environ["CONTROL_TOKEN"]
+    tenant = _env("TENANT")
+    admin_token = _env("BOOTSTRAP_ADMIN_TOKEN")
+    control_token = _env("CONTROL_TOKEN")
 
     _wait_for(control + "/healthz")
 
@@ -161,18 +208,38 @@ def cmd_init(args):
 
     # The API stores only the hash; the raw token stays on this side.
     digest = hashlib.sha256(control_token.encode()).hexdigest()
-    # token_hash is unique, and the control plane deliberately collapses every
-    # unhandled exception into an opaque 503, so a duplicate insert is
-    # indistinguishable from a real fault over HTTP. Check the table directly
-    # instead of trying to read intent out of the status code.
+    # token_hash is unique, and the control plane collapses every unhandled
+    # exception into an opaque 500, so a duplicate insert is indistinguishable
+    # from a real fault over HTTP. Check the table directly instead of trying to
+    # read intent out of the status code. (The status was 503 until that was
+    # corrected: an unhandled fault is not a retryable one.)
     if _principal_exists(digest):
         print("init: agent principal already present")
     else:
-        agent = _request("POST", control + "/v1/principals", admin_token, {
-            "token_hash": digest,
-            "role": "agent",
-            "expires_at": int(time.time()) + 7 * 86400,
-        })
+        try:
+            agent = _request("POST", control + "/v1/principals", admin_token, {
+                "token_hash": digest,
+                "role": "agent",
+                "expires_at": int(time.time()) + 7 * 86400,
+            })
+        except urllib.error.HTTPError as exc:
+            if exc.code == 401:
+                # The commonest rerun failure, and it used to be a raw traceback.
+                # scripts/bootstrap.py gives the admin principal a seven-day
+                # expiry, so a stack left up over a week fails here with exactly
+                # the same 401 as a regenerated .dev/env against a kept volume.
+                raise SystemExit(
+                    "the control plane rejected BOOTSTRAP_ADMIN_TOKEN (401).\n"
+                    "  Either .dev/env was regenerated while the postgres volume was kept,\n"
+                    "  so the token no longer matches the stored hash, or the bootstrap\n"
+                    "  admin principal has passed its seven-day expiry.\n"
+                    "  Both are fixed by starting clean: `make dev-down && make dev-up`.")
+            raise SystemExit("creating the agent principal failed: HTTP %d %s"
+                             % (exc.code, exc.read().decode()[:300]))
+        if not agent or "id" not in agent:
+            raise SystemExit(
+                "the control plane accepted the agent principal but returned no id; "
+                "check `docker compose -f docker-compose.dev.yml logs controlplane`")
         print("init: agent principal %s" % agent["id"])
 
     now = int(time.time())

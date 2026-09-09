@@ -119,6 +119,108 @@ Each of these is backed by a run recorded in `docs/VALIDATION.md`.
     billing records to make a container memory graph look tidier is the wrong
     trade, and the slab growth is reclaimable rather than a leak.
 
+19. **Two live routing defects, found while scoping something else, now fixed.**
+    Both were reachable on the ordinary serving path with no feature flags, and
+    neither was findable by tooling: `go vet`, `go build` and `go test -race`
+    were clean before and after.
+
+    **The circuit breaker was reset by provider failures.** A terminal fault
+    called `circuit.result(false)`, which is the *success* path -- it zeroes
+    `failures` and clears the open-until deadline. `classify()` returns
+    `faultTerminal` for everything that is not 503/429/400/422, so 401, 403,
+    404, 500, 502 and 504 all landed there. A provider returning 500 forever
+    therefore reset its own breaker on every request and the breaker could never
+    open. Now a 5xx counts as a failure and a 400/422 is neutral (`release()`),
+    because a malformed request is the caller's fault and must not wipe out
+    failures a sick provider has accumulated.
+
+    **401, 403 and 404 now fail over.** They are refused before generation, so
+    nothing was accepted and nothing was billed -- the argument `temperature.go`
+    already makes for a 400 -- and they are specific to one provider, so the old
+    comment's premise, "this request would fail the same way at every provider",
+    was false for them. A rotated key or a retired model name meant 100% of
+    requests returned 502 while a healthy provider sat idle in the same signed
+    policy; item 2 records two of three model names in this repository's own
+    tests being retired mid-project, so the 404 was not hypothetical. 500, 502
+    and 504 remain terminal: the provider may have accepted the request and
+    failed partway through generating it. New class `faultRefused`, new counter
+    `switchboard_refused_failover_total`, and a 60-second cooldown so a rotated
+    key does not cost a doomed round trip on every request.
+
+    **Budget-aware routing was miscalibrated in both directions.** The streaming
+    path recorded `producedText` as `text != ""` and the non-streaming path
+    recorded `true` unconditionally. A response can legitimately carry no text --
+    a Gemini prompt block, any `content_filter` finish, a `stop` with nothing to
+    say -- so one content-filtered stream set `emptyAt` and shadowed a *healthy*
+    model for the full six-hour TTL, and since `ParseChat` defaults `max_tokens`
+    to 1024 that is most default traffic; while one content-filtered
+    non-streamed response set `okAt` and silently disabled budget-aware routing
+    for that model instead. Both now use `observeOutcome`, which records a fact
+    only when the outcome is one -- `finish == "length"` with empty text, or text
+    produced -- and stays silent otherwise. The predicate the empty-completion
+    paths a few lines away already used.
+
+20. **Diagnosability, and the first-run path.** `syncOnce` discarded eight
+    distinct named errors from `Policies.Apply` in favour of one counter and no
+    log line, so a wrong trust key, an unregistered control token, a tenant with
+    no published policy and an unreachable control plane were indistinguishable:
+    an empty-bodied 503 from `/readyz`, forever, in silence. It now names which
+    failure occurred with a hint at the thing to check, logged when the failure
+    starts and again when it clears rather than every fifteen seconds; `/readyz`
+    and `/runtime` carry the reason; four `fatal` paths in `cmd/gateway/main.go`
+    that dropped their error now pass it; and the control plane logs the
+    exception type and traceback instead of a bare request id, and reports an
+    unhandled fault as 500 rather than as a retryable 503.
+
+    The correction to item 17's note: the fifteen-second poll was **not** why a
+    first control-plane attempt looked like a hang. `Sync` calls `syncOnce`
+    before waiting on the ticker, so the first poll is immediate and a healthy
+    start reaches `/readyz` 200 in well under a second. The fifteen seconds only
+    bit after a failure, and the defect was that the failure was invisible.
+
+    Also: the latency histogram covered two populations, since `ObserveLatency`
+    ran in the `defer` for every request including 401s and policy refusals that
+    complete in microseconds. `latencyBounds` starts at 5 with no lower edge on
+    the first bucket, so enough of them interpolated the median below zero --
+    the `P50 = -5 ms` in item 5. It now measures only requests that reached a
+    provider.
+
+    `make dev-up` and `make dev-smoke` were verified from a clean state after
+    these changes: 37 seconds to a provisioned stack, then `OK: request
+    traversed client -> gateway -> signed policy -> provider`. A `devstack` job
+    in `.github/workflows/ci.yml` now runs both on every push, which nothing did
+    before -- the one path a newcomer takes was the least protected thing in the
+    repository, and it can only rot silently, because whoever would notice
+    already has warm images and a populated `.dev/env`.
+
+21. **The local stack only ran in a directory called `switchboard`, and the CI
+    job added to protect it found that on its first run.**
+
+    Docker Compose derives its project name from the working directory and every
+    container name follows. `scripts/dev-up.sh`, `scripts/dev-smoke.sh` and
+    `docs/LOCAL.md` all name the namespace container directly -- they have to,
+    because `docker compose run` cannot attach to a service using
+    `network_mode: service:` -- so any checkout not named exactly `switchboard`
+    produced `<dir>-taskns-1` and every reference missed with
+    `No such container: switchboard-taskns-1`.
+
+    `git clone` from the sidecar remote produces `switchboard-sidecar/`, so the
+    documented first command did not work for anyone who cloned that repository
+    normally. It went unnoticed for the reason these things always do: the person
+    most likely to run it had cloned into a directory that happened to match.
+
+    The evidence is unusually clean. The same two commits passed `verify` on
+    `Grace/switchboard` and failed it on `Grace/switchboard-sidecar` -- identical
+    SHAs, different checkout directory, and `actions/checkout` names the directory
+    after the repository. Fixed by pinning `name: switchboard` in
+    `docker-compose.dev.yml`, which makes the project name independent of where
+    the repository sits and leaves all three existing references correct.
+
+    Verified by reproducing the CI condition rather than reasoning about it: a
+    worktree in a directory literally named `switchboard-sidecar` failed exactly
+    as CI did before the change and ran clean through `make dev-smoke` after it,
+    and the original directory still does both.
+
 ## Still open
 
 1. **Deployment is proven for the quickstart only.** `quickstart.yaml` has been
@@ -264,14 +366,24 @@ Each of these is backed by a run recorded in `docs/VALIDATION.md`.
    about half the requests, so the median still lands inside it. Lowering the
    floor again would move the problem rather than remove it.
 
-   The cause underneath is that one histogram measures two populations: requests
-   that reached a provider and took tens of milliseconds or more, and requests
-   refused locally in microseconds. `ObserveLatency` is called from a `defer` in
-   `Server.chat`, so every rejection sits in there alongside the inference.
-   Splitting them, or excluding requests that never reached a provider, is what
-   would make a median mean something; that is a design change and is not done.
-   Until then read the tail, read the heatmap for shape, and do not put a latency
-   SLO on the median. The board panel says so on its face.
+   The cause underneath was that one histogram measured two populations:
+   requests that reached a provider and took tens of milliseconds or more, and
+   requests refused locally in microseconds. `ObserveLatency` was called from a
+   `defer` in `Server.chat`, so every 401, rate-limit rejection, policy refusal
+   and idempotent replay sat in there alongside the inference.
+
+   **Since fixed, and this paragraph used to say it was not.** `ObserveLatency`
+   now runs only when `event.Attempts > 0` -- incremented immediately before each
+   upstream call, so it is exactly "did this request reach a provider". Item 20
+   records the change. The two entries contradicted each other for as long as it
+   took to notice, which is the failure mode this file exists to prevent, so it
+   is worth saying plainly rather than quietly editing.
+
+   The structural residue above still applies to whatever remains below the
+   lowest bound, and the numbers quoted are from before the fix. They have not
+   been re-measured against real traffic, because there is none. Read the tail
+   and the heatmap for shape until a deployment produces enough requests to say
+   whether the median now means something.
 
    **Traces carried a correct error signal that nothing could consume.** Spans
    set the OTLP status to `code: 2` on any 4xx or 5xx and always had, and it
@@ -377,10 +489,16 @@ Each of these is backed by a run recorded in `docs/VALIDATION.md`.
    a deployment. This does not touch AWS Marketplace billing, which meters per
    task-hour rather than per token; it is the `usage` block returned to callers,
    and anything built on it for cost attribution.
-8. **Reasoning models constrain `temperature`.** They reject any value other
-   than the default. `Chat.Temperature` is optional and was nil throughout
-   testing, so this has not been hit, but a caller setting it against a
-   reasoning model would get a 400. Not fixed blind.
+8. **Reasoning models constrain `temperature` -- since handled, and this entry
+   was stale.** They reject any value other than the default. This said "not
+   fixed blind" long after it was fixed: `internal/gateway/temperature.go` and
+   the retry path in `server.go` now detect the refusal from the provider's own
+   wording, resend once without the field, remember the model for six hours in a
+   bounded table keyed `{provider, model}`, and count
+   `switchboard_temperature_dropped_total` so the substitution is visible rather
+   than silent. What remains genuinely open is narrower: the phrase list is
+   lifted from real refusals and has no version to pin, so a provider rewording
+   its message costs one failed request before the table relearns.
 9. **Bedrock streaming, verified against the real service.** All four providers
    stream. Bedrock's AWS event-stream framing is translated into server-sent
    events at the provider boundary by `bedrockSSE`, so the generation deadline,
@@ -563,6 +681,119 @@ Each of these is backed by a run recorded in `docs/VALIDATION.md`.
     `preferred`, so the first thing an OpenAI SDK user types fails. That is the
     signed policy doing its job, and `LOCAL.md` now says so at the point the
     reader meets it.
+
+18. **The request surface excludes every agentic workload, and this file did not
+    say so.** `Chat` (`adapter.go:21-27`) models five fields and `strictJSON`
+    (`policy.go:44-54`) sets `DisallowUnknownFields`, so `tools`, `tool_choice`,
+    `functions`, `response_format`, `top_p`, `n`, `stop`, `seed` and
+    `stream_options` are all a hard 400. `role: "tool"` and assistant
+    `tool_calls` are rejected too (`adapter.go:44`), so a tool loop cannot be
+    carried even if the tools were declared elsewhere. No MCP host, no coding
+    agent, no RAG-with-tools and no extraction pipeline can sit behind this
+    gateway.
+
+    The response side is fail-closed to match, in five places
+    (`adapter.go:311`, `:361`, `:335-345`, `:400-403`, `bedrock.go:331`,
+    `:254`), plus `finish()` (`adapter.go:173`) which whitelists finish reasons
+    so `tool_calls` fails independently of the guards. Item 9's note that
+    Bedrock "tool and reasoning blocks are refused rather than flattened" is the
+    same gap seen from the provider side.
+
+    The rejection itself is correct and deliberate. What was wrong is that this
+    file was silent about it while `README.md:15` sends deployment readers here.
+    The disclosure existed only at `README.md:40` and at the end of an
+    idempotency paragraph in `docs/API.md`. `docs/API.md` now carries an
+    "Unsupported request surface" section above the endpoint table and
+    `README.md:15` points at it.
+
+    A second, smaller honesty problem in the same area: the control-plane RBAC
+    role named `agent` (`docs/API.md`, `app.py:39`) is a principal that reads
+    policy and ingests telemetry. It has nothing to do with AI agents, and a
+    reader skimming the role table could reasonably conclude the opposite. Now
+    stated inline.
+
+19. **Policy schema-version negotiation, fixed; one precondition remains.** The
+    verifier tested `p.Schema != policySchema` -- exact equality -- while the
+    gateway advertises `max_schema=policySchema` and the control plane honours
+    that as a ceiling (`schema<=%s`). A build with `policySchema = 2` would have
+    asked for "2 or lower", been correctly served a tenant's newest schema-1
+    policy, and rejected it; every gateway would then have served its cached copy
+    and gone 503 when that expired, up to seven days later, fleet-wide -- the
+    exact outcome the `max_schema` mechanism exists to prevent. Never reachable,
+    because `controlplane/policy.py` refuses to sign anything but schema 1.
+
+    Now `schemaSupported(n, ceiling)`, a range. The ceiling is a parameter rather
+    than a direct read of the constant so the behaviour is testable today: at
+    `policySchema = 1` a range and an equality are indistinguishable, so a test
+    pinned to today's value could not tell the fix from the bug. Strict on write
+    and permissive downward on read is deliberate -- signing an unknown schema is
+    a mistake, verifying an older one is the job.
+
+    **The precondition, for whoever ships a schema 2.** `Canonical()`
+    hand-enumerates one field set and `verify()` requires
+    `bytes.Equal(b, Canonical(p))`, so it must dispatch on `p.Schema` before two
+    schemas can both verify. Python's `canonical()` is generic and needs no
+    change. Everything else hardcoding the version or the field set:
+    `controlplane/policy.py`, `controlplane/policytool.py`,
+    `scripts/devstack.py`, `docs/DEPLOYMENT.md`, `003_policy_schema.sql`, the
+    signed `testdata/` fixtures (regenerated by hand, see the note in
+    `policy_test.go`), and `controlplane/tests/test_policy.py`, which asserts
+    that schema 2 raises. Generate v2 fixtures **empty-list first, one-entry
+    second**: a nil Go slice marshals to `null` where Python's `json.dumps([])`
+    emits `[]`, and the checked-in fixtures would not catch it.
+
+20. **Three defects recorded rather than fixed, with the reasoning.**
+
+    **`idemStore.Sweep` holds the store mutex across a full `os.ReadDir` and an
+    unbounded delete loop**, and runs every minute while `begin`/`finish`/`write`
+    contend on the same mutex on the request path. `capture.go` documents this
+    exact pattern as one it deliberately avoided -- "inherited from
+    idempotency.go" -- and added both an unlocked scan and a `sweepPerPass`
+    bound; the idempotency store got neither. Left because it is reachable only
+    with `idempotency_ttl_seconds` set, which is off by default. The fix is to
+    copy what `capture.go` already does.
+
+    **Bedrock `usage` aliases the decoder's reused scratch buffer.**
+    `translateBedrockStream` retains `msg.Payload` from the `metadata` event, and
+    the vendored eventstream decoder builds payloads over the caller's buffer, so
+    the next `Decode` overwrites it in place. Benign only because Bedrock sends
+    `metadata` last and no further decode succeeds. It becomes silent billing
+    corruption -- wrong token counts returned to the caller, no error -- the day
+    AWS emits anything after `metadata` or reorders it before `messageStop`.
+
+    **A stream that fails before its first byte reports 200 to the client and 502
+    to telemetry.** `stream()` writes an SSE error frame, implicitly committing
+    HTTP 200, while `chat()` sets `event.Status = 502`, so the span carries
+    `error.type` and a 502 status code for a request the client observed as a
+    200. Defensible as an SSE design -- the status is already sent and cannot be
+    withdrawn -- but the wire and the telemetry disagree, and anyone reading an
+    error rate is misled. Changing it would touch the streaming contract in
+    `docs/API.md`, so it is written down instead.
+
+21. **The enterprise carve-out is deferred, not dropped.** The project is
+    Apache 2.0 as of 2026-09-09, having gone MIT → Elastic License 2.0
+    (2026-09-07) → Apache. No `enterprise/` directory exists, deliberately: an
+    empty carve-out establishes nothing, and one added later costs nothing,
+    because it lives in `NOTICE` and `enterprise/LICENSE` and touches no
+    existing path.
+
+    The only current occupant would be `internal/gateway/marketplace.go` — 112
+    lines, three touchpoints in `config.go` and three in `cmd/gateway/main.go`.
+    Moving it needs a `//go:build enterprise` tag and a no-op stub so the
+    default build genuinely excludes it, which is a code change and not a
+    licence change. Everything else that might qualify is unbuilt.
+
+    The principle, when it arrives: **gate operational scale and billing, never
+    the security primitives.** The CEL layer, per-caller policy, and policy
+    signing and verification stay in the open tree regardless — a free version
+    that cannot enforce does not do what this project claims. Elastic made its
+    security features free in 2019 after sustained criticism for exactly this;
+    that is the precedent, not a hypothetical.
+
+    If the carve-out is adopted, keep Apache verbatim in `LICENSE` and put the
+    carve-out in `NOTICE`. A composite root `LICENSE` is why GitHub serves
+    highlight.io as `License-1` instead of an `Apache-2.0` badge. The ELv2 text
+    is recoverable at `git show f3d7236:LICENSE`.
 
 ## Blocked externally
 

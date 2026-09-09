@@ -10,6 +10,29 @@
 | `GET /metrics` | Loopback | Prometheus exposition; no secrets or prompts |
 | `GET /runtime` | Local bearer token | Readiness, policy version and expiry |
 
+### Unsupported request surface
+
+The gateway models five request fields and rejects everything else. This is
+deliberate -- unknown fields fail validation rather than being silently dropped,
+so a caller never gets a response that quietly ignored what they asked for --
+but it is a hard cap on what can run behind it, and it is easier to discover
+here than from a 400.
+
+| Not supported | Consequence |
+|---|---|
+| `tools`, `tool_choice`, `functions` | **No agentic workload can use this gateway.** No MCP host, no coding agent, no RAG-with-tools, no extraction pipeline. |
+| Tool history: `role: "tool"`, assistant `tool_calls` | A tool loop cannot be carried even if the tools themselves were declared elsewhere. |
+| `response_format`, structured output | JSON-mode and schema-constrained output are unavailable. |
+| Multimodal content (`content` as an array of parts) | Text only. `content` must be a string. |
+| `top_p`, `n`, `stop`, `seed`, `logprobs`, `stream_options`, provider-specific options | Rejected as unknown fields. |
+| Responses API, embeddings, reranking, moderation, batch | Only `POST /v1/chat/completions` exists. |
+
+Supported: `model` (which must be the literal `"preferred"`), `messages`,
+`stream`, `max_tokens`, and `temperature` in the portable 0-1 subset. Roles are
+`system` (first message only), `user`, and `assistant`, with 1-128 messages, and
+the last message must be `user`. Plain multi-turn chat works; only the tool loop
+does not.
+
 Readiness deliberately does not depend on the control plane, telemetry delivery or provider health checks. It cannot promise that an external provider is currently reachable. Liveness is distinct from readiness.
 
 Streaming emits OpenAI-style `chat.completion.chunk` objects with stable generated ID, model, creation time, choice index, text delta and finish reason. Successful termination has exactly one `[DONE]`. Midstream failure emits an `error` object and closes without `[DONE]`; the already-sent HTTP status cannot change. Clients must regard EOF without `[DONE]` as failure and not automatically replay it.
@@ -22,7 +45,9 @@ OpenAI uses Chat Completions, Anthropic uses Messages, and Gemini uses `generate
 |---|---|
 | Provider not configured or circuit open | Skip before sending |
 | HTTP 429 or 503, before acceptance | Yes, if retry budget and attempt cap permit |
-| HTTP 400, 401, 403, 404, 422, 500, 502, 504 or redirect | No |
+| HTTP 401, 403 or 404, before acceptance | Yes. Refused before generation, so nothing was billed, and the refusal is specific to one provider: a key rotated at one says nothing about another, and a model one provider retired is not a model every provider retired. The refusing provider is then withheld for 60 seconds rather than retried on every request. |
+| HTTP 400, 422 | No. The caller's request is malformed and would fail identically everywhere. The provider's own words are carried back. |
+| HTTP 500, 502, 504 or redirect | No. The provider may have accepted the request and failed partway through generating it, so replaying it could be charged twice. It does count toward opening the circuit breaker. |
 | Transport error or timeout | No: server may already have accepted generation |
 | HTTP 200 with malformed/unsupported body | No |
 | Stream accepted then interrupted | No |
@@ -46,7 +71,7 @@ With it enabled, a key gives you this and no more:
 
 A replayed stream carries the same answer, not the original frame timing: it arrives as one chunk followed by `[DONE]`.
 
-Disable automatic SDK retries (`max_retries=0` in the OpenAI Python client) whether or not you use keys; the gateway never replays upstream on your behalf. Use application operation IDs and an application-owned transactional outbox for external side effects. Tools are entirely unsupported, including tool history, so no tool invocation can be silently translated or executed here.
+Disable automatic SDK retries (`max_retries=0` in the OpenAI Python client) whether or not you use keys; the gateway never replays upstream on your behalf. Use application operation IDs and an application-owned transactional outbox for external side effects. Tools are entirely unsupported, including tool history, so no tool invocation can be silently translated or executed here; see [unsupported request surface](#unsupported-request-surface).
 
 ## Control plane
 
@@ -54,7 +79,7 @@ Every protected call derives tenant and role from a hashed bearer credential. Te
 
 | Role | Capabilities |
 |---|---|
-| `agent` | Read policy; ingest telemetry |
+| `agent` | Read policy; ingest telemetry. A control-plane principal -- unrelated to AI agents, which this gateway does not support; see above. |
 | `viewer` | Read policy, recent telemetry and audit |
 | `publisher` | Read/publish policy and read telemetry |
 | `admin` | Read/publish policy, read telemetry/audit, create and revoke principals |

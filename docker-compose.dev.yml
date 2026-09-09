@@ -7,6 +7,20 @@
 # talks over localhost. `taskns` stands in for the task.
 #
 # Postgres sits outside that namespace on the default network, as RDS would.
+
+# Pinned, because Compose otherwise derives the project name from the directory
+# and every container name follows it. The scripts and docs name the namespace
+# container directly -- they have to, since `docker compose run` cannot attach to
+# a service using network_mode: service: -- so a checkout in any directory not
+# called `switchboard` produced `<dir>-taskns-1` and every one of those
+# references missed.
+#
+# That is not hypothetical: `git clone` from the sidecar remote yields
+# `switchboard-sidecar/`, and the local stack could not start there. It went
+# unnoticed because the person most likely to run it had cloned into a directory
+# that happened to match. The devstack CI job found it on its first run.
+name: switchboard
+
 services:
   postgres:
     image: postgres:17

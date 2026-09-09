@@ -201,6 +201,11 @@ type Server struct {
 	// 503 until the process restarted. Only consulted when ProviderCheckStrict.
 	unhealthyMu sync.Mutex
 	unhealthy   map[string]bool
+	// syncState is the last reported policy-sync outcome, "" meaning healthy. It
+	// exists so a failure is logged when it starts and when it clears, rather
+	// than once every fifteen seconds forever: a control plane that is down stays
+	// down, and 5,760 identical lines a day buries the one line that mattered.
+	syncState atomic.Value
 }
 
 func New(c Config, p *PolicyStore, m *Metrics, t *Telemetry) *Server {
@@ -211,17 +216,49 @@ func New(c Config, p *PolicyStore, m *Metrics, t *Telemetry) *Server {
 // not consider the startup provider check: one broken provider is precisely the
 // situation failover exists for, and refusing to serve would turn a degraded
 // deployment into an unavailable one.
-func (s *Server) ready() bool {
-	p := s.Policies.Current()
-	if s.Draining.Load() || p == nil {
-		return false
+func (s *Server) ready() bool { return s.notReady() == "" }
+
+// notReady answers the same question as ready(), phrased so the answer can be
+// handed to whoever asked. Every distinct cause used to present as one
+// empty-bodied 503, which is the least useful thing a first run can produce: a
+// wrong trust key, an unregistered control token, a tenant with no published
+// policy and a policy that quietly expired were indistinguishable.
+func (s *Server) notReady() string {
+	if s.Draining.Load() {
+		return "draining"
 	}
-	for _, r := range p.Routes {
-		if _, ok := s.C.Providers[r.Provider]; ok {
-			return true
+	if p := s.Policies.Current(); p != nil {
+		for _, r := range p.Routes {
+			if _, ok := s.C.Providers[r.Provider]; ok {
+				return ""
+			}
 		}
+		return fmt.Sprintf("policy v%d names no provider this gateway has configured", p.Version)
 	}
-	return false
+	if s.Policies.Expired() {
+		return "the cached policy expired and no newer one has been accepted"
+	}
+	// No policy at all. The sync state, when there is one, is the actual cause.
+	if reason, _ := s.syncState.Load().(string); reason != "" {
+		return "no policy yet: " + reason
+	}
+	if s.C.ControlURL == "" {
+		return "no policy: none cached, and no control plane is configured to fetch one"
+	}
+	return "no policy yet: waiting for the first control-plane sync to succeed"
+}
+
+// readyzReason is notReady plus the strict-mode provider check. Kept separate
+// for the reason readyz() documents: gating ready() on the provider check
+// deadlocks recovery.
+func (s *Server) readyzReason() string {
+	if r := s.notReady(); r != "" {
+		return r
+	}
+	if s.C.ProviderCheckStrict && s.anyUnhealthy() {
+		return "a configured provider failed its startup check and provider_check_strict is set"
+	}
+	return ""
 }
 
 // readyz answers a different question from ready: not "can I serve this
@@ -232,12 +269,7 @@ func (s *Server) ready() bool {
 // Keeping the two separate matters. Gating ready() on the same condition
 // deadlocked recovery: the gateway refused every request, and the only thing
 // that clears a failed check is a request succeeding.
-func (s *Server) readyz() bool {
-	if !s.ready() {
-		return false
-	}
-	return !(s.C.ProviderCheckStrict && s.anyUnhealthy())
-}
+func (s *Server) readyz() bool { return s.readyzReason() == "" }
 func (s *Server) markUnhealthy(provider string) {
 	s.unhealthyMu.Lock()
 	defer s.unhealthyMu.Unlock()
@@ -267,8 +299,13 @@ func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(200) })
 	mux.HandleFunc("GET /readyz", func(w http.ResponseWriter, r *http.Request) {
-		if !s.readyz() {
+		if reason := s.readyzReason(); reason != "" {
+			// A body, because an empty 503 is indistinguishable between a wrong
+			// trust key, an unregistered control token, a tenant with no policy
+			// and a policy that expired. Loopback-only, so this is not exposure.
+			w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 			w.WriteHeader(503)
+			io.WriteString(w, reason+"\n")
 			return
 		}
 		w.WriteHeader(200)
@@ -306,10 +343,12 @@ func (s *Server) Handler() http.Handler {
 		p := s.Policies.Current()
 		w.Header().Set("Content-Type", "application/json")
 		if p == nil {
-			w.Write([]byte(`{"ready":false}`))
+			w.Write(jsonBytes(map[string]any{"ready": false, "serving": false,
+				"reason": s.readyzReason()}))
 			return
 		}
 		w.Write(jsonBytes(map[string]any{"ready": s.readyz(), "serving": s.ready(),
+			"reason":         s.readyzReason(),
 			"policy_version": p.Version, "policy_expires_at": p.ExpiresAt}))
 	})
 	return mux
@@ -320,7 +359,14 @@ func (s *Server) authorized(r *http.Request) bool {
 	return subtle.ConstantTimeCompare(a[:], b[:]) == 1
 }
 func problem(w http.ResponseWriter, status int, msg string) {
-	w.Header().Set("Content-Type", "application/json")
+	// stream() sets these before reading a frame, and a stream that produced
+	// nothing fails over and can end here instead -- shipping a JSON error body
+	// labelled as an unbuffered event stream. Only Content-Type was being
+	// overwritten, so the other two leaked through.
+	h := w.Header()
+	h.Del("Cache-Control")
+	h.Del("X-Accel-Buffering")
+	h.Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	w.Write(jsonBytes(map[string]any{"error": map[string]any{"message": msg, "type": "switchboard_error", "code": status}}))
 }
@@ -378,7 +424,22 @@ func (s *Server) chat(w http.ResponseWriter, r *http.Request) {
 	var capturedText string
 	defer func() {
 		event.End = time.Now().UnixNano()
-		s.Metrics.ObserveLatency(time.Since(start).Milliseconds())
+		// Only requests that actually reached a provider. This histogram is meant
+		// to describe inference latency, and it was measuring two populations at
+		// once: an unauthorized request, a rate-limit rejection, a policy refusal
+		// and an idempotent replay all complete in microseconds without contacting
+		// anyone, and they outnumber real inferences in exactly the deployments
+		// most likely to look at the graph.
+		//
+		// The visible symptom was a median of -5 ms. latencyBounds starts at 5 and
+		// an explicit-bounds histogram has no lower edge on its first bucket, so a
+		// mass of sub-millisecond local rejections interpolates below zero.
+		// docs/GAPS.md item 5 records it, and names splitting the populations as
+		// the fix. event.Attempts is incremented immediately before each upstream
+		// call, so it is exactly "did this request reach a provider".
+		if event.Attempts > 0 {
+			s.Metrics.ObserveLatency(time.Since(start).Milliseconds())
+		}
 		if event.Status >= 400 {
 			s.Metrics.Errors.Add(1)
 		}
@@ -663,12 +724,46 @@ func (s *Server) chat(w http.ResponseWriter, r *http.Request) {
 					s.circuits[route.Provider].cooldown(wait)
 				}
 				continue
+			case faultRefused:
+				// Credentials, access or a missing model. The provider is healthy
+				// and this deployment's access to it is not, which is the same
+				// shape as faultAccount: withhold it rather than count it against
+				// provider health, and fail over to a route that may work.
+				//
+				// The cooldown matters as much as the failover. Without it a
+				// rotated key means every single request pays a doomed round trip
+				// to the same provider first. ProbeProviders already does exactly
+				// this at startup (see the cooldown below markUnhealthy).
+				s.circuits[route.Provider].cooldown(max(wait, accountCooldown))
+				s.Metrics.RefusedFailover.Add(1)
+				slog.Warn("provider refused the request; failing over", "request_id", id,
+					"provider", route.Provider, "model", route.Model, "status", status,
+					"reason", providerReason(errBody))
+				continue
 			}
-			// Terminal: this request would fail the same way at every provider,
-			// so failing over would only multiply the waste. Carry the
-			// provider's own words, because "provider rejected request" made a
-			// token-budget problem indistinguishable from a malformed one.
-			s.circuits[route.Provider].result(false)
+			// Terminal: not replayed. Two different things land here and they need
+			// opposite treatment by the breaker, which is why this is not one
+			// call. Carry the provider's own words either way, because "provider
+			// rejected request" made a token-budget problem indistinguishable
+			// from a malformed one.
+			//
+			// Neither branch may call result(false). That is the *success* path:
+			// it zeroes failures and clears the open-until deadline. Calling it
+			// here meant a provider returning 500 forever reset its own breaker on
+			// every request, so the breaker could never open no matter how many
+			// failures arrived.
+			if status == 400 || status == 422 {
+				// The caller's fault. Not evidence the provider is sick, and not
+				// evidence it is well, so leave the breaker's counters alone and
+				// only give back the half-open probe this attempt claimed.
+				s.circuits[route.Provider].release()
+			} else {
+				// 500, 502, 504 and anything unrecognised: the provider's fault.
+				// It counts toward opening the breaker even though this request is
+				// not replayed, because the next request should not be sent into
+				// the same failure.
+				s.circuits[route.Provider].result(true)
+			}
 			msg := "provider rejected request"
 			if reason := providerReason(errBody); reason != "" {
 				msg += ": " + reason
@@ -712,7 +807,7 @@ func (s *Server) chat(w http.ResponseWriter, r *http.Request) {
 				event.Status = 502
 				idemSettled = s.settleUnknown(idemKey, hashBody(b))
 			} else {
-				s.budgets.observe(route.Provider, route.Model, c.MaxTokens, streamed.text != "")
+				s.budgets.observeOutcome(route.Provider, route.Model, c.MaxTokens, streamed.finish, streamed.text)
 				if len(empties) > 0 {
 					s.Metrics.EmptyCompletionRecovered.Add(1)
 				}
@@ -766,7 +861,7 @@ func (s *Server) chat(w http.ResponseWriter, r *http.Request) {
 				"max_tokens", c.MaxTokens, "reasoning_tokens", n.Reasoning)
 			continue
 		}
-		s.budgets.observe(route.Provider, route.Model, c.MaxTokens, true)
+		s.budgets.observeOutcome(route.Provider, route.Model, c.MaxTokens, n.Finish, n.Text)
 		if len(empties) > 0 {
 			s.Metrics.EmptyCompletionRecovered.Add(1)
 		}
@@ -1034,13 +1129,70 @@ func (s *Server) syncOnce(ctx context.Context) {
 	res, e := s.HTTP.Do(req)
 	if e != nil {
 		s.Metrics.PolicyErrors.Add(1)
+		s.noteSync("control plane unreachable", "error", e)
 		return
 	}
 	defer res.Body.Close()
 	b, e := io.ReadAll(io.LimitReader(res.Body, 65537))
-	if e != nil || res.StatusCode != 200 || s.Policies.Apply(b, true) != nil {
+	if e != nil {
 		s.Metrics.PolicyErrors.Add(1)
+		s.noteSync("control plane response could not be read", "error", e)
+		return
 	}
+	if res.StatusCode != 200 {
+		s.Metrics.PolicyErrors.Add(1)
+		s.noteSync("control plane refused the policy request",
+			"status", res.StatusCode, "hint", syncHint(res.StatusCode))
+		return
+	}
+	// Apply distinguishes eight failures -- invalid envelope, untrusted signing
+	// key, invalid signature, noncanonical policy, invalid policy constraints,
+	// invalid route, policy rollback, version equivocation -- and every one of
+	// them used to be discarded here in favour of a single counter increment.
+	// A wrong trust key and an unreachable control plane looked identical: both
+	// produced an empty-bodied 503 from /readyz, forever, in silence.
+	if e := s.Policies.Apply(b, true); e != nil {
+		s.Metrics.PolicyErrors.Add(1)
+		s.noteSync("policy rejected", "error", e)
+		return
+	}
+	s.noteSync("")
+}
+
+// syncHint turns a control-plane status into the thing to go and check. These
+// are the first-run misconfigurations, and without them the operator has a
+// number and no next step.
+func syncHint(status int) string {
+	switch status {
+	case 401:
+		return "the control token is wrong, unregistered, or its principal has been revoked or expired"
+	case 403:
+		return "this principal exists but lacks the agent role"
+	case 404:
+		return "no policy has been published for this tenant yet"
+	case 503:
+		return "the control plane reached an internal fault; check its own logs"
+	}
+	return "see the control plane's logs for this request"
+}
+
+// noteSync reports a change in policy-sync health, and says nothing when nothing
+// changed. reason is "" for success.
+func (s *Server) noteSync(reason string, args ...any) {
+	prev, _ := s.syncState.Load().(string)
+	if prev == reason {
+		return
+	}
+	s.syncState.Store(reason)
+	if reason == "" {
+		// Only interesting as a recovery, which is why it is not logged on the
+		// first successful poll of a healthy start.
+		if prev != "" {
+			slog.Info("policy sync recovered")
+		}
+		return
+	}
+	slog.Error("policy sync failed", append([]any{"reason", reason}, args...)...)
 }
 func Healthcheck(addr string) int {
 	c := client(2 * time.Second)

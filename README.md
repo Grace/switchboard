@@ -12,7 +12,31 @@ It runs beside your application in the same task, exposes one OpenAI-compatible
 endpoint on loopback, and routes to OpenAI, Anthropic or Gemini according to a
 signed policy it cannot itself edit.
 
-**Release status: production-oriented release candidate, not production-certified.** This is a fresh implementation of the Switchboard architecture and has not been verified for compatibility with any earlier version's implementation or persisted data. Read [validation](docs/VALIDATION.md) and [remaining gaps](docs/GAPS.md) before deployment.
+**Release status: production-oriented release candidate, not production-certified.** This is a fresh implementation of the Switchboard architecture and has not been verified for compatibility with any earlier version's implementation or persisted data. Read [validation](docs/VALIDATION.md) and [remaining gaps](docs/GAPS.md) before deployment, and the [unsupported request surface](docs/API.md#unsupported-request-surface) before assuming an OpenAI-compatible client will work unchanged.
+
+## Try it
+
+Docker is the only prerequisite. No AWS account, no provider API key, no cost:
+the stack runs against a mock provider, and everything a real deployment needs —
+an Ed25519 signing key, a database, a tenant, and a **signed routing policy** —
+is generated for you.
+
+```sh
+make dev-up      # build, generate keys, migrate, provision, start
+make dev-smoke   # send a real completion through the whole path
+make dev-down    # remove the containers and volumes
+```
+
+`dev-smoke` prints `OK: request traversed client -> gateway -> signed policy ->
+provider` when the whole chain works. It is idempotent, so `make dev-up` is safe
+to re-run.
+
+Two things that surprise people, both deliberate: the gateway is **not**
+reachable from your host — it binds loopback inside a shared container network
+namespace, exactly as it would inside an ECS task — and `model` must be the
+literal string `"preferred"`, because the signed policy chooses the model rather
+than the caller. See [local development](docs/LOCAL.md), which also covers going
+from the mock to a real provider without a control plane.
 
 ## What is implemented
 
@@ -44,12 +68,14 @@ Only `model`, `messages`, `stream`, `max_tokens`, and `temperature` are supporte
 Go 1.27 (or newer supported Go release) and Python 3.14:
 
 ```sh
-go test -race ./...
-go build -o bin/gateway ./cmd/gateway
 python -m venv .venv
 .venv/bin/pip install -r controlplane/requirements-dev.txt
-.venv/bin/python -m unittest controlplane.tests.test_policy
+make test          # go test -race ./... and the Python suite
+make build         # writes bin/gateway
 ```
+
+`make test` is the single source of truth for how the suites are run; invoke the
+tools directly only if you need to narrow a run.
 
 The Postgres tests need a **disposable dedicated cluster** and `TEST_DATABASE_URL`; they create schema and roles. CI supplies Postgres automatically and runs these tests. `SWITCHBOARD_IN_MEMORY_TESTS=1 go test -race ./...` uses an in-process HTTP transport when sockets are unavailable; this does not validate real network behavior.
 

@@ -77,11 +77,14 @@ func main() {
 		os.Exit(gateway.Healthcheck(c.Listen))
 	}
 	if e = os.MkdirAll(c.DataDir, 0700); e != nil {
-		fatal("data directory unavailable")
+		fatal("data directory unavailable", "data_dir", c.DataDir, "error", e)
 	}
 	lock, e := os.OpenFile(filepath.Join(c.DataDir, ".lock"), os.O_CREATE|os.O_RDWR, 0600)
-	if e != nil || syscall.Flock(int(lock.Fd()), syscall.LOCK_EX|syscall.LOCK_NB) != nil {
-		fatal("data directory already in use or not writable")
+	if e != nil {
+		fatal("data directory not writable", "data_dir", c.DataDir, "error", e)
+	}
+	if e = syscall.Flock(int(lock.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); e != nil {
+		fatal("data directory already in use by another gateway", "data_dir", c.DataDir, "error", e)
 	}
 	defer lock.Close()
 	p := c.Store()
@@ -90,7 +93,7 @@ func main() {
 			fatal("cached policy invalid", "error", e)
 		}
 	} else if !os.IsNotExist(e) {
-		fatal("cannot read policy cache")
+		fatal("cannot read policy cache", "path", p.Path, "error", e)
 	} else if c.ControlURL == "" {
 		// File-only operation with nothing to serve. Failing here says so;
 		// starting would leave /readyz at 503 forever with nothing to poll and
@@ -128,7 +131,7 @@ func main() {
 	m := &gateway.Metrics{LogDropped: &logs.Dropped}
 	t, e := gateway.NewTelemetry(c, m)
 	if e != nil {
-		fatal("telemetry initialization failed")
+		fatal("telemetry initialization failed", "error", e)
 	}
 	background, stop := context.WithCancel(context.Background())
 	s := gateway.New(c, p, m, t)
@@ -225,8 +228,7 @@ func main() {
 	}
 	slog.Info("gateway started", "tenant", c.Tenant, "listen", c.Listen)
 	if e = srv.ListenAndServe(); e != nil && e != http.ErrServerClosed {
-		fatal("listener failed")
-		stop()
+		fatal("listener failed", "listen", c.Listen, "error", e)
 	}
 	<-background.Done()
 	done := make(chan struct{})

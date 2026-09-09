@@ -11,9 +11,15 @@ check:
 	go vet ./...
 	go test -race ./...
 
+# Prefer the repository venv when it exists, so `make test` behaves the same
+# whether or not it has been activated. README.md tells the reader to create one;
+# without this, `make test` used whatever python was on PATH and failed on a
+# missing pytest rather than on anything to do with the code.
+PYTHON ?= $(shell [ -x .venv/bin/python ] && echo .venv/bin/python || echo python3)
+
 test:
 	go test -race ./...
-	python -m pytest controlplane/tests -v
+	$(PYTHON) -m pytest controlplane/tests -v
 build:
 	mkdir -p bin
 	CGO_ENABLED=0 go build -trimpath -o bin/gateway ./cmd/gateway
@@ -25,5 +31,9 @@ dev-smoke:
 	./scripts/dev-smoke.sh
 dev-down:
 	./scripts/dev-down.sh
+# Sources .dev/env for the same reason dev-up.sh does: compose interpolates
+# ${APP_DB_PASSWORD} from the shell, not from env_file, so without this every
+# invocation prints a "variable is not set" warning that reads like a fault.
 dev-logs:
+	@set -a; [ -f .dev/env ] && . ./.dev/env; set +a; \
 	docker compose -f docker-compose.dev.yml logs -f gateway controlplane

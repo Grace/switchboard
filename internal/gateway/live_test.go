@@ -104,10 +104,28 @@ func (p liveProvider) send(t *testing.T, c Chat) *http.Response {
 			// serve this request right now, not that the adapter is wrong.
 			// Retrying keeps the test measuring what it is meant to measure.
 			// Gemini in particular enforces a short per-minute quota.
-			if res.StatusCode != 503 && res.StatusCode != 429 {
+			//
+			// But not every 429 is capacity. classify() already distinguishes a
+			// rate limit from an account that cannot serve at all -- no credits,
+			// quota exhausted, balance too low -- and that second kind never
+			// clears by waiting. Retried three times and then skipped, it
+			// reported the suite green while every request was failing for
+			// billing reasons, which is exactly what this file refuses to do a
+			// hundred lines below: "Not Skip: skipping here reported the parent
+			// test as PASS when every request was failing authentication."
+			if res.StatusCode == 429 {
+				body, _ := io.ReadAll(io.LimitReader(res.Body, 1<<16))
+				res.Body.Close()
+				if accountExhausted(body) {
+					t.Fatalf("%s: the account cannot serve: %s\n"+
+						"This is a billing state, not provider capacity. Waiting will not clear it.",
+						p.name, providerReason(body))
+				}
+			} else if res.StatusCode != 503 {
 				return res
+			} else {
+				res.Body.Close()
 			}
-			res.Body.Close()
 		}
 		if attempt == liveRetries {
 			if err != nil {

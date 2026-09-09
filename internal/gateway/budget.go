@@ -78,7 +78,35 @@ func (b *budgetTable) skip(provider, model string, budget int) bool {
 	return f.okAt == 0 || budget < f.okAt
 }
 
-// observe records what a budget actually produced at a model.
+// observeOutcome records what a completed response says about this model's token
+// budget, and stays silent when it says nothing.
+//
+// "No text" has two unrelated causes and only one of them is a budget fact. A
+// model that hit its ceiling before writing anything -- finish "length", empty
+// text -- is exactly what this table exists to route around. A model that was
+// content-filtered, or that finished normally with nothing to say, produced no
+// text for a reason a larger budget would not fix.
+//
+// The two callers used to disagree about this and both were wrong, in opposite
+// directions. The streaming path passed producedText as text != "", so a single
+// content-filtered response set emptyAt and shadowed a healthy model for the
+// whole six-hour TTL -- and since ParseChat defaults max_tokens to 1024, that is
+// most default traffic. The non-streaming path passed true unconditionally, so
+// the same filtered response set okAt and silently disabled budget-aware routing
+// for that model instead. Neither used the predicate the empty-completion paths
+// a few lines away had already got right.
+func (b *budgetTable) observeOutcome(provider, model string, budget int, finish, text string) {
+	switch {
+	case text != "":
+		b.observe(provider, model, budget, true)
+	case finish == "length":
+		b.observe(provider, model, budget, false)
+	}
+}
+
+// observe records what a budget actually produced at a model. Prefer
+// observeOutcome at call sites that have a finish reason; this takes the
+// decision already made.
 func (b *budgetTable) observe(provider, model string, budget int, producedText bool) {
 	if budget <= 0 {
 		return

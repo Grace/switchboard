@@ -75,6 +75,35 @@ func (s *PolicyStore) Verify(raw []byte, now time.Time) (*Policy, error) {
 // seven days after the publish, across the whole fleet at once.
 const policySchema = 1
 
+// schemaSupported reports whether this build can verify a policy of this schema.
+//
+// It is a range, not an equality, and the difference is a fleet outage. The
+// gateway advertises its ceiling as GET /v1/policy?max_schema=policySchema
+// (see Sync in server.go), and the control plane honours that as a ceiling:
+// "WHERE tenant_id=%s AND schema<=%s ORDER BY version DESC LIMIT 1"
+// (controlplane/app.py). So a build with policySchema = 2 asks for "2 or lower"
+// and is legitimately served a tenant's newest schema-1 policy.
+//
+// The check here used to be p.Schema != policySchema, which refused exactly that
+// document. Every gateway in a fleet would have kept serving its cached copy and
+// gone 503 when that expired, up to seven days after the publish -- which is
+// precisely the delayed, silent, fleet-wide outage the max_schema mechanism was
+// built to prevent. Not reachable yet only because controlplane/policy.py
+// refuses to sign anything but schema 1.
+//
+// Strict on write, permissive downward on read. The asymmetry is deliberate:
+// signing an unknown schema is a mistake, verifying an older one is the job.
+//
+// When a schema 2 does ship, Canonical() must dispatch on p.Schema before this
+// can accept both, because it hand-enumerates one field set and verify()
+// requires bytes.Equal(b, Canonical(p)).
+//
+// The ceiling is a parameter rather than a direct read of policySchema so the
+// range behaviour is testable today. With policySchema at 1 a range and an
+// equality are indistinguishable, so a test that could not vary the ceiling
+// could not tell the fix from the bug.
+func schemaSupported(n, ceiling int) bool { return n >= 1 && n <= ceiling }
+
 func (s *PolicyStore) verify(raw []byte, now time.Time, allowExpired bool) (*Policy, error) {
 	var e Envelope
 	if len(raw) > 65536 || strictJSON(raw, &e) != nil {
@@ -99,7 +128,7 @@ func (s *PolicyStore) verify(raw []byte, now time.Time, allowExpired bool) (*Pol
 	if strictJSON(b, &p) != nil || !bytes.Equal(b, Canonical(p)) {
 		return nil, errors.New("noncanonical policy")
 	}
-	if p.Schema != policySchema || p.Tenant != s.Tenant || !identifier.MatchString(p.Tenant) || p.Version < 1 || p.Version > 9007199254740991 || p.IssuedAt > now.Unix()+60 || p.IssuedAt < 1 || (!allowExpired && p.ExpiresAt <= now.Unix()) || p.ExpiresAt <= p.IssuedAt || p.ExpiresAt-p.IssuedAt > 604800 || len(p.Routes) < 1 || len(p.Routes) > 4 {
+	if !schemaSupported(p.Schema, policySchema) || p.Tenant != s.Tenant || !identifier.MatchString(p.Tenant) || p.Version < 1 || p.Version > 9007199254740991 || p.IssuedAt > now.Unix()+60 || p.IssuedAt < 1 || (!allowExpired && p.ExpiresAt <= now.Unix()) || p.ExpiresAt <= p.IssuedAt || p.ExpiresAt-p.IssuedAt > 604800 || len(p.Routes) < 1 || len(p.Routes) > 4 {
 		return nil, errors.New("invalid policy constraints")
 	}
 	seen := map[string]bool{}
@@ -162,6 +191,18 @@ func (s *PolicyStore) Current() *Policy {
 	p.Routes = append([]Route(nil), p.Routes...)
 	return &p
 }
+
+// Expired reports whether a policy is cached but past its expiry. Distinct from
+// Current() == nil, which is also true when none was ever loaded, and the two
+// have entirely different remedies: publish a policy, versus find out why this
+// gateway stopped being able to fetch one. Without the distinction both present
+// as the same empty 503.
+func (s *PolicyStore) Expired() bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.current != nil && s.current.ExpiresAt <= time.Now().Unix()
+}
+
 func atomicFile(path string, b []byte) error {
 	f, err := os.CreateTemp(filepath.Dir(path), ".pending-")
 	if err != nil {

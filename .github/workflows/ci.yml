@@ -116,3 +116,29 @@ jobs:
             exit 1
           fi
           echo "All commits signed off."
+
+  # The first-run path, exercised from clean. Nothing checked it before, so the
+  # one route a newcomer takes was the least protected thing in the repository --
+  # and it can only rot silently, because whoever would notice already has warm
+  # images and a populated .dev/env, which are the two things a newcomer does not.
+  #
+  # `containers` above proves both images build. This proves they run, find each
+  # other in the shared namespace, apply migrations, provision a tenant, sign a
+  # policy, and serve a completion through it.
+  devstack:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: Bring the local stack up
+        run: make dev-up
+      - name: Prove a request traverses the whole path
+        run: make dev-smoke
+      # The failure this job exists to catch is one that leaves nothing on
+      # stdout, so the logs are the finding rather than a convenience.
+      - name: Container logs on failure
+        if: ${{ failure() }}
+        run: docker compose -f docker-compose.dev.yml logs --no-color --tail=200
+      - name: Tear down
+        if: ${{ always() }}
+        run: make dev-down

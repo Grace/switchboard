@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"slices"
 	"strings"
 )
 
@@ -26,13 +27,59 @@ type Chat struct {
 	Temperature *float64  `json:"temperature,omitempty"`
 }
 
+// supportedFields is the request surface named once, so an error can say which
+// of the caller's fields was refused. The message this replaces recited the
+// whole list and mentioned only tools and multimodal, while firing identically
+// for top_p, n, stop, seed, stream_options, user and response_format -- so a
+// caller who sent response_format was told about tools.
+var supportedFields = map[string]bool{
+	"model": true, "messages": true, "stream": true, "max_tokens": true, "temperature": true,
+}
+
+// parseHint turns a strict-decode failure into something the caller can act on.
+// It runs only on the error path, so a well-formed request pays nothing for the
+// second decode.
+func parseHint(b []byte, e error) string {
+	const supported = "Supported fields: model, messages, stream, max_tokens, temperature."
+	var top map[string]json.RawMessage
+	if json.Unmarshal(b, &top) != nil {
+		return "request body is not a JSON object: " + e.Error()
+	}
+	unknown := make([]string, 0, 4)
+	for k := range top {
+		if !supportedFields[k] {
+			unknown = append(unknown, k)
+		}
+	}
+	if len(unknown) > 0 {
+		slices.Sort(unknown)
+		// Bounded: the field names come from the caller, and this string reaches
+		// a response body and the log.
+		if len(unknown) > 5 {
+			unknown = append(unknown[:5], fmt.Sprintf("and %d more", len(unknown)-5))
+		}
+		return fmt.Sprintf("unsupported request field(s): %s. %s", strings.Join(unknown, ", "), supported)
+	}
+	// Only known field names, so the decode failed on a type. Content as an array
+	// of parts is by far the most common: every multimodal example sends it.
+	return "a supported field has an unsupported value; message content must be a plain string, " +
+		"not an array of content parts (" + e.Error() + ")"
+}
+
 func ParseChat(b []byte) (Chat, error) {
 	var c Chat
 	if e := strictJSON(b, &c); e != nil {
-		return c, errors.New("only model, messages, stream, max_tokens, temperature are supported; tools and multimodal content are not supported")
+		return c, errors.New(parseHint(b, e))
 	}
-	if c.Model != "preferred" || len(c.Messages) < 1 || len(c.Messages) > 128 {
-		return c, errors.New("model must be preferred; 1-128 messages required")
+	// Split from the message-count check below. Welded together, the first
+	// request an OpenAI SDK user ever sends -- model="gpt-4o" -- was answered
+	// with a sentence about message counts, which is not what went wrong.
+	if c.Model != "preferred" {
+		return c, fmt.Errorf("model must be the literal string \"preferred\", not %q; "+
+			"the signed routing policy chooses the provider and model, so the caller does not name one", c.Model)
+	}
+	if len(c.Messages) < 1 || len(c.Messages) > 128 {
+		return c, fmt.Errorf("1-128 messages required, got %d", len(c.Messages))
 	}
 	if c.MaxTokens == 0 {
 		c.MaxTokens = 1024

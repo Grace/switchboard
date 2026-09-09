@@ -20,6 +20,37 @@ func signed(t *testing.T, p Policy, key ed25519.PrivateKey, kid string) []byte {
 func testPolicy() Policy {
 	return Policy{Schema: 1, Tenant: "tenant-a", Version: 1, IssuedAt: time.Now().Unix() - 1, ExpiresAt: time.Now().Unix() + 3600, Routes: []Route{{"openai", "test-model"}, {"anthropic", "test-model"}, {"gemini", "test-model"}}}
 }
+
+// The contract between three files, stated once so it cannot drift again. The
+// gateway asks the control plane for max_schema=policySchema; the control plane
+// answers with the newest policy at or *below* that ceiling; so the verifier
+// must accept the whole range it advertises, not just its own version.
+//
+// The ceiling is passed in rather than read from policySchema precisely so this
+// test can vary it. At policySchema = 1 a range and an equality behave
+// identically, so a test pinned to today's value could not tell the fix from the
+// bug it replaces -- the {schema 1, ceiling 2} row is the whole point.
+func TestSchemaSupportedAcceptsTheRangeItAdvertises(t *testing.T) {
+	for _, tc := range []struct {
+		schema, ceiling int
+		want            bool
+	}{
+		{1, 2, true},  // the case the bug got wrong: a newer gateway, an older policy
+		{1, 3, true},  // and however far apart they drift
+		{2, 2, true},  // its own version
+		{1, 1, true},  // today
+		{3, 2, false}, // newer than this build can parse; refuse, do not guess
+		{2, 1, false},
+		{0, 1, false}, // not a schema, and never signed
+		{-1, 1, false},
+	} {
+		if got := schemaSupported(tc.schema, tc.ceiling); got != tc.want {
+			t.Errorf("schemaSupported(schema=%d, ceiling=%d) = %v, want %v",
+				tc.schema, tc.ceiling, got, tc.want)
+		}
+	}
+}
+
 func TestPolicyTrustAndRollback(t *testing.T) {
 	pub, key, _ := ed25519.GenerateKey(rand.Reader)
 	pub2, key2, _ := ed25519.GenerateKey(rand.Reader)

@@ -143,9 +143,24 @@ def create_app(pool=None, seed=None, key_id=None):
         request._body = b"".join(chunks)
         try:
             response = await call_next(request)
-        except Exception:
-            log.error(json.dumps({"event": "request_failed", "request_id": rid}))
-            response = JSONResponse({"detail": "service unavailable"}, status_code=503)
+        except Exception as exc:
+            # The type and the traceback, not just a request id. Without them a
+            # control plane whose database has drifted answers every gateway
+            # identically and names only an id, while the gateway's own policy
+            # sync counts an error -- between the two, nothing anywhere says what
+            # happened. exc_info goes to the handler so the traceback survives;
+            # the type and message go in the JSON so a log search can find them.
+            #
+            # The message is deliberately not returned to the caller: it can
+            # quote a DSN or a query. It goes to the operator's log only.
+            log.error(json.dumps({"event": "request_failed", "request_id": rid,
+                                  "error_type": type(exc).__name__,
+                                  "error": str(exc)[:300]}), exc_info=exc)
+            # 500, not 503. This is an unhandled fault, and 503 told every caller
+            # it was worth retrying -- which for a deterministic bug means the
+            # same failure at the same rate forever, and hides it behind what
+            # looks like transient unavailability.
+            response = JSONResponse({"detail": "internal error"}, status_code=500)
         response.headers["X-Request-ID"] = rid
         log.info(json.dumps({"event": "request", "request_id": rid, "method": request.method,
                              "status": response.status_code, "duration_ms": int((time.monotonic()-started)*1000)}))

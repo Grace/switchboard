@@ -9,6 +9,118 @@ import (
 	"testing"
 )
 
+// "No text" is not one fact, and treating it as one broke this table in both
+// directions. A model that hit its ceiling before writing anything is the budget
+// problem the table exists for. A model that was content-filtered, or that
+// finished normally with nothing to say, produced no text for a reason a larger
+// budget would not fix, and recording that as a budget fact shadows a healthy
+// model for the whole TTL.
+func TestObserveOutcomeOnlyRecordsBudgetFacts(t *testing.T) {
+	for _, tc := range []struct {
+		name, finish, text string
+		wantSkip           bool
+	}{
+		{"empty at the ceiling is a budget fact", "length", "", true},
+		{"content filtered says nothing about the budget", "content_filter", "", false},
+		{"finished with nothing to say says nothing about the budget", "stop", "", false},
+		{"text produced at this budget is a budget fact", "stop", "hello", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			b := newBudgetTable()
+			b.observeOutcome("openai", "m", 1024, tc.finish, tc.text)
+			if got := b.skip("openai", "m", 1024); got != tc.wantSkip {
+				t.Fatalf("skip = %v, want %v", got, tc.wantSkip)
+			}
+		})
+	}
+}
+
+// The opposite direction, which the non-streaming path had. It recorded
+// producedText unconditionally true on success, so one content-filtered response
+// set okAt and silently switched budget-aware routing off for that model for six
+// hours -- the whole feature, disabled by a safety filter.
+func TestContentFilterDoesNotEraseARealBudgetFact(t *testing.T) {
+	b := newBudgetTable()
+	b.observeOutcome("openai", "m", 1024, "length", "")
+	if !b.skip("openai", "m", 1024) {
+		t.Fatal("a genuine empty-at-ceiling was not recorded")
+	}
+	b.observeOutcome("openai", "m", 1024, "content_filter", "")
+	if !b.skip("openai", "m", 1024) {
+		t.Fatal("a content-filtered response erased a real budget fact and disabled routing")
+	}
+}
+
+// End to end on the non-streaming path, which had the opposite bug: it recorded
+// producedText unconditionally true on every success, so a content-filtered
+// response set okAt and switched budget-aware routing off for that model.
+//
+// A single provider is configured deliberately. The route is already shadowed,
+// and server.chat clears the skip set when every eligible route is shadowed --
+// so the request is attempted, which is exactly the state this needs to reach.
+func TestContentFilteredResponseDoesNotDisableBudgetRouting(t *testing.T) {
+	a := testHTTP(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		io.WriteString(w, `{"choices":[{"index":0,"message":{"content":""},"finish_reason":"content_filter"}],`+
+			`"usage":{"prompt_tokens":9,"completion_tokens":0}}`)
+	}))
+	defer a.Close()
+	s := testServer(t, map[string]ProviderConfig{"openai": {URL: a.URL, KeyEnv: "PROVIDER_KEY"}})
+
+	// A real budget fact, observed before this request.
+	s.budgets.observe("openai", "test-model", 1024, false)
+	if !s.budgets.skip("openai", "test-model", 1024) {
+		t.Fatal("setup: the budget fact was not recorded")
+	}
+
+	body := `{"model":"preferred","max_tokens":1024,"messages":[{"role":"user","content":"hi"}]}`
+	if w := call(s, body); w.Code != 200 {
+		t.Fatalf("request: %d %s", w.Code, w.Body)
+	}
+	if !s.budgets.skip("openai", "test-model", 1024) {
+		t.Fatal("a content-filtered response set okAt and disabled budget-aware routing")
+	}
+}
+
+// End to end on the streaming path, where the bug was worst: ParseChat defaults
+// max_tokens to 1024, so a single filtered stream shadowed the primary model for
+// essentially all default traffic and callers were silently moved to the
+// fallback -- different model, different cost.
+func TestContentFilteredStreamDoesNotShadowTheModel(t *testing.T) {
+	var primary, fallback atomic.Int64
+	a := testHTTP(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		primary.Add(1)
+		w.Header().Set("Content-Type", "text/event-stream")
+		io.WriteString(w, "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"\"},\"finish_reason\":\"content_filter\"}]}\n\n")
+		io.WriteString(w, "data: [DONE]\n\n")
+	}))
+	defer a.Close()
+	b := testHTTP(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fallback.Add(1)
+		io.WriteString(w, `{"content":[{"type":"text","text":"fallback"}],"stop_reason":"end_turn"}`)
+	}))
+	defer b.Close()
+	s := testServer(t, map[string]ProviderConfig{
+		"openai":    {URL: a.URL, KeyEnv: "PROVIDER_KEY"},
+		"anthropic": {URL: b.URL, KeyEnv: "PROVIDER_KEY"},
+	})
+	body := `{"model":"preferred","stream":true,"max_tokens":1024,"messages":[{"role":"user","content":"hi"}]}`
+	if w := call(s, body); w.Code != 200 {
+		t.Fatalf("first request: %d %s", w.Code, w.Body)
+	}
+	if s.budgets.skip("openai", "test-model", 1024) {
+		t.Fatal("a content-filtered stream marked the model as producing nothing at this budget")
+	}
+	if w := call(s, body); w.Code != 200 {
+		t.Fatalf("second request: %d %s", w.Code, w.Body)
+	}
+	if primary.Load() != 2 {
+		t.Fatalf("primary reached %d times, want 2; it was shadowed by the filtered response", primary.Load())
+	}
+	if fallback.Load() != 0 {
+		t.Fatalf("fallback reached %d times, want 0", fallback.Load())
+	}
+}
+
 // The measured case. gpt-5-nano at max_tokens 1024 returned zero visible
 // characters for four of seven ordinary prompts, billed in full. Once that has
 // been seen, sending the next identical request there spends money to learn what
