@@ -55,27 +55,27 @@ Parameters:
   ExecutionRoleArn:
     Type: String
     Description: Existing ECS execution role. Must be able to read the two secrets below.
-    AllowedPattern: '^arn:[^:]+:iam::\d{12}:role/.+$'
+    AllowedPattern: '^arn:[^:]+:iam::\d{12}:role/[A-Za-z0-9+=,.@_/-]{1,576}$'
   TaskRoleArn:
     Type: String
     Description: Existing ECS task role for the control plane container.
-    AllowedPattern: '^arn:[^:]+:iam::\d{12}:role/.+$'
+    AllowedPattern: '^arn:[^:]+:iam::\d{12}:role/[A-Za-z0-9+=,.@_/-]{1,576}$'
   KmsKeyArn:
     Type: String
     Description: Customer managed KMS key for database storage and the managed master password.
-    AllowedPattern: '^arn:[^:]+:kms:[a-z0-9-]+:\d{12}:key/.+$'
+    AllowedPattern: '^arn:[^:]+:kms:[a-z0-9-]+:\d{12}:key/(mrk-[0-9a-f]{32}|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$'
   LogKmsKeyArn:
     Type: String
     Description: Customer managed KMS key encrypting the CloudWatch log group.
-    AllowedPattern: '^arn:[^:]+:kms:[a-z0-9-]+:\d{12}:key/.+$'
+    AllowedPattern: '^arn:[^:]+:kms:[a-z0-9-]+:\d{12}:key/(mrk-[0-9a-f]{32}|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$'
   EcsClusterArn:
     Type: String
     Description: Existing ECS cluster to run the control plane in.
-    AllowedPattern: '^arn:[^:]+:ecs:[a-z0-9-]+:\d{12}:cluster/.+$'
+    AllowedPattern: '^arn:[^:]+:ecs:[a-z0-9-]+:\d{12}:cluster/[A-Za-z0-9_-]{1,255}$'
   TargetGroupArn:
     Type: String
     Description: Existing load balancer target group. Its listener should terminate TLS.
-    AllowedPattern: '^arn:[^:]+:elasticloadbalancing:[a-z0-9-]+:\d{12}:targetgroup/.+$'
+    AllowedPattern: '^arn:[^:]+:elasticloadbalancing:[a-z0-9-]+:\d{12}:targetgroup/[A-Za-z0-9-]{1,32}/[0-9a-f]{16}$'
 
   ControlPlaneImage:
     Type: String
@@ -96,11 +96,11 @@ Parameters:
   DatabaseUrlSecretArn:
     Type: String
     Description: Secrets Manager ARN holding the runtime DATABASE_URL. Use sslmode=verify-full.
-    AllowedPattern: '^arn:[^:]+:secretsmanager:[a-z0-9-]+:\d{12}:secret:.+$'
+    AllowedPattern: '^arn:[^:]+:secretsmanager:[a-z0-9-]+:\d{12}:secret:[A-Za-z0-9/_+=.@-]{1,512}$'
   PolicySigningSeedSecretArn:
     Type: String
     Description: Secrets Manager ARN holding the base64 Ed25519 POLICY_SIGNING_SEED.
-    AllowedPattern: '^arn:[^:]+:secretsmanager:[a-z0-9-]+:\d{12}:secret:.+$'
+    AllowedPattern: '^arn:[^:]+:secretsmanager:[a-z0-9-]+:\d{12}:secret:[A-Za-z0-9/_+=.@-]{1,512}$'
 
   EngineVersion:
     Type: String

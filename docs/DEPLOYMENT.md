@@ -320,6 +320,76 @@ its scope. A clean scan is a much smaller attack surface, not a guarantee.
 | `controlplane.yaml` | 14, all pre-existing infrastructure | `CAPABILITY_IAM` |
 | `github-oidc.yaml` | `OidcProviderArn` | **`CAPABILITY_NAMED_IAM`** |
 
+### Deploying the quickstart
+
+Use `scripts/deploy.sh`. It is the only path carrying the properties a hand-run
+`aws cloudformation deploy` does not:
+
+```sh
+./scripts/deploy.sh \
+  --certificate arn:aws:acm:us-east-1:123456789012:certificate/12345678-1234-1234-1234-123456789012 \
+  --hostname switchboard.example.com \
+  --image <account>.dkr.ecr.<region>.amazonaws.com/switchboard/controlplane@sha256:<digest>
+```
+
+It refuses to deploy into a stack that is already wedged, runs
+`scripts/preflight.sh`, and creates with `--disable-rollback`. That flag is the
+one that matters, for the reason below. Updates to an existing stack go through
+a normal change set with rollback left on, because by then the database exists,
+is `available`, and can be snapshotted.
+
+### Recovering a failed or wedged stack
+
+A quickstart create that fails in its first ten minutes does not clean up after
+itself. The reason is worth knowing before you meet it.
+
+The database carries `DeletionPolicy: Snapshot`, so CloudFormation snapshots it
+on the way out. It cannot snapshot an instance that is still `creating` -- and a
+rollback of a failed create always arrives while the instance is still creating.
+So the delete fails, and the rollback fails with it:
+
+```
+Database   DELETE_FAILED    Cannot create a snapshot because the database
+                            instance <stack>-postgres is not currently in the
+                            available state.
+<stack>    ROLLBACK_FAILED  The following resource(s) failed to delete: [Database].
+```
+
+A stack in `ROLLBACK_FAILED` cannot be updated. There is no fixing it in place;
+it has to be deleted and recreated. This is what `--disable-rollback` avoids: the
+stack stops at `CREATE_FAILED` with everything intact, and the delete you issue
+afterwards finds the database settled and snapshots it cleanly.
+
+| Status | What it means | Way out |
+|---|---|---|
+| `CREATE_FAILED` | Created with `--disable-rollback`, so nothing was torn down | Read the events and logs, then `delete-stack` |
+| `ROLLBACK_FAILED` | Rollback could not delete the database | `delete-stack`, which succeeds once the instance is `available` |
+| `DELETE_FAILED` | Deletion protection, or a snapshot that cannot be taken | Clear protection, then `delete-stack`; failing that `--retain-resources Database`, then `--deletion-mode FORCE_DELETE_STACK` |
+
+`./scripts/teardown.sh <stack>` prints these commands with your stack name and
+region filled in, and refuses to touch anything while the stack still exists.
+
+Two things bite on the retry:
+
+- **Deletion protection.** `Environment=production` turns it on, and
+  `delete-stack` then fails with `Cannot delete protected DB Instance`. Clear it
+  with `aws rds modify-db-instance --db-instance-identifier <stack>-postgres
+  --no-deletion-protection --apply-immediately`. The parameter defaults to
+  `evaluation`, which leaves it off; the snapshot preserves the data either way,
+  so what deletion protection buys is a guard against an accidental delete, not
+  durability.
+- **Final snapshot names must be unique.** As noted under Preparation, replacing
+  a previously deleted deployment fails if an old final snapshot still holds the
+  name. `scripts/teardown.sh` lists and removes them.
+
+And the failure that prompted this section: `CertificateArn` used to end in
+`.+`, which accepted two ARNs joined by whitespace -- the shape
+`aws acm list-certificates --output text` returns when more than one certificate
+matches. CloudFormation took the pair and only the load balancer rejected it,
+four minutes in, after the VPC, NAT gateway and database had started building.
+The template pattern and `scripts/preflight.sh` both reject it now. Pass exactly
+one ARN.
+
 ### Read the OIDC subject before deploying the publishing role
 
 `github-oidc.yaml` writes a trust policy matching the subject claim GitHub puts

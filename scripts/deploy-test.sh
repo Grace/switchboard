@@ -51,7 +51,22 @@ cleanup() {
   say "Teardown"
   if aws cloudformation describe-stacks --stack-name "$STACK" >/dev/null 2>&1; then
     aws cloudformation delete-stack --stack-name "$STACK" 2>/dev/null || true
-    while aws cloudformation describe-stacks --stack-name "$STACK" >/dev/null 2>&1; do sleep 20; done
+    # Bounded, because the delete this waits on is the one that can wedge: a
+    # database that cannot be snapshotted leaves DELETE_FAILED, which never
+    # resolves, and an unbounded poll would spin on it forever while the stack
+    # kept billing. Say so and hand off rather than hang.
+    waited=0
+    while aws cloudformation describe-stacks --stack-name "$STACK" >/dev/null 2>&1; do
+      if [ "$waited" -ge 2400 ]; then
+        S=$(aws cloudformation describe-stacks --stack-name "$STACK" \
+            --query 'Stacks[0].StackStatus' --output text 2>/dev/null || echo UNKNOWN)
+        echo "  '$STACK' still present after 40 minutes ($S) and still billing."
+        echo "  ./scripts/teardown.sh $STACK --region $REGION prints the way out."
+        return
+      fi
+      sleep 20
+      waited=$((waited + 20))
+    done
     echo "  stack deleted"
   else
     echo "  no stack was created"

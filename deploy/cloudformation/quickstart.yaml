@@ -35,7 +35,16 @@ Parameters:
       plane. Required because the sidecar refuses plain HTTP to anything but
       loopback and trusts only system roots, so this stack cannot mint its own.
       After deploy, point that DNS name at the load balancer address in Outputs.
-    AllowedPattern: '^arn:[^:]+:acm:[a-z0-9-]+:\d{12}:certificate/.+$'
+    # The tail is the certificate UUID, not '.+'. A dot matches a tab, so '.+'
+    # accepted two ARNs joined by whitespace, which is what
+    # 'aws acm list-certificates --output text' returns when more than one
+    # certificate matches. CloudFormation took it and only the load balancer
+    # rejected it, four minutes in, after the VPC, NAT and database had started.
+    AllowedPattern: '^arn:[^:]+:acm:[a-z0-9-]+:\d{12}:certificate/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+    ConstraintDescription: >-
+      must be one ACM certificate ARN, e.g.
+      arn:aws:acm:us-east-1:123456789012:certificate/12345678-1234-1234-1234-123456789012.
+      Two ARNs joined by whitespace are rejected here.
 
   ControlPlaneHostname:
     Type: String
@@ -47,13 +56,18 @@ Parameters:
 
   Environment:
     Type: String
-    Default: production
+    # This template is for evaluation, so it defaults that way. A production
+    # default meant a stack deployed with defaults could not be deleted without
+    # an out-of-band RDS call, which is a poor first impression and was not the
+    # protection it looked like: DeletionPolicy Snapshot keeps the data either way.
+    Default: evaluation
     AllowedValues: [production, evaluation]
     Description: >-
-      production keeps database deletion protection on. evaluation turns it off
-      so a trial stack can be deleted without a manual step. The database is
-      snapshotted on delete either way; run scripts/teardown.sh afterwards to
-      remove the retained key, secrets and log group.
+      evaluation, the default, leaves database deletion protection off so a trial
+      stack can be deleted without a manual step. production turns it on, which
+      means deleting this stack fails until you clear the flag by hand. The
+      database is snapshotted on delete either way; run scripts/teardown.sh
+      afterwards to remove the retained key, secrets and log group.
 
   ControlPlaneImage:
     Type: String

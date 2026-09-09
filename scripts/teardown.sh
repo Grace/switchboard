@@ -33,7 +33,49 @@ aws() { command aws --region "$REGION" "$@"; }
 if STATUS=$(aws cloudformation describe-stacks --stack-name "$STACK" \
     --query 'Stacks[0].StackStatus' --output text 2>/dev/null); then
   echo "Stack '$STACK' still exists ($STATUS)." >&2
-  echo "Wait for it to finish deleting, then run this again. Nothing was touched." >&2
+  case "$STATUS" in
+    # These four never resolve on their own, so telling the operator to wait is
+    # a dead end. Say what the stack is actually stuck on and how to get out.
+    CREATE_FAILED|ROLLBACK_FAILED|DELETE_FAILED|UPDATE_ROLLBACK_FAILED)
+      cat >&2 <<EOF
+
+That status is terminal. It will not finish on its own, and a stack in
+ROLLBACK_FAILED cannot be updated either, so there is no fixing it in place.
+
+The usual cause is the database. CloudFormation snapshots it on the way out
+(DeletionPolicy: Snapshot), and it cannot snapshot an instance that is still
+creating, nor delete one at all while deletion protection is on. A create that
+fails early therefore rolls back into ROLLBACK_FAILED every time.
+
+Work down this list, re-running the delete after each step:
+
+  # 1. Clear deletion protection, which Environment=production turns on.
+  aws rds modify-db-instance --region $REGION \\
+    --db-instance-identifier $STACK-postgres \\
+    --no-deletion-protection --apply-immediately
+
+  # 2. Delete again. Once the instance reaches 'available' it can be
+  #    snapshotted, and the snapshot is what holds your data.
+  aws cloudformation delete-stack --region $REGION --stack-name $STACK
+
+  # 3. Only valid from DELETE_FAILED: keep the database, delete the rest.
+  #    The instance then survives and bills until you remove it by hand.
+  aws cloudformation delete-stack --region $REGION --stack-name $STACK \\
+    --retain-resources Database
+
+  # 4. Only valid from DELETE_FAILED, and last: drop the stack and orphan
+  #    whatever it could not delete, including any snapshot in progress.
+  aws cloudformation delete-stack --region $REGION --stack-name $STACK \\
+    --deletion-mode FORCE_DELETE_STACK
+
+Then run this script again to clear what the stack leaves behind.
+EOF
+      ;;
+    *)
+      echo "Wait for it to finish deleting, then run this again." >&2
+      ;;
+  esac
+  echo "Nothing was touched." >&2
   exit 1
 fi
 

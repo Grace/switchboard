@@ -118,18 +118,39 @@ check_quota "$(aws ec2 describe-addresses --query 'length(Addresses)' --output t
 
 # --- certificate ------------------------------------------------------------
 if [ -n "$CERT" ]; then
-  ST=$(aws acm describe-certificate --certificate-arn "$CERT" \
-    --query 'Certificate.Status' --output text 2>/dev/null || echo MISSING)
-  case "$ST" in
-    ISSUED) pass "certificate is ISSUED" ;;
-    PENDING_VALIDATION) fail "certificate still PENDING_VALIDATION; the DNS record is not live yet" ;;
-    *) fail "certificate status $ST" ;;
-  esac
-  # A certificate in another region is invisible to an ALB here.
+  # Shape before anything else. `aws acm list-certificates --output text` prints
+  # every match tab separated, so a command substitution that matched two
+  # certificates hands this one argument holding both ARNs. Left to the checks
+  # below, that value passes the region test (the substring is still in there)
+  # and fails describe-certificate as MISSING, which reads as one wrong ARN
+  # rather than as two right ones. Name it here, before any of that.
+  CERT_OK=1
   case "$CERT" in
-    *":$REGION:"*) ;;
-    *) fail "certificate is not in $REGION; a load balancer cannot use it" ;;
+    *[[:space:]]*)
+      CERT_OK=0
+      fail "--certificate holds whitespace, so it is more than one ARN. Pass exactly one." ;;
   esac
+  if [ "$CERT_OK" = 1 ] && ! printf '%s\n' "$CERT" | grep -Eq \
+      '^arn:[^:]+:acm:[a-z0-9-]+:[0-9]{12}:certificate/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+  then
+    CERT_OK=0
+    fail "--certificate is not an ACM certificate ARN: $CERT"
+  fi
+
+  if [ "$CERT_OK" = 1 ]; then
+    ST=$(aws acm describe-certificate --certificate-arn "$CERT" \
+      --query 'Certificate.Status' --output text 2>/dev/null || echo MISSING)
+    case "$ST" in
+      ISSUED) pass "certificate is ISSUED" ;;
+      PENDING_VALIDATION) fail "certificate still PENDING_VALIDATION; the DNS record is not live yet" ;;
+      *) fail "certificate status $ST" ;;
+    esac
+    # A certificate in another region is invisible to an ALB here.
+    case "$CERT" in
+      *":$REGION:"*) ;;
+      *) fail "certificate is not in $REGION; a load balancer cannot use it" ;;
+    esac
+  fi
 else
   skip "no --certificate given"
 fi
