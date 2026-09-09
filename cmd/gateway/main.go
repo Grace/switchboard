@@ -144,6 +144,22 @@ func main() {
 		// data directory now deserves the same protection as the signing seed.
 		slog.Info("idempotency enabled; request and response content is stored in the data directory",
 			"ttl_seconds", c.IdempotencyTTLSeconds, "limit_bytes", c.IdempotencyBytes)
+		go func() {
+			// Expiry used to happen only in NewIdemStore, so a process that stayed
+			// up never reclaimed a byte. The store filled, then silently stopped
+			// accepting new keys, and idempotency was off while every counter
+			// still read zero. See Sweep's comment for why that costs money.
+			tick := time.NewTicker(time.Minute)
+			defer tick.Stop()
+			for {
+				select {
+				case <-background.Done():
+					return
+				case <-tick.C:
+					store.Sweep()
+				}
+			}
+		}()
 	}
 	if c.CaptureTTLSeconds > 0 {
 		store, e := gateway.NewCaptureStore(

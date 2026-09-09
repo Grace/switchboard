@@ -7,7 +7,7 @@ produces a trigger that is accepted and never fires.
 """
 import pytest
 
-from controlplane import alerting
+from controlplane import alerting, honeycomb
 from controlplane.honeycomb import (
     NEEDED,
     NOTIFY_TRIGGER,
@@ -175,3 +175,110 @@ def test_recipient_choice_must_be_explicit(capsys):
     """
     with pytest.raises(SystemExit):
         main(["--dataset", "Metrics"])
+
+
+class FakeAPI:
+    """Records every call so a test can assert what a dry run did NOT do."""
+
+    def __init__(self, access=None, triggers=(), boards=()):
+        self.calls = []
+        self.access = access or {"triggers": True, "boards": True,
+                                 "recipients": True, "queries": True}
+        self.triggers = list(triggers)
+        self.boards = list(boards)
+
+    def __call__(self, key, method, path, body=None):
+        self.calls.append((method, path))
+        if path == "/1/auth":
+            return {"type": "configuration", "team": {"slug": "t"},
+                    "environment": {"slug": "e"}, "api_key_access": self.access}
+        if path == "/1/recipients":
+            return [] if method == "GET" else {"id": "r1"}
+        if path.startswith("/1/triggers"):
+            return self.triggers if method == "GET" else {"id": "t1", "query_id": "q1"}
+        if path == "/1/boards":
+            return self.boards if method == "GET" else {"id": "b1", "links": {"board_url": "u"}}
+        if path.startswith("/1/queries"):
+            return {"id": "q1"}
+        if path.startswith("/1/query_annotations"):
+            return {"id": "a1"}
+        if path.startswith("/1/query_results"):
+            return {"id": "qr1", "complete": True}
+        return {}
+
+    def writes(self):
+        return [(m, p) for m, p in self.calls if m != "GET"]
+
+
+def test_dry_run_writes_nothing(monkeypatch, capsys):
+    """The defect this test exists for shipped and was found by review.
+
+    Only the final POST /1/boards was behind the dry-run guard; the saved queries
+    and query annotations each panel needs were created unconditionally. A dry
+    run against a fresh environment issued ten writes and left five orphaned
+    annotations, while printing only "would create board" -- and every repeat run
+    created five more. A flag documented as "writing nothing" that writes is a
+    false statement, not an imprecise one.
+    """
+    fake = FakeAPI()
+    monkeypatch.setattr(honeycomb, "api", fake)
+    honeycomb.apply("k", "Metrics", "ops@example.com", dry_run=True)
+
+    assert fake.writes() == [], (
+        f"--dry-run issued {len(fake.writes())} writes: {fake.writes()}"
+    )
+
+
+def test_a_real_run_does_write(monkeypatch, capsys):
+    """The counterpart, so the test above cannot be satisfied by a tool that has
+    simply stopped working."""
+    fake = FakeAPI()
+    monkeypatch.setattr(honeycomb, "api", fake)
+    honeycomb.apply("k", "Metrics", "ops@example.com", dry_run=False)
+
+    paths = [p for _, p in fake.writes()]
+    assert any(p.startswith("/1/triggers") for p in paths)
+    assert "/1/boards" in paths
+    assert any(p.startswith("/1/queries") for p in paths)
+
+
+def test_missing_run_queries_still_provisions(monkeypatch, capsys):
+    """'Run Queries' is Enterprise-only. Requiring it meant the tool could not run
+    at all on the tier most people provisioning this are on -- it exited 1 and
+    left the account untouched. It now provisions and reports what it could not
+    check."""
+    fake = FakeAPI(access={"triggers": True, "boards": True,
+                           "recipients": True, "queries": False})
+    monkeypatch.setattr(honeycomb, "api", fake)
+    rc = honeycomb.apply("k", "Metrics", "ops@example.com", dry_run=False)
+
+    assert rc == 0, "a free-tier user provisioning successfully is a success"
+    assert any(p.startswith("/1/triggers") for _, p in fake.writes()), "it must still provision"
+    out = capsys.readouterr().out
+    assert "NOT VERIFIED" in out
+    assert "Enterprise" in out
+    for spec in honeycomb.triggers():
+        assert spec["name"] in out, "every unverified trigger must be named"
+    assert not any(p.startswith("/1/query_results") for _, p in fake.calls), \
+        "it must not attempt a query it has no permission to run"
+
+
+def test_no_recipient_does_not_require_the_recipients_permission(monkeypatch):
+    """--no-recipient never touches a recipient, so demanding the permission to
+    manage one turned an unrelated missing checkbox into a hard stop."""
+    fake = FakeAPI(access={"triggers": True, "boards": True,
+                           "recipients": False, "queries": True})
+    monkeypatch.setattr(honeycomb, "api", fake)
+    assert honeycomb.apply("k", "Metrics", None, dry_run=False) == 0
+    assert not any(p == "/1/recipients" for _, p in fake.calls)
+
+
+def test_missing_a_genuinely_required_permission_still_stops(monkeypatch):
+    """The relaxation must not become a blanket one: without Manage Triggers the
+    tool cannot do its job at all, and should say so rather than half-run."""
+    fake = FakeAPI(access={"triggers": False, "boards": True,
+                           "recipients": True, "queries": True})
+    monkeypatch.setattr(honeycomb, "api", fake)
+    with pytest.raises(SystemExit) as e:
+        honeycomb.apply("k", "Metrics", "ops@example.com", dry_run=False)
+    assert "triggers" in str(e.value)

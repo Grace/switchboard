@@ -1,8 +1,10 @@
 package gateway
 
 import (
+	"fmt"
 	"io"
 	"net/http"
+	"os"
 	"net/http/httptest"
 	"strings"
 	"sync"
@@ -234,5 +236,89 @@ func TestStreamReplayDeliversTheSameAnswer(t *testing.T) {
 	}
 	if second.Header().Get("X-Switchboard-Replayed") != "true" {
 		t.Error("replayed stream is indistinguishable from a fresh one")
+	}
+}
+
+// The store filling was not a housekeeping problem, it was the feature turning
+// itself off. Expiry ran only in NewIdemStore, so a process that stayed up never
+// reclaimed a byte: finish() overwrites and never deletes, and only release()
+// decrements used. Once used crossed the limit, every new key was refused,
+// Server.chat did not match that error, and the request proceeded with no entry
+// at all -- so an ambiguous retry was billed twice, while replay, conflict and
+// unknown all still read zero.
+func TestIdemSweepReclaimsExpiredEntries(t *testing.T) {
+	dir := t.TempDir()
+	m := &Metrics{}
+	s, err := NewIdemStore(dir, 50*time.Millisecond, 1<<20, m)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	body := []byte(`{"model":"m"}`)
+	for _, k := range []string{"a", "b", "c"} {
+		if _, err := s.begin(k, body); err != nil {
+			t.Fatalf("begin %s: %v", k, err)
+		}
+		s.finish(k, &idemEntry{
+			State: idemDone, BodyHash: hashBody(body), Stored: time.Now().Unix(),
+			Status: 200, Response: []byte(`{"ok":true}`),
+		})
+	}
+	if s.used == 0 || s.count != 3 {
+		t.Fatalf("after three settled entries: used=%d count=%d, want non-zero and 3",
+			s.used, s.count)
+	}
+
+	time.Sleep(80 * time.Millisecond)
+	s.Sweep()
+
+	if s.count != 0 || s.used != 0 {
+		t.Errorf("after Sweep: used=%d count=%d, want 0 and 0; expired entries were "+
+			"settled, and settled entries are exactly the ones nothing else reclaims",
+			s.used, s.count)
+	}
+	if names, _ := os.ReadDir(dir); len(names) != 0 {
+		t.Errorf("%d expired files still on disk; docs/SECURITY.md says entries expire "+
+			"with the TTL", len(names))
+	}
+}
+
+// The failure this guards, end to end: fill the store with settled entries until
+// it refuses a new key, then confirm a sweep restores service. Without Sweep the
+// second begin() stays refused for the life of the process.
+func TestIdemFullStoreRecoversAfterSweep(t *testing.T) {
+	s, err := NewIdemStore(t.TempDir(), 50*time.Millisecond, 400, &Metrics{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := []byte(`{"model":"m"}`)
+	settle := func(k string) error {
+		if _, err := s.begin(k, body); err != nil {
+			return err
+		}
+		s.finish(k, &idemEntry{
+			State: idemDone, BodyHash: hashBody(body), Stored: time.Now().Unix(),
+			Status: 200, Response: []byte(`{"ok":true}`),
+		})
+		return nil
+	}
+	if err := settle("first"); err != nil {
+		t.Fatalf("first key: %v", err)
+	}
+	// Enough to cross the 400-byte limit.
+	var refused error
+	for i := 0; i < 20 && refused == nil; i++ {
+		refused = settle(fmt.Sprintf("k%d", i))
+	}
+	if refused == nil {
+		t.Skip("store did not fill; nothing to recover from")
+	}
+
+	time.Sleep(80 * time.Millisecond)
+	s.Sweep()
+
+	if _, err := s.begin("after-sweep", body); err != nil {
+		t.Errorf("still refusing new keys after Sweep: %v. Until this passes, a full "+
+			"store means idempotency is off and duplicate requests are billed twice", err)
 	}
 }

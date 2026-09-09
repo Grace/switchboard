@@ -97,15 +97,35 @@ def api(key: str, method: str, path: str, body=None):
 # What each Honeycomb permission is needed for. Named individually because
 # "isn't allowed" tells a deployer nothing about which switch to flip, and the
 # first key handed to this tool had two of the four off.
-NEEDED = {
+# Permissions this tool cannot work without.
+REQUIRED = {
     "triggers": "create and update the two triggers",
     "boards": "create the board",
-    "recipients": "attach a notification target",
-    "queries": "execute each trigger's query to prove it runs",
 }
+# Required only when a recipient is actually being set. --no-recipient touches none.
+CONDITIONAL = {
+    "recipients": "attach a notification target",
+}
+# Wanted, but NOT required, and the distinction matters more than it looks.
+#
+# "Run Queries" is an Enterprise-plan permission. Making it mandatory - which an
+# earlier version of this did - means the tool cannot run at all on a free or
+# self-serve plan, which is the tier most people provisioning this are on. A
+# provisioning tool that refuses to provision is worse than one that provisions
+# and says clearly what it could not check.
+#
+# So without it: do the work, then say loudly which triggers went out unverified
+# and how to check them by hand. With it: prove every query runs, because a
+# trigger Honeycomb stores and refuses to execute looks identical to a healthy
+# one in the UI, and that is not a hypothetical - it is what two triggers in the
+# first account this ran against were doing for hours.
+OPTIONAL = {
+    "queries": "execute each trigger's query to prove it runs (Enterprise plans only)",
+}
+NEEDED = {**REQUIRED, **CONDITIONAL, **OPTIONAL}
 
 
-def preflight(key: str) -> dict:
+def preflight(key: str, want_recipient: bool = True) -> dict:
     """Ask the key what it can do, before using it for anything.
 
     An earlier version of this guessed from a failed write that the key was an
@@ -123,17 +143,19 @@ def preflight(key: str) -> dict:
     print(f"key: type={auth.get('type', '?')} team={team} environment={env}")
 
     access = auth.get("api_key_access") or {}
-    missing = [p for p in NEEDED if not access.get(p)]
+    need = dict(REQUIRED)
+    if want_recipient:
+        need.update(CONDITIONAL)
+
+    missing = [p for p in need if not access.get(p)]
     if missing:
-        lines = "\n".join(f"    {p:<12} to {NEEDED[p]}" for p in missing)
+        lines = "\n".join(f"    {p:<12} to {need[p]}" for p in missing)
         raise Fatal(
             "this key is missing permissions it needs:\n" + lines + "\n"
-            "  Enable them in Honeycomb under Environment settings > API keys, or use a\n"
-            "  Configuration key that has them. An ingest key has none of these; it can\n"
-            "  send telemetry and nothing else.\n"
-            "  'queries' is not optional: without it the triggers can be written but not\n"
-            "  verified, and an unverified trigger is precisely the failure this tool\n"
-            "  exists to prevent, so it stops rather than report a false success."
+            "  Enable them in Honeycomb under Environments > Manage Environments > your\n"
+            "  environment > API Keys > Configuration Keys > Details.\n"
+            "  An ingest key has none of these; it can send telemetry and nothing else.\n"
+            "  Pass --no-recipient if you deliberately want triggers that notify nobody."
         )
     return auth
 
@@ -307,9 +329,11 @@ def apply(key: str, dataset: str, recipient: str | None, dry_run: bool = False) 
     change nothing. Doing that for real would mean writing to a live account to
     prove that writing was unnecessary.
     """
-    preflight(key)
+    auth = preflight(key, want_recipient=recipient is not None)
+    can_verify = bool((auth.get("api_key_access") or {}).get("queries"))
     changed = []
     plan = []
+    unverified = []
 
     def write(kind, name, fn):
         if dry_run:
@@ -354,9 +378,11 @@ def apply(key: str, dataset: str, recipient: str | None, dry_run: bool = False) 
         # point of the check is to catch a stored trigger whose query the engine
         # will not run, and that is exactly what a dry run should surface.
         qid = got["query_id"] if got else (found or {}).get("query_id")
-        if qid:
+        if qid and can_verify:
             run_query(key, dataset, qid, spec["name"])
             print(f"  query runs: {spec['name']}")
+        elif qid:
+            unverified.append(spec["name"])
 
     boards = api(key, "GET", "/1/boards") or []
     if find_by_name(boards, BOARD_NAME):
@@ -370,13 +396,23 @@ def apply(key: str, dataset: str, recipient: str | None, dry_run: bool = False) 
             }
         ]
         for i, (name, desc, spec) in enumerate(board_queries()):
-            q = api(key, "POST", f"/1/queries/{dataset}", spec)
-            ann = api(
-                key,
-                "POST",
-                f"/1/query_annotations/{dataset}",
-                {"name": name, "description": desc, "query_id": q["id"]},
-            )
+            # Behind write(), not around it. A board panel needs a saved query and
+            # an annotation to point at, and creating those is as much a write as
+            # creating the board: they are named objects that persist in the
+            # account whether or not a board ever references them. Issuing them
+            # during a dry run left five orphaned annotations per run and printed
+            # nothing about it, which makes a flag documented as "writing nothing"
+            # a false statement rather than an imprecise one.
+            q = write("create query", name, lambda spec=spec:
+                      api(key, "POST", f"/1/queries/{dataset}", spec))
+            ann = write("create query annotation", name, lambda name=name, desc=desc, q=q:
+                        api(key, "POST", f"/1/query_annotations/{dataset}",
+                            {"name": name, "description": desc, "query_id": q["id"]}))
+            if q is None or ann is None:
+                # Dry run: there is no id to build a panel around, and inventing a
+                # placeholder would produce a "would create" report describing a
+                # board that could not be built from it.
+                continue
             panels.append(
                 {
                     "type": "query",
@@ -410,6 +446,26 @@ def apply(key: str, dataset: str, recipient: str | None, dry_run: bool = False) 
         if made:
             print(f"board created: {made['links']['board_url']}")
             changed.append(BOARD_NAME)
+
+    if unverified:
+        # Loud, itemised, and last, so it is the part still on screen. Saying
+        # "some checks were skipped" would be technically true and useless; the
+        # operator needs to know which triggers are unproven and what to do.
+        print()
+        print("=" * 72)
+        print("NOT VERIFIED. These triggers were written but not proven to run:")
+        for name in unverified:
+            print(f"  - {name}")
+        print()
+        print("  This key cannot execute queries. 'Run Queries' is an Enterprise-plan")
+        print("  permission, so on a free or self-serve plan this check is unavailable and")
+        print("  the tool does not pretend otherwise.")
+        print()
+        print("  It matters because Honeycomb will store a trigger whose query it refuses")
+        print("  to run, list it as healthy, and never fire it. To check by hand: open each")
+        print("  trigger, run its query in the query builder, and confirm it returns a")
+        print("  number rather than an error.")
+        print("=" * 72)
 
     print()
     if dry_run:

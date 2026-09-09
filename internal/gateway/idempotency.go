@@ -113,6 +113,40 @@ func NewIdemStore(dir string, ttl time.Duration, limit int64, m *Metrics) (*idem
 	return s, nil
 }
 
+// Sweep removes expired entries. Without it, expiry happened only in
+// NewIdemStore, which meant it happened only at startup -- and the consequence
+// was not merely stale files.
+//
+// finish() overwrites an entry and never deletes one; only release(), the
+// un-settled path, decrements used. So used climbed monotonically toward the
+// configured limit and stayed there. Past it, write() refuses every entry for a
+// new key, begin() returns that error, and the switch in Server.chat matches
+// only errIdemMismatch and errIdemConflict -- so a full store fell through
+// unmatched and the request proceeded with no idempotency entry at all.
+//
+// From that point the feature was off while appearing healthy: replay, conflict
+// and unknown all read zero, which looks like "no duplicates seen" rather than
+// "no longer checking". An ambiguous retry then found nothing, was treated as
+// fresh, and was billed a second time -- the exact failure this file exists to
+// prevent. It never recovered without a restart.
+//
+// It also made docs/SECURITY.md's claim that entries expire with the TTL false.
+func (s *idemStore) Sweep() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	entries, _ := os.ReadDir(s.dir)
+	for _, e := range entries {
+		i, err := e.Info()
+		if err != nil || time.Since(i.ModTime()) <= s.ttl {
+			continue
+		}
+		if os.Remove(filepath.Join(s.dir, e.Name())) == nil {
+			s.used -= i.Size()
+			s.count--
+		}
+	}
+}
+
 // path derives a filename from the key by hashing it. A key is caller-supplied
 // and would otherwise be a path traversal straight into the data directory.
 func (s *idemStore) path(key string) string {

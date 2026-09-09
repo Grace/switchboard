@@ -4,7 +4,7 @@
 
 One customer task is one trust domain. The gateway binds only to a loopback IP and requires an application bearer token. Other containers in that task share its network namespace; do not colocate untrusted workloads. Metrics and health endpoints assume this task boundary. Gateway credentials never reach the control plane. Configuration, trust keys, disk cache and binaries must be writable only by deployment operators/the sidecar as appropriate.
 
-All configured remote endpoints require HTTPS; an explicit option allows HTTP only to localhost/loopback for local tests or a same-task Collector. Redirects are rejected. Provider response bodies, prompts, completions and bearer values are not logged or included in product telemetry. Metadata includes request/trace IDs, provider, attempt count, status and timestamps. Local trace context is accepted but request IDs are always regenerated.
+All configured remote endpoints require HTTPS; an explicit option allows HTTP only to localhost/loopback for local tests or a same-task Collector. Redirects are rejected. Prompts, completions and bearer values are not logged or included in product telemetry. **A provider's own error message is an exception and is logged** when a request is refused, so that a failure can be diagnosed at all; see "Provider error text" below. Metadata includes request/trace IDs, provider, attempt count, status and timestamps. Local trace context is accepted but request IDs are always regenerated.
 
 The control plane stores SHA-256 hashes of high-entropy random bearer tokens, not passwords. A password-derived token is unsafe and unsupported. Roles and tenant membership come from Postgres on each call. Public endpoint handlers never accept an arbitrary tenant header. Table queries explicitly filter tenant, with forced RLS on policies/telemetry/audit as a second layer. The runtime database login must be a member only of `switchboard_app`, not migration owner, superuser or `BYPASSRLS`. The authentication function can read credential hashes but exposes only principal ID, tenant and role. Security-definer functions fix their search path and revoke public execution.
 
@@ -12,7 +12,7 @@ RLS guards accidental missing filters; it is not isolation from a fully compromi
 
 ## Idempotency and content at rest
 
-Provider response bodies, prompts and completions are not logged and are not in product telemetry.
+Prompts and completions are not logged and are not in product telemetry. A provider's error message is logged when a request is refused; a provider's response *body* is not.
 **Enabling `idempotency_ttl_seconds` changes what is at rest**, and that is the one place this
 statement needs qualifying: an idempotency entry stores the request body hash and the response
 content so a duplicate key can be answered without calling the provider again.
@@ -53,6 +53,26 @@ config file.
 
 Turning it on takes on the corresponding obligations: encrypted storage, restricted mounts, a
 retention position, and an answer for deletion requests. The TTL is a bound, not a policy.
+
+### Provider error text
+
+When a provider refuses a request, the gateway logs the message that provider returned, via
+`providerReason` in `internal/gateway/fault.go`. It reads only the `error.message` or `message`
+field out of the first 8 KiB of the response and caps the result at 300 characters. The same string
+is returned to the caller in the error response.
+
+**This is a deliberate exception to the sentence above, and it is stated because the alternative is
+a promise that is not kept.** Without it a 400 from a provider is an opaque failure: the whole
+reason `fault.go` can tell "this account cannot pay" from "this request is malformed" is that the
+body carries text the status code does not.
+
+What it means for an operator: a provider's validation errors sometimes quote the offending part of
+the submitted request, so a log collector shipping stdout off the machine can carry fragments of
+request content. That is on by default. If that is unacceptable for a deployment, the log stream
+needs the same treatment as the capture directory below rather than being assumed clean.
+
+The telemetry path is held to the stricter rule and does not carry it: `error.message` is
+deliberately absent from spans, which is why spans record only `error.type`.
 
 ## Runtime profiling
 
