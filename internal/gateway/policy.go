@@ -66,6 +66,15 @@ func Canonical(p Policy) []byte {
 func (s *PolicyStore) Verify(raw []byte, now time.Time) (*Policy, error) {
 	return s.verify(raw, now, false)
 }
+
+// policySchema is the policy document schema this build can verify. verify()
+// rejects anything else outright, which is correct -- a signature over a
+// document you cannot parse is worth nothing -- and is precisely why the poller
+// sends this to the control plane. A gateway that silently refused every new
+// policy would keep serving its cached copy and go 503 when it expired, up to
+// seven days after the publish, across the whole fleet at once.
+const policySchema = 1
+
 func (s *PolicyStore) verify(raw []byte, now time.Time, allowExpired bool) (*Policy, error) {
 	var e Envelope
 	if len(raw) > 65536 || strictJSON(raw, &e) != nil {
@@ -90,7 +99,7 @@ func (s *PolicyStore) verify(raw []byte, now time.Time, allowExpired bool) (*Pol
 	if strictJSON(b, &p) != nil || !bytes.Equal(b, Canonical(p)) {
 		return nil, errors.New("noncanonical policy")
 	}
-	if p.Schema != 1 || p.Tenant != s.Tenant || !identifier.MatchString(p.Tenant) || p.Version < 1 || p.Version > 9007199254740991 || p.IssuedAt > now.Unix()+60 || p.IssuedAt < 1 || (!allowExpired && p.ExpiresAt <= now.Unix()) || p.ExpiresAt <= p.IssuedAt || p.ExpiresAt-p.IssuedAt > 604800 || len(p.Routes) < 1 || len(p.Routes) > 4 {
+	if p.Schema != policySchema || p.Tenant != s.Tenant || !identifier.MatchString(p.Tenant) || p.Version < 1 || p.Version > 9007199254740991 || p.IssuedAt > now.Unix()+60 || p.IssuedAt < 1 || (!allowExpired && p.ExpiresAt <= now.Unix()) || p.ExpiresAt <= p.IssuedAt || p.ExpiresAt-p.IssuedAt > 604800 || len(p.Routes) < 1 || len(p.Routes) > 4 {
 		return nil, errors.New("invalid policy constraints")
 	}
 	seen := map[string]bool{}

@@ -189,6 +189,26 @@ func (c Config) Validate() error {
 		return fmt.Errorf("capture_bytes is %d; must be %d to %d when capture is enabled",
 			c.CaptureBytes, 1<<20, int64(100)<<30)
 	}
+	// The three stores share one data_dir and each budget was validated only
+	// against itself. spool_bytes up to 10 GiB, idempotency_bytes up to 10 GiB
+	// and capture_bytes up to 100 GiB all pass individually, and a config
+	// allocating more than the volume holds validates cleanly -- then the disk
+	// fills before any store reaches its own limit, and every store starts
+	// failing at once for a reason none of them can report.
+	//
+	// Checked against the filesystem rather than against a constant, because the
+	// number that matters is what this deployment actually has. A Fargate task's
+	// default ephemeral storage is 20 GiB, which two of these limits exceed on
+	// their own.
+	if free, err := freeBytes(c.DataDir); err == nil && free > 0 {
+		total := c.SpoolBytes + c.IdempotencyBytes + c.CaptureBytes
+		if total > free {
+			return fmt.Errorf(
+				"spool_bytes + idempotency_bytes + capture_bytes is %d, more than the %d bytes "+
+					"available on data_dir %q; the volume fills before any store reaches its "+
+					"own limit", total, free, c.DataDir)
+		}
+	}
 	if c.IdempotencyTTLSeconds > 0 && (c.IdempotencyBytes < 1<<20 || c.IdempotencyBytes > 10<<30) {
 		return fmt.Errorf("idempotency_bytes is %d; with idempotency enabled it must be between %d and %d",
 			c.IdempotencyBytes, 1<<20, int64(10)<<30)

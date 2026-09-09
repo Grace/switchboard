@@ -113,20 +113,53 @@ func (s *captureStore) path(id string) string {
 // since a gateway that stays up for a week would otherwise hold a week of
 // prompts under a one-day TTL.
 func (s *captureStore) Sweep() {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	// The scan happens unlocked. Holding the store mutex across a full ReadDir
+	// was inherited from idempotency.go without the property that made it safe
+	// there: an idempotency entry exists only for a request that carried a key,
+	// so its directory is proportional to idempotent traffic, while capture
+	// writes one file for every request including 401s and policy refusals. At
+	// any real rate that directory is large, and a sweep holding the mutex
+	// across it serialises against the write in every request's deferred block.
 	entries, _ := os.ReadDir(s.dir)
+	type victim struct {
+		name string
+		size int64
+	}
+	var expired []victim
 	for _, e := range entries {
 		i, err := e.Info()
 		if err != nil || time.Since(i.ModTime()) <= s.ttl {
 			continue
 		}
-		if os.Remove(filepath.Join(s.dir, e.Name())) == nil {
-			s.used -= i.Size()
-			s.count--
+		expired = append(expired, victim{e.Name(), i.Size()})
+		// Bounded per pass, as deliver() bounds itself, so the cost of a tick
+		// does not grow with the directory.
+		if len(expired) >= sweepPerPass {
+			break
 		}
 	}
+	for _, v := range expired {
+		if os.Remove(filepath.Join(s.dir, v.name)) != nil {
+			continue
+		}
+		s.mu.Lock()
+		s.used -= v.size
+		s.count--
+		s.mu.Unlock()
+	}
 }
+
+// captureMaxRecords bounds the file count as well as the byte total, which the
+// spool already does at 10,000. Bytes alone are not enough: a 10 GiB budget of
+// ~4 KB records is millions of files in one flat directory, where the cost is
+// the directory rather than the disk.
+//
+// sweepPerPass bounds the work one sweep does, so a tick is O(1) in the size of
+// the directory rather than O(N).
+const (
+	captureMaxRecords = 50000
+	sweepPerPass      = 2000
+)
 
 var errCaptureTooLarge = errors.New("capture record exceeds the per-record limit")
 
@@ -160,8 +193,11 @@ func (s *captureStore) Write(r *captureRecord) error {
 	// evidence at exactly the moment the most is being produced, which is the
 	// wrong instinct for a store whose purpose is answering questions about the
 	// past. An operator who wants more sets a bigger limit.
-	if s.used+int64(len(b)) > s.limit {
-		s.m.DiskErrors.Add(1)
+	if s.used+int64(len(b)) > s.limit || s.count >= captureMaxRecords {
+		// Counted separately from a write error: a full store is a capacity
+		// decision an operator can act on, and an I/O failure is not, so one
+		// counter for both told an operator nothing about which they had.
+		s.m.CaptureFull.Add(1)
 		return errors.New("capture store is full")
 	}
 	existing := int64(0)

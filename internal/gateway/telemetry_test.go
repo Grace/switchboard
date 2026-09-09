@@ -808,3 +808,121 @@ func TestFaultNamesAreStable(t *testing.T) {
 		}
 	}
 }
+
+// Model and Fault were span-only because the control plane rejected any key its
+// model did not name, so the fault classification that chose a route could not
+// reach the store that replay reads. They travel in ext now, which exists so a
+// gateway newer than its control plane degrades instead of going silent.
+func TestEventCarriesModelAndFaultInExt(t *testing.T) {
+	e := Event{ID: "a", RequestID: "r", Provider: "anthropic",
+		Model: "claude-haiku-4-5-20251001", Fault: faultAccount.String()}
+
+	var got map[string]any
+	if err := json.Unmarshal(jsonBytes(e.wire()), &got); err != nil {
+		t.Fatalf("not valid JSON: %v", err)
+	}
+	ext, ok := got["ext"].(map[string]any)
+	if !ok {
+		t.Fatalf("no ext object: %v", got)
+	}
+	if ext["model"] != "claude-haiku-4-5-20251001" || ext["fault"] != "account" {
+		t.Errorf("ext = %v, want the model and fault", ext)
+	}
+	// Not at the top level: the core schema is the part both halves must agree
+	// on, and it grows only when they can be released together.
+	if _, top := got["model"]; top {
+		t.Error("model leaked into the core schema")
+	}
+	if _, top := got["fault"]; top {
+		t.Error("fault leaked into the core schema")
+	}
+}
+
+// An event with nothing extra must not grow an empty object, so the common case
+// stays exactly the bytes it was.
+func TestEventWithoutExtrasHasNoExt(t *testing.T) {
+	var got map[string]any
+	if err := json.Unmarshal(jsonBytes(Event{ID: "a", RequestID: "r"}.wire()), &got); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := got["ext"]; ok {
+		t.Error("an event with no extras emitted an ext object")
+	}
+}
+
+// The spool path was batched because one POST per event is round-trip bound --
+// "roughly twenty per second across a network at 50 ms" in its own comment --
+// and the OTLP path was left in exactly that shape while being the one the
+// deployment docs point at a hosted backend. A single goroutine doing a
+// blocking POST per span caps how much tracing a gateway can emit, and the
+// excess is dropped at Emit.
+func TestOTLPSpansAreBatchedIntoOneRequest(t *testing.T) {
+	var requests atomic.Int64
+	var spans atomic.Int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests.Add(1)
+		b, _ := io.ReadAll(r.Body)
+		var body struct {
+			ResourceSpans []struct {
+				ScopeSpans []struct {
+					Spans []map[string]any `json:"spans"`
+				} `json:"scopeSpans"`
+			} `json:"resourceSpans"`
+		}
+		if json.Unmarshal(b, &body) == nil && len(body.ResourceSpans) > 0 &&
+			len(body.ResourceSpans[0].ScopeSpans) > 0 {
+			spans.Add(int64(len(body.ResourceSpans[0].ScopeSpans[0].Spans)))
+		}
+		w.Write([]byte(`{}`))
+	}))
+	defer srv.Close()
+
+	tel := &Telemetry{c: Config{OTLPURL: srv.URL}, m: &Metrics{}, http: srv.Client(),
+		otlp: make(chan Event, 64)}
+	// Queue several before the gatherer runs, so they are already waiting.
+	const n = 12
+	for i := 0; i < n; i++ {
+		tel.otlp <- Event{ID: "e", TraceID: "t", SpanID: "s", Status: 200, Start: 1, End: 2}
+	}
+	first := <-tel.otlp
+	tel.exportOTLPBatch(context.Background(), tel.gatherSpans(context.Background(), first))
+
+	if got := spans.Load(); got != n {
+		t.Errorf("delivered %d spans, want %d; none may be dropped by batching", got, n)
+	}
+	if got := requests.Load(); got != 1 {
+		t.Errorf("used %d requests for %d spans, want 1", got, n)
+	}
+}
+
+// A quiet gateway must not hold a span waiting for a batch that will not fill.
+func TestOTLPBatchFlushesWhenIdle(t *testing.T) {
+	tel := &Telemetry{c: Config{}, m: &Metrics{}, otlp: make(chan Event)}
+	start := time.Now()
+	got := tel.gatherSpans(context.Background(), Event{ID: "only"})
+	if len(got) != 1 {
+		t.Errorf("gathered %d spans from an idle channel, want 1", len(got))
+	}
+	if elapsed := time.Since(start); elapsed > 2*otlpFlush {
+		t.Errorf("waited %v for a batch that could not fill; flush is %v", elapsed, otlpFlush)
+	}
+}
+
+// One span per request must still produce the shape the single-span assertions
+// elsewhere depend on, since spanOf is now shared by both paths.
+func TestSingleSpanExportStillWorks(t *testing.T) {
+	var got []byte
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		got, _ = io.ReadAll(r.Body)
+		w.Write([]byte(`{}`))
+	}))
+	defer srv.Close()
+	tel := &Telemetry{c: Config{OTLPURL: srv.URL}, m: &Metrics{}, http: srv.Client()}
+	tel.exportOTLP(context.Background(), Event{ID: "a", TraceID: "t", SpanID: "s",
+		Provider: "openai", Status: 503, Start: 1, End: 2})
+
+	attrs, _ := spanAttrs(t, got)
+	if attrs["error.type"] != "503" || attrs["gen_ai.provider.name"] != "openai" {
+		t.Errorf("single-span export lost attributes: %v", attrs)
+	}
+}

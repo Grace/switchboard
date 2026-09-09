@@ -9,7 +9,7 @@ import os
 import re
 import time
 import uuid
-from typing import Literal
+from typing import Any, Literal
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
@@ -47,7 +47,11 @@ class Event(Strict):
     parent_id: str | None = Field(default=None, pattern=r"^[0-9a-f]{16}$")
     provider: Literal["", "openai", "anthropic", "gemini", "bedrock"]
     status: int = Field(ge=100, le=599)
-    attempts: int = Field(ge=0, le=3)
+    # Not le=3. The gateway's own max_attempts is validated 1..3 in config.go,
+    # but that is a local operating choice and this is a wire contract: encoding
+    # today's retry ceiling here means raising it later rejects every event from
+    # a gateway that does. Bounded against garbage, not against a policy.
+    attempts: int = Field(ge=0, le=64)
     start_ns: int = Field(ge=1)
     end_ns: int = Field(ge=1)
     # Optional, and that is load-bearing in both directions. This model forbids
@@ -61,6 +65,21 @@ class Event(Strict):
     # routing decision; without it the envelope is there and nothing points at
     # which one was live.
     policy_version: int | None = Field(default=None, ge=1)
+    # Everything the core schema does not name, kept verbatim.
+    #
+    # extra="forbid" on the core is deliberate and stays: a typo in request_id
+    # should be a rejected event, not a silently mis-stored one. But a strict
+    # model across an upgrade boundary the vendor does not control is a
+    # different thing, and it has already fired once -- adding policy_version
+    # made every event from a newer gateway fail validation on an older control
+    # plane, and the gateway's response is to drop and count, so the symptom is
+    # silence rather than an error anyone sees.
+    #
+    # A named object rather than extra="allow" for the whole model, because that
+    # would buy forward compatibility by giving up the typo protection on the
+    # fields that matter. New optional fields go in here; the core grows only
+    # when both halves can be released together.
+    ext: dict[str, Any] = Field(default_factory=dict)
 
 class EventBatch(Strict):
     # Bounded in the model rather than checked by hand: an unbounded array is a
@@ -164,9 +183,31 @@ def create_app(pool=None, seed=None, key_id=None):
         return {"ready": request.app.state.ready}
 
     @app.get("/v1/policy")
-    def policy(s=Depends(session, scope="function")):
+    def policy(max_schema: int | None = None, s=Depends(session, scope="function")):
+        """The newest policy this caller can actually verify.
+
+        A gateway hard-rejects a policy whose schema it does not know, keeps
+        serving from its cached copy, and goes 503 when that expires -- so
+        publishing a new schema to a fleet that has not been upgraded is a
+        delayed, silent, fleet-wide data-plane outage, arriving up to seven days
+        after the publish that caused it.
+
+        max_schema lets a gateway say what it can verify, and is optional so an
+        older gateway that does not send it keeps the previous behaviour rather
+        than breaking on the day this ships. A tenant can then carry a mixed
+        fleet through a rolling upgrade: publish schema 2, gateways that
+        understand it take it, gateways that do not keep taking the newest
+        schema 1 until they are replaced.
+        """
         db, p = s
-        row = db.execute("SELECT envelope FROM policies WHERE tenant_id=%s ORDER BY version DESC LIMIT 1", (p["tenant_id"],)).fetchone()
+        if max_schema is not None:
+            row = db.execute(
+                "SELECT envelope FROM policies WHERE tenant_id=%s AND schema<=%s"
+                " ORDER BY version DESC LIMIT 1",
+                (p["tenant_id"], max_schema),
+            ).fetchone()
+        else:
+            row = db.execute("SELECT envelope FROM policies WHERE tenant_id=%s ORDER BY version DESC LIMIT 1", (p["tenant_id"],)).fetchone()
         if row is None:
             raise HTTPException(404, "no policy")
         return row["envelope"]
@@ -185,7 +226,11 @@ def create_app(pool=None, seed=None, key_id=None):
         if row["version"] is not None and body["version"] <= row["version"]:
             raise HTTPException(409, "version must increase")
         envelope = sign(body, request.app.state.key_id, request.app.state.seed)
-        db.execute("INSERT INTO policies(tenant_id,version,envelope) VALUES(%s,%s,%s)", (p["tenant_id"], body["version"], Jsonb(envelope)))
+        # schema denormalised from the document the signature covers, so a
+        # gateway can ask for the newest policy it is able to verify without
+        # anything having to decode a signed payload in a query.
+        db.execute("INSERT INTO policies(tenant_id,version,envelope,schema) VALUES(%s,%s,%s,%s)",
+                   (p["tenant_id"], body["version"], Jsonb(envelope), body["schema"]))
         audit(db, p, "policy.publish", {"version": body["version"], "key_id": envelope["key_id"]})
         return envelope
 

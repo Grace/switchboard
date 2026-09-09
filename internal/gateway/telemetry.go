@@ -82,8 +82,14 @@ type Metrics struct {
 	// worse than the 400 it replaces unless it is visible, which is the same
 	// argument as usage_mismatch_total.
 	TemperatureDropped atomic.Int64
-	LatencyBuckets     [len(latencyBounds)]atomic.Int64
-	LogDropped         *atomic.Int64
+	// CaptureFull and IdemFull separate a capacity decision from an I/O failure.
+	// One DiskErrors counter covered the spool, the idempotency store and the
+	// capture store, and covered "the disk refused" and "this store hit its own
+	// budget" alike -- so a rising number told an operator neither which store
+	// was in trouble nor whether raising a limit would fix it.
+	CaptureFull, IdemFull atomic.Int64
+	LatencyBuckets        [len(latencyBounds)]atomic.Int64
+	LogDropped            *atomic.Int64
 }
 
 // The first bucket of an explicit-bounds histogram has no lower bound, so
@@ -154,6 +160,8 @@ func (m *Metrics) series() []series {
 		{"provider_probe_failed_total", "counter", &m.ProviderProbeFailed},
 		{"budget_skip_total", "counter", &m.BudgetSkip},
 		{"temperature_dropped_total", "counter", &m.TemperatureDropped},
+		{"capture_full_total", "counter", &m.CaptureFull},
+		{"idempotency_full_total", "counter", &m.IdemFull},
 		{"idempotent_replay_total", "counter", &m.IdempotentReplay},
 		{"idempotent_conflict_total", "counter", &m.IdempotentConflict},
 		{"idempotent_unknown_total", "counter", &m.IdempotentUnknown},
@@ -211,15 +219,46 @@ type Event struct {
 	// Recorded before any route is chosen, so a request refused by policy has it
 	// as surely as one that reached a provider.
 	PolicyVersion int64 `json:"policy_version,omitempty"`
-	// Span-only, and json:"-" is load-bearing rather than tidiness. The control
-	// plane declares its Event model with extra="forbid", so one unrecognised
-	// key does not degrade an event, it rejects it: every event would fail
-	// validation and all control-plane telemetry would stop. Spans reach the
-	// OTLP endpoint directly without passing through the control plane, so these
-	// two carry to Honeycomb regardless. Sending either upstream is a separate
-	// change that has to deploy the control plane first.
+	// Model and Fault were span-only, because the control plane rejected any key
+	// its model did not name and one unrecognised field failed the whole event.
+	// They now travel in Ext, which exists so that a gateway newer than the
+	// control plane it reports to degrades instead of going silent.
+	//
+	// They are still Go fields rather than map entries: the span builder reads
+	// them directly, and a routing decision recorded in a map is a routing
+	// decision nothing type-checks.
 	Model string `json:"-"`
 	Fault string `json:"-"`
+	// Ext carries everything the core schema does not name. The control plane
+	// validates the core strictly and keeps this verbatim, so a field added to
+	// the gateway reaches an older control plane as data rather than as a
+	// validation failure -- which is the whole point, because the two halves are
+	// deployed independently by a customer and there is no ordering to enforce.
+	//
+	// New optional fields belong here, not at the top level. The core is the
+	// part both sides must agree on and is deliberately hard to grow.
+	Ext map[string]any `json:"ext,omitempty"`
+}
+
+// wire fills Ext from the fields that are not part of the core schema. Done at
+// the single point where an event is serialised, so a new field cannot be added
+// to Event and forgotten here.
+func (e Event) wire() Event {
+	ext := map[string]any{}
+	for k, v := range e.Ext {
+		ext[k] = v
+	}
+	if e.Model != "" {
+		ext["model"] = e.Model
+	}
+	if e.Fault != "" {
+		ext["fault"] = e.Fault
+	}
+	if len(ext) == 0 {
+		return e
+	}
+	e.Ext = ext
+	return e
 }
 
 func randomID(n int) string {
@@ -313,7 +352,18 @@ func (t *Telemetry) Start(ctx context.Context) {
 			case <-ctx.Done():
 				return
 			case e := <-t.otlp:
-				t.exportOTLP(ctx, e)
+				// Gathered, not sent one at a time. The spool path was batched
+				// for exactly this reason -- one POST per event is round-trip
+				// bound, roughly twenty per second across a 50 ms network -- and
+				// the OTLP path was left in that shape while being the one the
+				// deployment docs point at a hosted backend. A single goroutine
+				// doing a blocking POST per span is a hard ceiling on how much
+				// tracing a gateway can emit, and the excess is dropped at Emit.
+				//
+				// OTLP/HTTP already carries many spans in one scopeSpans.spans
+				// array, so this is batching within the protocol rather than a
+				// change to it.
+				t.exportOTLPBatch(ctx, t.gatherSpans(ctx, e))
 			}
 		}
 	}()
@@ -351,7 +401,7 @@ func (t *Telemetry) Start(ctx context.Context) {
 }
 func (t *Telemetry) Wait() { t.wg.Wait() }
 func (t *Telemetry) persist(e Event) {
-	b := jsonBytes(e)
+	b := jsonBytes(e.wire())
 	if t.m.SpoolUsed.Load()+int64(len(b)) > t.c.SpoolBytes || t.m.SpoolCount.Load() >= 10000 {
 		t.m.Dropped.Add(1)
 		return
@@ -689,8 +739,54 @@ func (t *Telemetry) otlpHeaders(req *http.Request) {
 	}
 }
 
+// otlpBatch and otlpFlush bound a span batch the way deliverBatch and
+// deliverBytes bound the spool: by count and by time, so a quiet gateway does
+// not hold a span waiting for a batch that will not fill.
+const (
+	otlpBatch = 64
+	otlpFlush = 200 * time.Millisecond
+)
+
+// gatherSpans collects whatever is already queued behind the first event,
+// without waiting for more than otlpFlush. Under load this fills immediately;
+// idle, it returns the one span it was given.
+func (t *Telemetry) gatherSpans(ctx context.Context, first Event) []Event {
+	batch := make([]Event, 0, otlpBatch)
+	batch = append(batch, first)
+	timer := time.NewTimer(otlpFlush)
+	defer timer.Stop()
+	for len(batch) < otlpBatch {
+		select {
+		case <-ctx.Done():
+			return batch
+		case e := <-t.otlp:
+			batch = append(batch, e)
+		case <-timer.C:
+			return batch
+		}
+	}
+	return batch
+}
+
+// exportOTLPBatch sends many spans as one request.
+func (t *Telemetry) exportOTLPBatch(ctx context.Context, events []Event) {
+	if len(events) == 0 {
+		return
+	}
+	spans := make([]any, 0, len(events))
+	for _, e := range events {
+		spans = append(spans, t.spanOf(e))
+	}
+	t.postSpans(ctx, spans)
+}
+
 // OTLP/HTTP JSON encoding follows the OpenTelemetry protobuf JSON mapping.
-func (t *Telemetry) exportOTLP(ctx context.Context, e Event) {
+//
+// spanOf builds one span; postSpans sends any number of them. Split so the
+// batching above shares the encoding rather than duplicating it -- the span
+// attributes here are the product of several corrections and must not exist in
+// two places.
+func (t *Telemetry) spanOf(e Event) map[string]any {
 	attrs := []any{
 		map[string]any{"key": "gen_ai.provider.name", "value": map[string]any{"stringValue": e.Provider}},
 		map[string]any{"key": "http.response.status_code", "value": map[string]any{"intValue": strconv.Itoa(e.Status)}},
@@ -746,7 +842,17 @@ func (t *Telemetry) exportOTLP(ctx context.Context, e Event) {
 		span["attributes"] = append(span["attributes"].([]any),
 			map[string]any{"key": "error.type", "value": map[string]any{"stringValue": strconv.Itoa(e.Status)}})
 	}
-	body := map[string]any{"resourceSpans": []any{map[string]any{"resource": map[string]any{"attributes": []any{map[string]any{"key": "service.name", "value": map[string]any{"stringValue": "switchboard-gateway"}}}}, "scopeSpans": []any{map[string]any{"scope": map[string]any{"name": "switchboard", "version": "1.0.0"}, "spans": []any{span}}}}}}
+	return span
+}
+
+// exportOTLP sends a single span. Kept for the tests that assert on one span's
+// shape; the serving path batches through exportOTLPBatch.
+func (t *Telemetry) exportOTLP(ctx context.Context, e Event) {
+	t.postSpans(ctx, []any{t.spanOf(e)})
+}
+
+func (t *Telemetry) postSpans(ctx context.Context, spans []any) {
+	body := map[string]any{"resourceSpans": []any{map[string]any{"resource": map[string]any{"attributes": []any{map[string]any{"key": "service.name", "value": map[string]any{"stringValue": "switchboard-gateway"}}}}, "scopeSpans": []any{map[string]any{"scope": map[string]any{"name": "switchboard", "version": "1.0.0"}, "spans": spans}}}}}
 	req, _ := http.NewRequestWithContext(ctx, "POST", t.c.OTLPURL, bytes.NewReader(jsonBytes(body)))
 	req.Header.Set("Content-Type", "application/json")
 	t.otlpHeaders(req)

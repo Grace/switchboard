@@ -1022,7 +1022,14 @@ func (s *Server) Sync(ctx context.Context) {
 func (s *Server) syncOnce(ctx context.Context) {
 	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
-	req, _ := http.NewRequestWithContext(ctx, "GET", trimURL(s.C.ControlURL)+"/v1/policy", nil)
+	// Says what this build can verify. verify() hard-rejects an unknown schema,
+	// so without this a control plane publishing a newer one hands every gateway
+	// a document it must refuse -- each keeps serving its cached copy and goes
+	// 503 when that expires, days later, all at once. Asking for the newest
+	// policy at or below what this binary understands turns a schema bump into a
+	// rolling upgrade instead.
+	req, _ := http.NewRequestWithContext(ctx, "GET",
+		fmt.Sprintf("%s/v1/policy?max_schema=%d", trimURL(s.C.ControlURL), policySchema), nil)
 	req.Header.Set("Authorization", "Bearer "+os.Getenv(s.C.ControlTokenEnv))
 	res, e := s.HTTP.Do(req)
 	if e != nil {

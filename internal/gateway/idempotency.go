@@ -236,7 +236,11 @@ func (s *idemStore) write(key string, e *idemEntry) error {
 	if fi, statErr := os.Stat(s.path(key)); statErr == nil {
 		existing = fi.Size()
 	} else if s.used+int64(len(b)) > s.limit {
-		s.m.DiskErrors.Add(1)
+		// A full store means new keys are refused, and Server.chat does not
+		// match that error -- so the request proceeds with no entry and
+		// idempotency is silently off. Its own counter, because that is a
+		// capacity decision rather than a disk fault.
+		s.m.IdemFull.Add(1)
 		return errors.New("idempotency store is full")
 	}
 	if err := os.WriteFile(s.path(key), b, 0600); err != nil {

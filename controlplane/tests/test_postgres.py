@@ -175,3 +175,74 @@ def test_replay_rejects_ids_that_are_not_request_ids(setup):
 def test_replay_requires_authentication(setup):
     c,t,_ = setup
     assert c.get("/v1/replay/" + "0"*32).status_code == 401
+
+def test_event_ext_survives_and_core_stays_strict(setup):
+    """The forward-compatibility contract, both halves of it.
+
+    A field the control plane does not know must arrive as data rather than as
+    a validation failure -- adding policy_version made every event from a newer
+    gateway fail on an older control plane, and the gateway drops what is not
+    acknowledged, so the symptom was silence. But the core must stay strict: a
+    typo in request_id should be a rejected event, not a silently mis-stored one.
+    """
+    c,t,_ = setup
+    ev = _event(ext={"model":"claude-haiku-4-5-20251001","fault":"rate_limit",
+                     "something_invented_later": 42})
+    r = c.post("/v1/telemetry/batch",json={"events":[ev]},headers=auth(t,role="agent"))
+    assert r.status_code == 200 and r.json()["accepted"] == [ev["id"]]
+
+    stored = [x for x in c.get("/v1/telemetry",headers=auth(t)).json()
+              if x["event"]["id"] == ev["id"]][0]["event"]
+    # Verbatim, including the key nobody has written a model for.
+    assert stored["ext"]["model"] == "claude-haiku-4-5-20251001"
+    assert stored["ext"]["fault"] == "rate_limit"
+    assert stored["ext"]["something_invented_later"] == 42
+
+    # The core is still closed: an unknown TOP-LEVEL key is a rejection, which
+    # is what keeps a typo from becoming a quietly wrong record.
+    bad = _event(); bad["requst_id"] = bad.pop("request_id")
+    r2 = c.post("/v1/telemetry/batch",json={"events":[bad]},headers=auth(t,role="agent"))
+    assert r2.status_code == 200 and r2.json()["accepted"] == []
+
+def test_attempts_is_not_bounded_by_todays_retry_ceiling(setup):
+    """max_attempts is validated 1..3 in the gateway's own config, but that is a
+    local operating choice. Encoding it on the wire means raising it later
+    rejects every event from a gateway that does."""
+    c,t,_ = setup
+    ev = _event(attempts=7)
+    r = c.post("/v1/telemetry/batch",json={"events":[ev]},headers=auth(t,role="agent"))
+    assert r.json()["accepted"] == [ev["id"]], "a wire bound encoded a local policy"
+
+def test_policy_schema_negotiation(setup):
+    """A gateway hard-rejects a policy schema it cannot verify, keeps serving its
+    cached copy, and goes 503 when that expires -- so publishing a new schema to
+    a fleet that has not been upgraded is a delayed, silent, fleet-wide outage
+    arriving up to seven days later. max_schema turns that into a rolling
+    upgrade."""
+    c,t,_ = setup
+    assert c.put("/v1/policy",json=policy(version=900),headers=auth(t)).status_code == 200
+
+    # A gateway that says what it can verify gets it.
+    r = c.get("/v1/policy?max_schema=1",headers=auth(t,role="agent"))
+    assert r.status_code == 200
+
+    # Omitting the parameter keeps the old behaviour, so a gateway predating
+    # this change does not break on the day it ships.
+    assert c.get("/v1/policy",headers=auth(t,role="agent")).status_code == 200
+
+    # A schema this caller cannot verify is not served to it. Simulated by
+    # asking for a lower ceiling than anything published.
+    assert c.get("/v1/policy?max_schema=0",headers=auth(t,role="agent")).status_code == 404
+
+def test_policy_schema_is_recorded_for_negotiation(setup):
+    """Denormalised at publish time, because the writer already parsed the
+    document and decoding a signed payload in a query to recover a number it
+    had is the wrong place to spend it."""
+    c,t,pool = setup
+    assert c.put("/v1/policy",json=policy(version=901),headers=auth(t)).status_code == 200
+    with pool.connection() as db:
+        db.execute("SELECT set_config('app.tenant','tenant-a',false)")
+        row = db.execute("SELECT schema FROM policies WHERE tenant_id='tenant-a'"
+                         " ORDER BY version DESC LIMIT 1").fetchone()
+    # dict_row: the pool returns mappings, not tuples.
+    assert row["schema"] == 1
