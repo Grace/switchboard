@@ -359,10 +359,24 @@ Each of these is backed by a run recorded in `docs/VALIDATION.md`.
    plane first.** `scripts/dev-up.sh` did not rebuild the control plane image at
    all, which is how this was found.
 
-7. **Anthropic prompt-cache tokens are not counted.** Responses carry
-   `cache_creation_input_tokens` and `cache_read_input_tokens`; neither is
-   modelled. Both are zero today, so input accounting is currently correct, but
-   enabling prompt caching would under-count input.
+7. **Anthropic prompt-cache tokens, now counted.** Anthropic splits input three
+   ways and `input_tokens` is only one of them: its documentation defines that
+   field as "the tokens that come after the last cache breakpoint in your
+   request, not all the input tokens you sent", and gives
+   `total_input = cache_read + cache_creation + input`. The three are disjoint.
+
+   Reading `input_tokens` alone was therefore not a rounding error but an
+   unbounded under-count. Anthropic's own worked example is 100,000 tokens read
+   from cache plus a 50-token message, which reports `input_tokens: 50`; the
+   gateway would have told the caller that request cost 50 input tokens when it
+   cost 100,050. All three are now summed.
+
+   It was invisible rather than absent: `cache_control` is opt-in, so both fields
+   are zero on every request made so far and the arithmetic was correct by
+   accident. The defect would have arrived with the first cached prompt, not with
+   a deployment. This does not touch AWS Marketplace billing, which meters per
+   task-hour rather than per token; it is the `usage` block returned to callers,
+   and anything built on it for cost attribution.
 8. **Reasoning models constrain `temperature`.** They reject any value other
    than the default. `Chat.Temperature` is optional and was nil throughout
    testing, so this has not been hit, but a caller setting it against a

@@ -214,8 +214,24 @@ type wire struct {
 		Text string `json:"text"`
 	} `json:"content_block"`
 	Usage struct {
-		Input      int `json:"input_tokens"`
-		Output     int `json:"output_tokens"`
+		Input  int `json:"input_tokens"`
+		Output int `json:"output_tokens"`
+		// Anthropic's prompt caching splits input three ways and input_tokens is
+		// only one of them: "the tokens that come after the last cache breakpoint
+		// in your request - not all the input tokens you sent". The three are
+		// disjoint and total_input = input + cache_creation + cache_read.
+		//
+		// Reading input_tokens alone is therefore not a small under-count, it is
+		// an unbounded one. Anthropic's own example: 100,000 tokens read from
+		// cache plus a 50-token message reports input_tokens = 50. A gateway that
+		// stops there tells the caller their request cost 50 input tokens when it
+		// cost 100,050.
+		//
+		// Both are zero unless the caller uses cache_control, which is why this
+		// was invisible rather than absent: the defect arrives with the first
+		// cached prompt, not with a deployment.
+		CacheCreation int `json:"cache_creation_input_tokens"`
+		CacheRead     int `json:"cache_read_input_tokens"`
 		Prompt     int `json:"prompt_tokens"`
 		Completion int `json:"completion_tokens"`
 		// Reasoning models bill hidden reasoning inside completion_tokens and
@@ -311,7 +327,9 @@ func normalize(provider string, b []byte, stream bool) (normalized, bool, error)
 			}
 		}
 	case "anthropic":
-		n.Input = w.Usage.Input
+		// All three, because they are disjoint parts of one total. Absent fields
+		// decode to zero, so an uncached response is unchanged.
+		n.Input = w.Usage.Input + w.Usage.CacheCreation + w.Usage.CacheRead
 		n.Output = w.Usage.Output
 		if stream {
 			switch w.Type {

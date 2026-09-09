@@ -166,3 +166,96 @@ func TestOpenAIRequestUsesMaxCompletionTokens(t *testing.T) {
 		t.Errorf("model = %v", got["model"])
 	}
 }
+
+// Anthropic's three input counts are disjoint parts of one total, not a total
+// and two subsets of it. Their documentation is explicit -- input_tokens is
+// "the tokens that come after the last cache breakpoint in your request, not
+// all the input tokens you sent" -- and gives
+// total_input = cache_read + cache_creation + input.
+//
+// Reading input_tokens alone is an unbounded under-count rather than a rounding
+// error. Anthropic's own example is 100,000 tokens read from cache plus a
+// 50-token message, which reports input_tokens = 50; a gateway that stops there
+// tells the caller their request cost 50 input tokens when it cost 100,050.
+func TestAnthropicCountsCachedInputTokens(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		usage string
+		want  int
+	}{
+		{
+			// The case every request has today. cache_control is opt-in, so both
+			// fields are absent, decode to zero, and the total is unchanged. This
+			// is the behaviour that must not move.
+			name:  "no caching, unchanged",
+			usage: `{"input_tokens":11,"output_tokens":7}`,
+			want:  11,
+		},
+		{
+			name:  "cache being written",
+			usage: `{"input_tokens":50,"cache_creation_input_tokens":1024,"output_tokens":7}`,
+			want:  1074,
+		},
+		{
+			name:  "cache being read",
+			usage: `{"input_tokens":50,"cache_read_input_tokens":100000,"output_tokens":7}`,
+			want:  100050, // Anthropic's own worked example.
+		},
+		{
+			name: "reading one cache while writing another",
+			usage: `{"input_tokens":50,"cache_creation_input_tokens":1024,` +
+				`"cache_read_input_tokens":100000,"output_tokens":7}`,
+			want: 101074,
+		},
+		{
+			// The whole prompt was cached and nothing followed the breakpoint.
+			// input_tokens is legitimately zero here, and reporting zero input for
+			// a request that processed 4096 tokens is the starkest form of the bug.
+			name:  "everything cached, nothing after the breakpoint",
+			usage: `{"input_tokens":0,"cache_read_input_tokens":4096,"output_tokens":7}`,
+			want:  4096,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			body := `{"content":[{"type":"text","text":"hi"}],"stop_reason":"end_turn","usage":` +
+				tc.usage + `}`
+			n, _, err := normalize("anthropic", []byte(body), false)
+			if err != nil {
+				t.Fatalf("normalize: %v", err)
+			}
+			if n.Input != tc.want {
+				t.Errorf("Input = %d, want %d", n.Input, tc.want)
+			}
+			if n.Output != 7 {
+				t.Errorf("Output = %d, want 7; counting cached input must not disturb output",
+					n.Output)
+			}
+		})
+	}
+}
+
+// The cache fields are Anthropic's. The usage struct is shared across providers,
+// so a key that only one provider sends must not change what the others report:
+// OpenAI counts prompt_tokens and Gemini promptTokenCount, and neither has any
+// notion of a cache breakpoint.
+func TestCachedInputCountsAreAnthropicOnly(t *testing.T) {
+	for _, tc := range []struct{ provider, body string }{
+		{"openai", `{"choices":[{"message":{"content":"hi"},"finish_reason":"stop"}],` +
+			`"usage":{"prompt_tokens":11,"completion_tokens":7,` +
+			`"cache_creation_input_tokens":9999,"cache_read_input_tokens":9999}}`},
+		{"gemini", `{"candidates":[{"content":{"parts":[{"text":"hi"}]},"finishReason":"STOP"}],` +
+			`"usageMetadata":{"promptTokenCount":11,"candidatesTokenCount":7,"totalTokenCount":18,` +
+			`"cache_creation_input_tokens":9999,"cache_read_input_tokens":9999}}`},
+	} {
+		t.Run(tc.provider, func(t *testing.T) {
+			n, _, err := normalize(tc.provider, []byte(tc.body), false)
+			if err != nil {
+				t.Fatalf("normalize: %v", err)
+			}
+			if n.Input != 11 {
+				t.Errorf("Input = %d, want 11; %s does not report Anthropic cache fields",
+					n.Input, tc.provider)
+			}
+		})
+	}
+}
