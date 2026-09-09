@@ -210,6 +210,10 @@ func main() {
 	// live. A key that is present but wrong, or an account that cannot pay, is
 	// otherwise only discovered by a customer's first request failing.
 	go s.ProbeProviders(background)
+	// Started in both modes, deliberately. A policy lasts at most seven days and
+	// renewal is manual either way, and file-only operation is the mode with no
+	// control plane to notice on the operator's behalf.
+	go s.WatchPolicyExpiry(background)
 	srv := &http.Server{Addr: c.Listen, Handler: s.Handler(), ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 15 * time.Second, WriteTimeout: 100 * time.Second, IdleTimeout: 60 * time.Second, MaxHeaderBytes: 16384}
 	signals, unregister := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
 	defer unregister()

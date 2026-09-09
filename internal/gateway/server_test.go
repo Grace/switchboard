@@ -1,10 +1,12 @@
 package gateway
 
 import (
+	"bytes"
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"regexp"
@@ -314,6 +316,86 @@ func TestProblemClearsStreamingHeaders(t *testing.T) {
 		if got := w.Header().Get(h); got != "" {
 			t.Errorf("%s = %q on a JSON error body, want it cleared", h, got)
 		}
+	}
+}
+
+// A policy lasts at most seven days and renewal is manual. Nothing measured the
+// remaining time, so the first signal a deployment got was /readyz turning 503 --
+// after it had already stopped serving. A system that worked for a week and then
+// stopped, with no indication a clock was running, is worse than one that never
+// started, because by then the operator believed it.
+func TestPolicyExpiryIsMeasuredAndWarnedAboutOnce(t *testing.T) {
+	s := testServer(t, map[string]ProviderConfig{"openai": {URL: "http://127.0.0.1:1", KeyEnv: "PROVIDER_KEY"}})
+
+	// The test policy has an hour left, which is inside the warning margin.
+	s.samplePolicyExpiry()
+	left := s.Metrics.PolicyExpiresIn.Load()
+	if left <= 0 || left > int64(policyExpiryWarn.Seconds()) {
+		t.Fatalf("policy_expires_in_seconds = %d, want a positive value inside the warning margin", left)
+	}
+	if band, _ := s.expiryState.Load().(string); band != "expiring" {
+		t.Errorf("band = %q, want expiring", band)
+	}
+
+	// Sampling again must not warn again. Asserting on the band alone would not
+	// catch that -- storing the same value twice looks identical -- so this
+	// counts what actually reached the log. Two days of one-minute ticks is 2,880
+	// identical warnings otherwise, which buries the line it is trying to raise.
+	var logged bytes.Buffer
+	restore := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&logged, nil)))
+	defer slog.SetDefault(restore)
+
+	s.samplePolicyExpiry()
+	s.samplePolicyExpiry()
+	s.samplePolicyExpiry()
+	if n := strings.Count(logged.String(), "policy expires soon"); n != 0 {
+		t.Errorf("warned %d more times for an unchanged policy, want 0", n)
+	}
+	if band, _ := s.expiryState.Load().(string); band != "expiring" {
+		t.Errorf("band changed on an unchanged policy: %q", band)
+	}
+
+	// Past expiry is a different band, and must be reachable rather than
+	// collapsing into "no policy" the way Current() does.
+	expired := &PolicyStore{Tenant: "tenant-a", Keys: s.Policies.Keys}
+	p := testPolicy()
+	p.IssuedAt = time.Now().Unix() - 7200
+	p.ExpiresAt = time.Now().Unix() - 60
+	pub, key, _ := ed25519.GenerateKey(rand.Reader)
+	expired.Keys = map[string]ed25519.PublicKey{"k": pub}
+	if e := expired.Apply(signed(t, p, key, "k"), false); e == nil {
+		t.Fatal("setup: an expired policy was accepted by Apply")
+	}
+	// Apply refuses an expired policy, so load it the way a restart does.
+	if e := expired.Restore(signed(t, p, key, "k")); e != nil {
+		t.Fatalf("setup: %v", e)
+	}
+	s.Policies = expired
+	s.samplePolicyExpiry()
+	if got := s.Metrics.PolicyExpiresIn.Load(); got >= 0 {
+		t.Errorf("expired policy reported %d seconds left, want negative", got)
+	}
+	if band, _ := s.expiryState.Load().(string); band != "expired" {
+		t.Errorf("band = %q, want expired", band)
+	}
+	if n := strings.Count(logged.String(), "policy expired"); n != 1 {
+		t.Errorf("crossing into expiry logged %d times, want exactly 1", n)
+	}
+}
+
+// A gateway that never loaded a policy has no deadline, and inventing one would
+// report a countdown against a policy that does not exist. notReady() already
+// tells those two states apart.
+func TestPolicyExpiryIsSilentWithNoPolicy(t *testing.T) {
+	s := testServer(t, map[string]ProviderConfig{"openai": {URL: "http://127.0.0.1:1", KeyEnv: "PROVIDER_KEY"}})
+	s.Policies = &PolicyStore{Tenant: "tenant-a", Keys: s.Policies.Keys}
+	s.samplePolicyExpiry()
+	if got := s.Metrics.PolicyExpiresIn.Load(); got != 0 {
+		t.Errorf("policy_expires_in_seconds = %d with no policy loaded, want it untouched", got)
+	}
+	if band, _ := s.expiryState.Load().(string); band != "" {
+		t.Errorf("band = %q with no policy loaded, want empty", band)
 	}
 }
 

@@ -83,6 +83,16 @@ type Metrics struct {
 	// runtime has kept rather than objects the program is holding, which a heap
 	// profile would not explain.
 	Goroutines, HeapAlloc, HeapObjects, HeapSys atomic.Int64
+	// PolicyExpiresIn is seconds until the live policy expires, sampled rather
+	// than counted. Negative once it has.
+	//
+	// A policy lasts at most seven days (controlplane/policy.py enforces 604800,
+	// policy.go verifies the same bound), renewal is manual, and docs/SECURITY.md
+	// says so. Nothing measured the remaining time, so the first signal a
+	// deployment got was /readyz turning 503 -- after it had already stopped
+	// serving. The value only reaches an operator if otlp_metrics_url is set;
+	// /metrics is loopback-only, which is what UncollectedMetricsWarning is for.
+	PolicyExpiresIn atomic.Int64
 	// TemperatureDropped counts requests sent without the caller's temperature
 	// because the model refuses it. Silently changing a caller's parameters is
 	// worse than the 400 it replaces unless it is visible, which is the same
@@ -184,6 +194,7 @@ func (m *Metrics) series() []series {
 		{"heap_alloc_bytes", "gauge", &m.HeapAlloc},
 		{"heap_objects", "gauge", &m.HeapObjects},
 		{"heap_sys_bytes", "gauge", &m.HeapSys},
+		{"policy_expires_in_seconds", "gauge", &m.PolicyExpiresIn},
 	}
 	if m.LogDropped != nil {
 		s = append(s, series{"log_dropped_total", "counter", m.LogDropped})

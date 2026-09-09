@@ -203,6 +203,19 @@ func (s *PolicyStore) Expired() bool {
 	return s.current != nil && s.current.ExpiresAt <= time.Now().Unix()
 }
 
+// ExpiresAt is the loaded policy's expiry, or 0 when none was ever loaded.
+// Unlike Current() it keeps answering after expiry, which is the whole point:
+// "expired eleven hours ago" and "never had one" need different answers and
+// Current() collapses them both to nil.
+func (s *PolicyStore) ExpiresAt() int64 {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.current == nil {
+		return 0
+	}
+	return s.current.ExpiresAt
+}
+
 func atomicFile(path string, b []byte) error {
 	f, err := os.CreateTemp(filepath.Dir(path), ".pending-")
 	if err != nil {

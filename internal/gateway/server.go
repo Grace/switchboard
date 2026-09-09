@@ -206,6 +206,10 @@ type Server struct {
 	// than once every fifteen seconds forever: a control plane that is down stays
 	// down, and 5,760 identical lines a day buries the one line that mattered.
 	syncState atomic.Value
+	// expiryState is the last reported policy-expiry band, for the same reason
+	// syncState exists: a policy expiring in thirty hours is still expiring in
+	// thirty hours a minute later, and saying so every minute buries it.
+	expiryState atomic.Value
 }
 
 func New(c Config, p *PolicyStore, m *Metrics, t *Telemetry) *Server {
@@ -1157,6 +1161,79 @@ func (s *Server) syncOnce(ctx context.Context) {
 		return
 	}
 	s.noteSync("")
+}
+
+// policyExpiryWarn is the margin at which an unrenewed policy is worth saying
+// out loud. Two days, because renewal is a human operation -- publishing a
+// higher version through the control plane -- and a warning that first appears
+// on a Saturday needs to survive until Monday.
+const policyExpiryWarn = 48 * time.Hour
+
+// WatchPolicyExpiry samples the time remaining on the live policy.
+//
+// A policy lasts at most seven days: controlplane/policy.py refuses a longer
+// lifetime and verify() enforces the same bound. Renewal is manual and
+// docs/SECURITY.md says so plainly. But nothing measured the remaining time and
+// nothing warned, so the first signal a deployment received was /readyz turning
+// 503 -- after it had already stopped serving. A deployment that worked for a
+// week then stopped, with no prior indication that a clock was running, is a
+// worse first experience than one that never started.
+//
+// This does not renew anything. Renewal is a design question about who re-signs
+// and on what trigger; making the deadline visible is not, and the absence of
+// the second is what turned the first into a surprise.
+func (s *Server) WatchPolicyExpiry(ctx context.Context) {
+	t := time.NewTicker(time.Minute)
+	defer t.Stop()
+	for {
+		s.samplePolicyExpiry()
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+		}
+	}
+}
+
+func (s *Server) samplePolicyExpiry() {
+	at := s.Policies.ExpiresAt()
+	if at == 0 {
+		// Never loaded one. notReady() already distinguishes that from expiry,
+		// and reporting a duration here would invent a deadline that does not
+		// exist.
+		return
+	}
+	left := time.Until(time.Unix(at, 0))
+	s.Metrics.PolicyExpiresIn.Store(int64(left.Seconds()))
+
+	band := "ok"
+	switch {
+	case left <= 0:
+		band = "expired"
+	case left <= policyExpiryWarn:
+		band = "expiring"
+	}
+	prev, _ := s.expiryState.Load().(string)
+	if prev == band {
+		return
+	}
+	s.expiryState.Store(band)
+	switch band {
+	case "expired":
+		slog.Error("policy expired; the gateway is not serving",
+			"expired_at", time.Unix(at, 0).UTC().Format(time.RFC3339),
+			"remedy", "publish a higher policy version; this repository does not renew automatically")
+	case "expiring":
+		slog.Warn("policy expires soon and renewal is manual",
+			"expires_at", time.Unix(at, 0).UTC().Format(time.RFC3339),
+			"hours_left", int(left.Hours()),
+			"remedy", "publish a higher policy version before then")
+	default:
+		if prev != "" {
+			slog.Info("policy renewed",
+				"expires_at", time.Unix(at, 0).UTC().Format(time.RFC3339))
+		}
+	}
 }
 
 // syncHint turns a control-plane status into the thing to go and check. These

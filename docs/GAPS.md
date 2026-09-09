@@ -221,6 +221,44 @@ Each of these is backed by a run recorded in `docs/VALIDATION.md`.
     as CI did before the change and ran clean through `make dev-smoke` after it,
     and the original directory still does both.
 
+22. **A policy expires within seven days and nothing said so until it had.**
+
+    `controlplane/policy.py` refuses a lifetime over 604800 seconds and the
+    gateway's `verify()` enforces the same bound. The cap is deliberate and
+    right: it bounds what a compromised signing key is worth. Renewal is manual,
+    and `docs/SECURITY.md` says so.
+
+    What was missing is that **nothing measured the remaining time.** No metric,
+    no alert, no log line. `/runtime` carried `policy_expires_at` behind the
+    local bearer token, and nothing polls it. So the first signal a deployment
+    received was `/readyz` turning 503, after it had already stopped serving. A
+    system that worked for a week and then stopped, with no indication a clock
+    had been running, is a worse experience than one that never started, because
+    by then the operator believed it.
+
+    Now `switchboard_policy_expires_in_seconds`, a gauge on the same sampled
+    path as the runtime gauges so both emitters get it from the one `series()`
+    list, negative once expired. Plus a warning at 48 hours and an error at
+    expiry, logged on band change rather than per tick — two days of one-minute
+    ticks is 2,880 identical lines, which buries the one it is raising. Both
+    modes start the watcher: file-only operation is the one with no control
+    plane to notice on the operator's behalf.
+
+    **Not alerted on, for a reason worth writing down.** `controlplane/alerting.py`'s
+    `Condition` is counter-only by construction — its own docstring says the
+    question is always "did this go up during the window" — so a gauge threshold
+    cannot be expressed there without extending the type and both emitters. And
+    the Honeycomb free plan allows two triggers per team, which
+    `controlplane/honeycomb.py` already spends by folding four conditions into
+    two. A fifth condition that cannot fold into a counter formula has nowhere
+    to go. The gauge and the log are what work today; the alerting layer needs a
+    gauge-threshold shape before this can join it.
+
+    **Automatic renewal is still not built**, and is a larger question than
+    visibility: who re-signs, on what trigger, and what happens when the signing
+    key is unavailable. Making the deadline visible was the part whose absence
+    turned a documented limit into a surprise.
+
 ## Still open
 
 1. **Deployment is proven for the quickstart only.** `quickstart.yaml` has been
