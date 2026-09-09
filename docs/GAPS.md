@@ -90,7 +90,7 @@ Each of these is backed by a run recorded in `docs/VALIDATION.md`.
     the check. A completion is used rather than an auth-only endpoint
     because `GET /v1/models` returned 200 on a key whose account had no credits,
     minutes before a completion on the same key returned 429.
-17. **Telemetry delivery is batched.** Delivery was one POST per event, issued
+18. **Telemetry delivery is batched.** Delivery was one POST per event, issued
     sequentially, so its real ceiling was round-trip bound rather than the
     hundred per tick the cap suggested: comfortable against a control plane in
     the same task, roughly twenty per second across a network at 50 ms. A spool
@@ -458,7 +458,30 @@ Each of these is backed by a run recorded in `docs/VALIDATION.md`.
 13. **Scale and operations.** Rate limits and circuit state are per process, not
    fleet-wide. There is no retention policy, partitioning, dashboard, SLO, audit
    export or restore drill.
-14. **A release pipeline has run three times; the current rewrite has not.**
+14. **The release pipeline works, and the first OIDC run failed for a reason
+    worth writing down.** `v0.4.0` published both images to ECR with cosign
+    signatures on 2026-09-08, carrying 105 commits.
+
+    The first attempt was refused with `Not authorized to perform
+    sts:AssumeRoleWithWebIdentity`, and everything that error usually means was
+    already correct: the role ARN, the `sts.amazonaws.com` audience on both the
+    provider and the trust policy, and `id-token: write` on the job. It is also
+    not propagation, though it looks exactly like it — `configure-aws-credentials`
+    retried 13 times across 84 seconds and was denied identically each time.
+
+    GitHub issues an **ID-qualified subject**. The repository's own API returns
+    `"sub_claim_prefix": "repo:Grace@14958021/switchboard@1356690158"`, so the
+    token carries that prefix and the trust policy was matching
+    `repo:OWNER/REPO`. The suffixes are rename resistance: the user and
+    repository IDs are stable even if either name changes.
+
+    `github-oidc.yaml` now takes a `SubjectPrefix` parameter, defaulting to the
+    classic form so an existing stack is unaffected. A parameter rather than a
+    wildcard on purpose: `repo:owner*/repo*` would match this token and also
+    anyone registering a similarly-named account, trading a correctness bug for
+    a privilege escalation.
+
+15. **A release pipeline has run three times before the rewrite.**
     An earlier heading here said the pipeline had never run, and that was wrong
     in the direction that matters: it understated what already ships.
 
@@ -498,11 +521,11 @@ Each of these is backed by a run recorded in `docs/VALIDATION.md`.
     Engine 20.10.17. What is verified is that the workflow parses, that every
     action is pinned to a SHA confirmed to be a real commit, and that the trigger
     admits tags only.
-15. **Infrastructure assumptions.** `controlplane.yaml` requires an existing VPC,
+16. **Infrastructure assumptions.** `controlplane.yaml` requires an existing VPC,
     subnets, IAM roles, KMS keys, ECS cluster and load balancer target group.
     `quickstart.yaml` removes all of those except the certificate.
 
-16. **Onboarding, largely closed.** `docs/LOCAL.md` now documents a file-only
+17. **Onboarding, largely closed.** `docs/LOCAL.md` now documents a file-only
     path to a first real provider request that needs no Postgres, no migrations,
     no database roles, no tenant, no principals and no control plane. It was
     verified by following it from a clean directory, using nothing that is not on

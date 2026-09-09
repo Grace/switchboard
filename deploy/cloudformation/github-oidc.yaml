@@ -26,6 +26,17 @@ Parameters:
       create it first with the command in this stack's Outputs. IAM retrieves the
       certificate thumbprint itself, so none is supplied here.
 
+  SubjectPrefix:
+    Type: String
+    Default: ''
+    Description: >-
+      The subject prefix GitHub actually puts in the token, without the trailing
+      ref. Leave empty for the classic repo:OWNER/REPO form. GitHub now issues
+      ID-qualified subjects such as repo:owner@14958021/repo@1356690158, which
+      survive a rename of either, and a trust policy written against the classic
+      form is silently refused. Read the real value before deploying:
+      gh api /repos/OWNER/REPO/actions/oidc/customization/sub --jq .sub_claim_prefix
+
   GitHubOwner:
     Type: String
     Default: Grace
@@ -62,6 +73,11 @@ Parameters:
       as a list because CloudFormation cannot build one ARN per element, and a
       wildcard would widen the grant beyond the two repositories intended.
 
+Conditions:
+  # An empty SubjectPrefix keeps the classic form, so a stack that predates this
+  # parameter deploys unchanged.
+  HasSubjectPrefix: !Not [!Equals [!Ref SubjectPrefix, '']]
+
 Resources:
   # Trust is the whole security boundary here. Two conditions matter and both are
   # required: the audience must be the STS audience GitHub is configured to
@@ -86,7 +102,15 @@ Resources:
               StringEquals:
                 'token.actions.githubusercontent.com:aud': sts.amazonaws.com
               StringLike:
-                'token.actions.githubusercontent.com:sub': !Sub 'repo:${GitHubOwner}/${GitHubRepository}:${AllowedRefPattern}'
+                # Not a wildcard over the owner. repo:owner*/repo* would match
+                # this token and also anyone who registers a similarly-named
+                # account, which trades a correctness bug for a privilege
+                # escalation. The IDs are stable by design, so pinning costs
+                # nothing.
+                'token.actions.githubusercontent.com:sub': !If
+                  - HasSubjectPrefix
+                  - !Sub '${SubjectPrefix}:${AllowedRefPattern}'
+                  - !Sub 'repo:${GitHubOwner}/${GitHubRepository}:${AllowedRefPattern}'
       Policies:
         - PolicyName: publish-images
           PolicyDocument:
@@ -129,5 +153,12 @@ Outputs:
       --client-id-list sts.amazonaws.com
 
   TrustedSubject:
-    Description: The exact subject claim this role accepts. Read it before deploying.
-    Value: !Sub 'repo:${GitHubOwner}/${GitHubRepository}:${AllowedRefPattern}'
+    Description: >-
+      The exact subject claim this role accepts, as enforced rather than as
+      assumed. Compare it against the token GitHub actually sends; a mismatch
+      here is refused as "Not authorized to perform sts:AssumeRoleWithWebIdentity",
+      which reads like a permissions problem and is not one.
+    Value: !If
+      - HasSubjectPrefix
+      - !Sub '${SubjectPrefix}:${AllowedRefPattern}'
+      - !Sub 'repo:${GitHubOwner}/${GitHubRepository}:${AllowedRefPattern}'

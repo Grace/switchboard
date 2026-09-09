@@ -320,6 +320,27 @@ its scope. A clean scan is a much smaller attack surface, not a guarantee.
 | `controlplane.yaml` | 14, all pre-existing infrastructure | `CAPABILITY_IAM` |
 | `github-oidc.yaml` | `OidcProviderArn` | **`CAPABILITY_NAMED_IAM`** |
 
+### Read the OIDC subject before deploying the publishing role
+
+`github-oidc.yaml` writes a trust policy matching the subject claim GitHub puts
+in its token. **Do not assume that claim is `repo:OWNER/REPO`.** GitHub now
+issues ID-qualified subjects — `repo:owner@14958021/repo@1356690158` — whose
+numeric suffixes survive a rename of either. Ask the repository what it sends:
+
+```sh
+gh api /repos/OWNER/REPO/actions/oidc/customization/sub --jq .sub_claim_prefix
+```
+
+Pass a non-classic result as `SubjectPrefix`. Getting this wrong fails as
+`Not authorized to perform sts:AssumeRoleWithWebIdentity`, which reads as a
+permissions problem and is not one: the trust policy, the audience, the provider
+and the workflow's `id-token: write` are all correct and the condition is simply
+false. The action retries about a dozen times before giving up, so it also looks
+like propagation. It is not.
+
+The stack's `TrustedSubject` output prints what the role actually enforces.
+Compare it against the command above before pushing a tag.
+
 All three create IAM resources, so a deploying buyer must acknowledge
 `CAPABILITY_IAM` — except `github-oidc.yaml`, which needs `CAPABILITY_NAMED_IAM`
 because it sets `RoleName` explicitly. A custom name is what escalates the
