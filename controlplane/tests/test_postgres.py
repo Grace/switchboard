@@ -121,3 +121,57 @@ def test_revocation_and_audit(setup):
     assert c.delete("/v1/principals/"+r.json()["id"],headers=auth(t)).status_code==204
     assert c.get("/v1/telemetry",headers=h).status_code==401
     assert len(c.get("/v1/audit",headers=auth(t)).json())>=2
+
+def test_replay_reconstructs_the_routing_decision(setup):
+    """The point of recording policy_version: turn a request id into an account
+    of where it went and why, from records the control plane already keeps."""
+    c,t,_ = setup
+    # Publish a policy so there is an envelope to join back to.
+    doc = policy(version=7)
+    doc["routes"] = [{"provider":"openai","model":"gpt-5-nano"},
+                     {"provider":"anthropic","model":"claude-haiku-4-5-20251001"}]
+    assert c.put("/v1/policy",json=doc,headers=auth(t)).status_code == 200
+
+    ev = _event(provider="anthropic", policy_version=7)
+    assert c.post("/v1/telemetry/batch",json={"events":[ev]},headers=auth(t,role="agent")).status_code == 200
+
+    r = c.get(f"/v1/replay/{ev['request_id']}",headers=auth(t))
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["policy_version"] == 7
+    assert body["provider"] == "anthropic"
+    # The route order, and that the provider which answered was one this policy
+    # allowed. A provider outside the list means the policy rotated mid-flight
+    # or something is wrong, and silence there would make the answer misleading.
+    assert [x["provider"] for x in body["routes"]] == ["openai","anthropic"]
+    assert body["consistent"] is True
+    # A policy forbids a repeated provider, so the model follows from the
+    # provider and never had to be stored on the event.
+    assert body["model"] == "claude-haiku-4-5-20251001"
+
+def test_replay_is_tenant_scoped_and_never_takes_a_tenant_parameter(setup):
+    """The tenant comes from the authenticated principal. Replay is exactly the
+    endpoint where accepting one from the caller would be tempting and wrong."""
+    c,t,_ = setup
+    ev = _event()
+    assert c.post("/v1/telemetry/batch",json={"events":[ev]},headers=auth(t,role="agent")).status_code == 200
+    assert c.get(f"/v1/replay/{ev['request_id']}",headers=auth(t)).status_code == 200
+    # Same request id, different tenant's credentials: it does not exist.
+    assert c.get(f"/v1/replay/{ev['request_id']}",headers=auth(t,"tenant-b")).status_code == 404
+
+def test_replay_absence_does_not_claim_the_request_never_happened(setup):
+    """Telemetry is delivered asynchronously and dropped rather than retried
+    forever, so a missing event is not evidence of a missing request."""
+    c,t,_ = setup
+    r = c.get("/v1/replay/" + "0"*32, headers=auth(t))
+    assert r.status_code == 404
+    assert "asynchronously" in r.json()["detail"]
+
+def test_replay_rejects_ids_that_are_not_request_ids(setup):
+    c,t,_ = setup
+    for bad in ["../../etc/passwd", "short", "A"*32, "%00"*8]:
+        assert c.get(f"/v1/replay/{bad}",headers=auth(t)).status_code in (404,)
+
+def test_replay_requires_authentication(setup):
+    c,t,_ = setup
+    assert c.get("/v1/replay/" + "0"*32).status_code == 401

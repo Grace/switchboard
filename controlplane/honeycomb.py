@@ -13,8 +13,10 @@ recipient and one board in any Honeycomb environment, from flags.
 
 There is no --env flag. A v1 API key is scoped to one environment, so the key
 already chooses it and a flag would only imply a choice that is not there. The
-key is read from HONEYCOMB_API_KEY rather than an argument so it stays out of the
-process table and shell history, as the signing seed does in policytool.
+key is read from HONEYCOMB_CONFIG_KEY rather than an argument so it stays out of
+the process table and shell history, as the signing seed does in policytool. Not
+HONEYCOMB_API_KEY: that holds the ingest key a gateway itself reads, and this
+tool refuses to fall back to it -- see main().
 
 Three behaviours here are not incidental, and each one is a bruise:
 

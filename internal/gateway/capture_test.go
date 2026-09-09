@@ -221,3 +221,35 @@ func TestCaptureFailureDoesNotAffectTheResponse(t *testing.T) {
 			rec.Code)
 	}
 }
+
+// The record is written before parsing precisely so a request rejected as
+// malformed can still be examined -- that is the case someone is most likely to
+// be investigating. It was the one case never captured: json.Marshal validates a
+// json.RawMessage, so an invalid body failed the marshal and lost the whole
+// record, and because every error counter sits below that call it happened with
+// no file, no metric and no log line.
+func TestCaptureKeepsAnUnparseableBody(t *testing.T) {
+	s, _ := newCapture(t, time.Hour, 1<<20)
+	id := "ffffffffffffffffffffffffffffffff"
+	r := record(id)
+	r.Status = 400
+	r.Prompt = json.RawMessage(`{"model": `) // truncated: what a broken client sends
+	if err := s.Write(r); err != nil {
+		t.Fatalf("Write refused a malformed body: %v", err)
+	}
+
+	got := s.Read(id)
+	if got == nil {
+		t.Fatal("no record written for a malformed body; that is the case capture is for")
+	}
+	if !got.PromptUnparseable {
+		t.Error("record does not say the prompt was unparseable")
+	}
+	if got.RawPrompt != `{"model": ` {
+		t.Errorf("RawPrompt = %q, want the body verbatim", got.RawPrompt)
+	}
+	// The routing context is the half that was silently lost with it.
+	if got.Status != 400 {
+		t.Errorf("Status = %d, want 400", got.Status)
+	}
+}

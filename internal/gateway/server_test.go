@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"regexp"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -397,5 +398,28 @@ func TestPprofRequiresTheLocalToken(t *testing.T) {
 	h.ServeHTTP(w, ok)
 	if w.Code != 200 {
 		t.Fatalf("pprof refused the local token, returning %d", w.Code)
+	}
+}
+
+// hex.DecodeString accepts A-F; the control plane does not. Its Event model
+// constrains trace_id to ^[0-9a-f]{32}$, so an uppercase id was accepted here,
+// echoed to the caller, spooled, then refused on ingest and deleted as
+// deterministically rejected. A client that uppercases its trace ids therefore
+// lost 100% of its telemetry, with no symptom but a rising drop counter.
+func TestTraceIDsAreLowercased(t *testing.T) {
+	upper := "4BF92F3577B34DA6A3CE929D0E0E4736"
+	span := "00F067AA0BA902B7"
+	trace, parent := traceIDs("00-" + upper + "-" + span + "-01")
+
+	if trace != strings.ToLower(upper) {
+		t.Errorf("trace = %q, want lowercase; the control plane rejects A-F", trace)
+	}
+	if parent != strings.ToLower(span) {
+		t.Errorf("parent = %q, want lowercase", parent)
+	}
+	// Still the same id, just normalised: W3C traceparent is defined in
+	// lowercase hex, so nothing about the caller's trace is changed.
+	if !regexp.MustCompile(`^[0-9a-f]{32}$`).MatchString(trace) {
+		t.Errorf("trace %q does not satisfy the control plane's own pattern", trace)
 	}
 }

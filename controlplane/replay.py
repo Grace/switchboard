@@ -1,6 +1,7 @@
 """Reconstruct a routing decision: which policy was live, and why this provider.
 
-    python -m controlplane.replay --request-id 9b8341eecc1919f3cccc6dbabed7a83b
+    python -m controlplane.replay --request-id 9b8341eecc1919f3cccc6dbabed7a83b \\
+      --tenant acme-prod
 
 The gateway records the policy version on every event, and the control plane
 keeps every signed policy envelope by ``(tenant, version)`` permanently. Those

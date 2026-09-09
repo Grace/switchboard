@@ -316,8 +316,8 @@ its scope. A clean scan is a much smaller attack surface, not a guarantee.
 
 | Template | Required parameters | Capabilities |
 |---|---|---|
-| `quickstart.yaml` | `CertificateArn`, `ControlPlaneImage` | `CAPABILITY_IAM` |
-| `controlplane.yaml` | 22, all pre-existing infrastructure | `CAPABILITY_IAM` |
+| `quickstart.yaml` | `CertificateArn`, `ControlPlaneHostname`, `ControlPlaneImage` | `CAPABILITY_IAM` |
+| `controlplane.yaml` | 14, all pre-existing infrastructure | `CAPABILITY_IAM` |
 
 Both templates create IAM resources, so a deploying buyer must acknowledge
 `CAPABILITY_IAM`. `controlplane.yaml` creates only the sidecar metering policy;

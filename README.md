@@ -16,7 +16,7 @@ signed policy it cannot itself edit.
 
 ## What is implemented
 
-- Loopback-only, single-tenant Go data plane; text chat normalization for OpenAI, Anthropic, Gemini and Amazon Bedrock. Streaming for the first three; Bedrock is nonstreaming, and a streaming request skips a Bedrock route rather than failing.
+- Loopback-only, single-tenant Go data plane; text chat normalization for OpenAI, Anthropic, Gemini and Amazon Bedrock. **All four stream.** Bedrock's AWS event-stream framing is translated to server-sent events at the provider boundary by `bedrockSSE`, so the generation deadline, finish tracking, empty-completion detection and the refusal to replay after acceptance apply to it identically rather than gaining an exception.
 - Postgres persistence, migrations, hashed bearer credentials, tenant-scoped RBAC, row-level security, revocation and audit records.
 - Ed25519 policy signatures, restricted canonical JSON, pinned overlapping verification keys, expiry, version rollback/equivocation protection and atomic disk cache.
 - Inference uses only local policy and direct provider connections. Control-plane polling and telemetry delivery are background work.
@@ -41,7 +41,7 @@ Only `model`, `messages`, `stream`, `max_tokens`, and `temperature` are supporte
 
 ## Build and test
 
-Go 1.26 (or newer supported Go release) and Python 3.14:
+Go 1.27 (or newer supported Go release) and Python 3.14:
 
 ```sh
 go test -race ./...

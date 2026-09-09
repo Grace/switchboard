@@ -45,6 +45,14 @@ type captureRecord struct {
 	Stored        int64           `json:"stored_unix"`
 	Prompt        json.RawMessage `json:"prompt,omitempty"`
 	Completion    json.RawMessage `json:"completion,omitempty"`
+	// RawPrompt holds a request body that is not valid JSON, as a string, and
+	// PromptUnparseable says so. The body is recorded before parsing precisely so
+	// a request rejected as malformed can still be examined -- and that was the
+	// one case never captured, because json.Marshal validates a json.RawMessage
+	// and failed the whole record, losing the status, provider and policy version
+	// along with it.
+	RawPrompt         string `json:"raw_prompt,omitempty"`
+	PromptUnparseable bool   `json:"prompt_unparseable,omitempty"`
 	// Text carries the assembled answer for a streamed response, because the
 	// frames themselves are not a document. docs/API.md already says a replayed
 	// stream is the same answer and not the original timing; a capture is the
@@ -129,8 +137,16 @@ func (s *captureStore) Write(r *captureRecord) error {
 	if !requestID.MatchString(r.RequestID) {
 		return errors.New("capture: request id is not a 32-character hex string")
 	}
+	// Moved off the JSON path before marshalling rather than after: an invalid
+	// Prompt makes json.Marshal fail, and every error counter in this function
+	// lives below that call, so the record vanished without a file, a metric or a
+	// log line.
+	if len(r.Prompt) > 0 && !json.Valid(r.Prompt) {
+		r.RawPrompt, r.PromptUnparseable, r.Prompt = string(r.Prompt), true, nil
+	}
 	b, err := json.Marshal(r)
 	if err != nil {
+		s.m.DiskErrors.Add(1)
 		return err
 	}
 	if int64(len(b)) > s.maxBytes {

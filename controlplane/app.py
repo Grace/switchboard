@@ -6,6 +6,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import time
 import uuid
 from typing import Literal
@@ -19,6 +20,7 @@ from psycopg.conninfo import conninfo_to_dict
 from psycopg.types.json import Jsonb
 from psycopg_pool import ConnectionPool
 from controlplane.policy import sign, validate_policy, ID
+from controlplane.replay import routes_of
 
 log = logging.getLogger("switchboard")
 log.setLevel(logging.INFO)
@@ -226,6 +228,78 @@ def create_app(pool=None, seed=None, key_id=None):
         db, p = s
         require(p, "admin", "publisher", "viewer")
         return db.execute("SELECT event,received_at FROM telemetry WHERE tenant_id=%s ORDER BY received_at DESC LIMIT 100", (p["tenant_id"],)).fetchall()
+
+    @app.get("/v1/replay/{request_id}")
+    def replay(request_id: str, s=Depends(session, scope="function")):
+        """Which policy routed this request, and whether the provider was allowed.
+
+        The routing decision has always been reconstructible -- every signed
+        envelope is kept by (tenant, version) forever -- but nothing recorded
+        which version was live until the gateway started sending policy_version.
+        With it, this is a join rather than a service.
+
+        The tenant comes from the authenticated principal and is never a
+        parameter. Every other handler here establishes that, and replay is
+        exactly the endpoint where accepting one would be tempting and wrong.
+
+        No captured content is served. Prompts and completions, when capture is
+        enabled at all, live on the gateway's own disk and never reach the
+        control plane; an endpoint that returned them would undo the property
+        that keeps that exposure to one machine. Read them with
+        `python -m controlplane.replay --capture-dir` on the box that served the
+        request.
+
+        Reuses replay.py rather than reimplementing the reconstruction, so the
+        CLI and the endpoint cannot drift into disagreeing about what happened.
+        """
+        db, p = s
+        require(p, "admin", "publisher", "viewer")
+        if not re.fullmatch(r"[0-9a-f]{32}", request_id):
+            raise HTTPException(404, "no such request")
+
+        row = db.execute(
+            "SELECT event,received_at FROM telemetry"
+            " WHERE tenant_id=%s AND event->>'request_id'=%s"
+            " ORDER BY received_at DESC LIMIT 1",
+            (p["tenant_id"], request_id),
+        ).fetchone()
+        if row is None:
+            # Telemetry is delivered asynchronously and dropped rather than
+            # retried forever, so absence is not proof the request never
+            # happened -- say so rather than implying it.
+            raise HTTPException(404, "no event for that request id; telemetry is "
+                                     "delivered asynchronously and may not have arrived")
+
+        version = (row["event"] or {}).get("policy_version")
+        policy = None
+        if version:
+            policy = db.execute(
+                "SELECT version,envelope,created_at FROM policies WHERE tenant_id=%s AND version=%s",
+                (p["tenant_id"], version),
+            ).fetchone()
+
+        served = (row["event"] or {}).get("provider")
+        routes = routes_of(policy["envelope"]) if policy else []
+        out = {
+            "request_id": request_id,
+            "received_at": row["received_at"],
+            "status": (row["event"] or {}).get("status"),
+            "attempts": (row["event"] or {}).get("attempts"),
+            "provider": served,
+            "policy_version": version,
+            "routes": routes,
+            "consistent": None,
+        }
+        if policy and not routes:
+            # An envelope that cannot be decoded must not be reported as a
+            # policy with no routes: that would make every request look
+            # inconsistent with its own policy.
+            out["policy_error"] = "envelope payload could not be decoded"
+        elif routes and served:
+            out["consistent"] = served in {r.get("provider") for r in routes}
+            if out["consistent"]:
+                out["model"] = next(r.get("model") for r in routes if r.get("provider") == served)
+        return out
 
     @app.get("/v1/audit")
     def audit_list(s=Depends(session, scope="function")):

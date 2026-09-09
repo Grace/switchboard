@@ -1,6 +1,7 @@
 package gateway
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"crypto/subtle"
@@ -162,6 +163,9 @@ type Server struct {
 	// budgets remembers which models have been seen returning nothing at a given
 	// token budget, so a request is not sent to a route already watched fail.
 	budgets *budgetTable
+	// temps remembers which models refused a temperature, so the 400 is paid
+	// once per model rather than on every request. See temperature.go.
+	temps *temperatureTable
 	// Idem is nil unless idempotency_ttl_seconds is set. Nil means the feature is
 	// off and a key is refused, which is the behaviour before it existed.
 	Idem *idemStore
@@ -181,7 +185,7 @@ type Server struct {
 }
 
 func New(c Config, p *PolicyStore, m *Metrics, t *Telemetry) *Server {
-	return &Server{C: c, Policies: p, Metrics: m, Telemetry: t, HTTP: client(time.Duration(c.TimeoutSeconds) * time.Second), slots: make(chan struct{}, c.Concurrency), rate: newBucket(c.Rate, c.Burst), retry: newBucket(c.RetryRate, c.RetryRate), circuits: map[string]*circuit{"openai": {}, "anthropic": {}, "gemini": {}, "bedrock": {}}, budgets: newBudgetTable()}
+	return &Server{C: c, Policies: p, Metrics: m, Telemetry: t, HTTP: client(time.Duration(c.TimeoutSeconds) * time.Second), slots: make(chan struct{}, c.Concurrency), rate: newBucket(c.Rate, c.Burst), retry: newBucket(c.RetryRate, c.RetryRate), circuits: map[string]*circuit{"openai": {}, "anthropic": {}, "gemini": {}, "bedrock": {}}, budgets: newBudgetTable(), temps: newTemperatureTable()}
 }
 
 // ready reports whether this gateway can serve a request. It deliberately does
@@ -308,7 +312,15 @@ func traceIDs(h string) (string, string) {
 		b, f := hex.DecodeString(parts[2])
 		_, g := hex.DecodeString(parts[3])
 		if e == nil && f == nil && g == nil && strings.Trim(string(a), "\x00") != "" && strings.Trim(string(b), "\x00") != "" {
-			return parts[1], parts[2]
+			// Lowercased, because hex.DecodeString accepts A-F and the control
+			// plane does not: its Event model constrains trace_id to
+			// ^[0-9a-f]{32}$. An uppercase id was therefore accepted here,
+			// echoed back, spooled, then rejected on ingest and deleted as
+			// deterministically refused -- so a client that uppercases its trace
+			// ids lost every event, with no symptom but a rising drop counter.
+			// W3C traceparent is defined in lowercase hex, so nothing is lost by
+			// normalising and the id still matches the one the caller sent.
+			return strings.ToLower(parts[1]), strings.ToLower(parts[2])
 		}
 	}
 	return randomID(16), ""
@@ -506,7 +518,14 @@ func (s *Server) chat(w http.ResponseWriter, r *http.Request) {
 		event.Attempts++
 		event.Provider = route.Provider
 		event.Model = route.Model
-		req, e := upstream(ctx, c, route, pc, s.Bedrock)
+		sent := c
+		if sent.Temperature != nil && s.temps.omit(route.Provider, route.Model) {
+			// Known refuser. Paying the 400 again on every request would be a
+			// tax on a fact already established.
+			sent.Temperature = nil
+			s.Metrics.TemperatureDropped.Add(1)
+		}
+		req, e := upstream(ctx, sent, route, pc, s.Bedrock)
 		if e != nil {
 			s.circuits[route.Provider].release()
 			fail(500, "adapter configuration")
@@ -514,6 +533,37 @@ func (s *Server) chat(w http.ResponseWriter, r *http.Request) {
 		}
 		req.Header.Set("X-Request-ID", id)
 		res, e := s.HTTP.Do(req)
+		if e == nil && res.StatusCode >= 400 && sent.Temperature != nil {
+			// One immediate retry without the field, if the provider said the
+			// field is the problem. Safe, and for a specific reason: a 400 means
+			// this request was rejected before anything was generated, so nothing
+			// was accepted and nothing was billed. The no-replay-after-acceptance
+			// rule applies to accepted requests and not to this.
+			//
+			// This is the first request against a model nobody has tried a
+			// temperature on. Learning here is what makes it the only one that
+			// pays the round trip.
+			peek, _ := io.ReadAll(io.LimitReader(res.Body, 1<<16))
+			res.Body.Close()
+			if rejectsTemperature(res.StatusCode, peek) {
+				s.temps.observe(route.Provider, route.Model)
+				s.Metrics.TemperatureDropped.Add(1)
+				slog.Info("provider refused temperature; retrying without it",
+					"request_id", id, "provider", route.Provider, "model", route.Model)
+				sent.Temperature = nil
+				if req, e = upstream(ctx, sent, route, pc, s.Bedrock); e != nil {
+					s.circuits[route.Provider].release()
+					fail(500, "adapter configuration")
+					return
+				}
+				req.Header.Set("X-Request-ID", id)
+				res, e = s.HTTP.Do(req)
+			} else {
+				// Not a temperature problem. Hand the body back so the existing
+				// classification reads exactly what it would have read.
+				res.Body = io.NopCloser(bytes.NewReader(peek))
+			}
+		}
 		if e != nil {
 			if r.Context().Err() != nil {
 				s.circuits[route.Provider].release()

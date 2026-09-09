@@ -77,8 +77,13 @@ type Metrics struct {
 	// runtime has kept rather than objects the program is holding, which a heap
 	// profile would not explain.
 	Goroutines, HeapAlloc, HeapObjects, HeapSys atomic.Int64
-	LatencyBuckets                              [len(latencyBounds)]atomic.Int64
-	LogDropped                                  *atomic.Int64
+	// TemperatureDropped counts requests sent without the caller's temperature
+	// because the model refuses it. Silently changing a caller's parameters is
+	// worse than the 400 it replaces unless it is visible, which is the same
+	// argument as usage_mismatch_total.
+	TemperatureDropped atomic.Int64
+	LatencyBuckets     [len(latencyBounds)]atomic.Int64
+	LogDropped         *atomic.Int64
 }
 
 // The first bucket of an explicit-bounds histogram has no lower bound, so
@@ -148,6 +153,7 @@ func (m *Metrics) series() []series {
 		{"account_failover_total", "counter", &m.AccountFailover},
 		{"provider_probe_failed_total", "counter", &m.ProviderProbeFailed},
 		{"budget_skip_total", "counter", &m.BudgetSkip},
+		{"temperature_dropped_total", "counter", &m.TemperatureDropped},
 		{"idempotent_replay_total", "counter", &m.IdempotentReplay},
 		{"idempotent_conflict_total", "counter", &m.IdempotentConflict},
 		{"idempotent_unknown_total", "counter", &m.IdempotentUnknown},
@@ -365,9 +371,23 @@ func (t *Telemetry) persist(e Event) {
 // control plane in the same task, roughly twenty per second across a network at
 // 50 ms. A spool that cannot drain grows to its cap and then drops events, and
 // the events are billing and audit records.
+//
+// deliverBytes bounds a batch by size as well as by count, because the two
+// limits governing one request were not derived from each other: the receiver
+// rejects a body over 65536 bytes, and 200 fully-populated events measure about
+// 64,812 -- roughly 1% of headroom. Adding policy_version put 200 bytes on every
+// batch and crossed the cap once a tenant's policy version reached five digits.
+//
+// The failure that follows has no floor: the control plane answers 413, send()
+// returns false, nothing is acknowledged or removed, and the identical over-size
+// batch is rebuilt and re-posted every tick until the spool fills and starts
+// dropping. Sizing the batch here means the sender cannot construct a request
+// the receiver is obliged to refuse; a smaller fixed count would only move the
+// cliff to the next field somebody adds.
 const (
 	deliverBatch   = 200
 	deliverBatches = 5
+	deliverBytes   = 56 << 10
 )
 
 // spooled is one file waiting to be sent, kept with its size so the accounting
@@ -386,6 +406,7 @@ func (t *Telemetry) deliver(ctx context.Context) {
 		return
 	}
 	batch := make([]spooled, 0, deliverBatch)
+	batchBytes := 0
 	sentBatches := 0
 	for _, f := range files {
 		if ctx.Err() != nil || sentBatches >= deliverBatches {
@@ -406,13 +427,14 @@ func (t *Telemetry) deliver(ctx context.Context) {
 			continue
 		}
 		batch = append(batch, spooled{path: path, id: event.ID, size: int64(len(b)), event: b})
-		if len(batch) < deliverBatch {
+		batchBytes += len(b)
+		if len(batch) < deliverBatch && batchBytes < deliverBytes {
 			continue
 		}
 		if !t.send(ctx, batch) {
 			return
 		}
-		batch, sentBatches = batch[:0], sentBatches+1
+		batch, batchBytes, sentBatches = batch[:0], 0, sentBatches+1
 	}
 	if len(batch) > 0 && sentBatches < deliverBatches {
 		t.send(ctx, batch)
@@ -510,6 +532,23 @@ func (t *Telemetry) sendPerEvent(ctx context.Context, batch []spooled) bool {
 		}
 		if e != nil || res.StatusCode != 200 || json.Unmarshal(ack, &a) != nil || a.ID != sp.id {
 			t.m.ExportErrors.Add(1)
+			// A 4xx that is not 429 is a refusal, not a hiccup: the control plane
+			// has looked at this event and will say the same thing forever. The
+			// batch path already drops these, on the reasoning that losing one
+			// malformed event beats losing every event queued behind it; this
+			// path retried them instead, so a single rejected event blocked the
+			// spool indefinitely.
+			//
+			// That is not hypothetical. This is the path a gateway falls back to
+			// against any control plane predating the batch route, and every
+			// event now carries policy_version, which such a control plane's
+			// extra="forbid" model rejects -- so the first event 422s and nothing
+			// after it is ever delivered.
+			if res.StatusCode >= 400 && res.StatusCode < 500 && res.StatusCode != 429 {
+				t.m.Dropped.Add(1)
+				t.remove(sp)
+				continue
+			}
 			return false
 		}
 		t.remove(sp)
