@@ -52,7 +52,9 @@ exporting one span naming the provider that answered, carrying the sum of every
 attempt's usage — so a provider that consumed 612 input tokens was recorded as
 having consumed 1,098. The conformance test passed and always would have: every
 attribute name was correct. It was an attribution defect, not a vocabulary one.
-Fixed by giving every attempt its own span.
+Fixed by giving every attempt its own span &mdash; on the
+[`child-spans`](https://github.com/Grace/switchboard-sidecar/tree/child-spans) branch, not yet
+merged, so `main` still carries the single-span shape.
 
 **Capturing the real libraries found bugs in five of seven.**
 [`docs/findings.md`](https://github.com/Grace/genai-interlingua/blob/main/docs/findings.md)
@@ -62,7 +64,9 @@ best claim to being already correct. None was reachable by a green test suite.
 
 ## Status
 
-`genai-interlingua` and `switchboard-sidecar` are built, tested and published.
+`genai-interlingua` and `switchboard-sidecar` are built, tested and published —
+with the caveat above: some of what is described here is on branches rather than
+on `main`, and where that is true this page says so.
 `switchboard-recordkeeper` is built and unreleased. A hosted control plane, a web
 console and a multi-tenant deployment are designed and **not built**; where this
 documentation describes them it says so.
