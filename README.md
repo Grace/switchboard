@@ -7,16 +7,21 @@
 Switchboard is an AI infrastructure platform. This repository is the umbrella for
 it. It is intentionally close to empty right now.
 
+> **Looking for the LLM gateway that can prove what happened?** It's
+> [Grace/switchboard-recordkeeper](https://github.com/Grace/switchboard-recordkeeper).
+
 ## Where the code is
 
 | | |
 |---|---|
+| **Switchboard Recordkeeper** | [Grace/switchboard-recordkeeper](https://github.com/Grace/switchboard-recordkeeper) — the streaming inference gateway in Go: one OpenAI-compatible endpoint over AWS Bedrock and on-device llama.cpp, with capability gaps that refuse rather than degrade and a tamper-evident record of every completion. |
 | **Switchboard Sidecar** | [Grace/switchboard-sidecar](https://github.com/Grace/switchboard-sidecar) — the Go inference sidecar and its Postgres-backed control plane. Released, signed and published from there. |
 
-Everything this repository used to hold was the sidecar, and it has moved. Its
-full history is preserved here on the [`sidecar`](../../tree/sidecar) branch, so
-nothing is lost and old links still resolve — but that branch is a snapshot, not
-a mirror. Work continues in `switchboard-sidecar`.
+The code this repository used to hold has moved to those two repositories, which
+share its early history. The sidecar's full history is preserved here on the
+[`sidecar`](../../tree/sidecar) branch, so nothing is lost and old links still
+resolve — but that branch is a snapshot, not a mirror. Work continues in
+`switchboard-recordkeeper` and `switchboard-sidecar`.
 
 ## What lands here later
 
